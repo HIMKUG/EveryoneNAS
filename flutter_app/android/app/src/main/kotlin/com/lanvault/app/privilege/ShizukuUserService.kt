@@ -25,7 +25,12 @@ class ShizukuUserService : IShizukuLanVaultService.Stub {
         }
 
         @JvmStatic
-        external fun nativeStartServer(vaultPath: String, quotaGb: Long, port: Int): Boolean
+        external fun nativeStartServer(
+            vaultPath: String,
+            quotaGb: Long,
+            port: Int,
+            webPassword: String,
+        ): Boolean
 
         @JvmStatic
         external fun nativeGracefulRestart(): Boolean
@@ -33,6 +38,15 @@ class ShizukuUserService : IShizukuLanVaultService.Stub {
 
     @Suppress("unused")
     private val appContext: Context?
+
+    private data class LaunchConfig(
+        val vaultPath: String,
+        val quotaGb: Long,
+        val port: Int,
+        val webPassword: String,
+    )
+
+    private var lastLaunch: LaunchConfig? = null
 
     @Keep
     constructor() {
@@ -52,12 +66,42 @@ class ShizukuUserService : IShizukuLanVaultService.Stub {
 
     override fun getUid(): Int = Os.getuid()
 
-    override fun startServer(vaultPath: String, quotaGb: Long, port: Int): Boolean {
-        return nativeStartServer(vaultPath, quotaGb, port)
+    override fun startServer(
+        vaultPath: String,
+        quotaGb: Long,
+        port: Int,
+        webPassword: String,
+    ): Boolean {
+        val started = nativeStartServer(vaultPath, quotaGb, port, webPassword)
+        if (started) {
+            lastLaunch = LaunchConfig(vaultPath, quotaGb, port, webPassword)
+        }
+        return started
     }
 
     override fun gracefulRestart(): Boolean {
-        return nativeGracefulRestart()
+        val launch = lastLaunch ?: return false
+        if (!nativeGracefulRestart()) {
+            return false
+        }
+        val restarted = nativeStartServer(
+            launch.vaultPath,
+            launch.quotaGb,
+            launch.port,
+            launch.webPassword,
+        )
+        if (restarted) {
+            lastLaunch = launch
+        }
+        return restarted
+    }
+
+    override fun stopServer(): Boolean {
+        val stopped = nativeGracefulRestart()
+        if (stopped) {
+            lastLaunch = null
+        }
+        return stopped
     }
 
     override fun allowBackgroundAppOps(packageName: String): Boolean {

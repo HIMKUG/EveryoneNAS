@@ -22,6 +22,7 @@ const SECS_PER_MONTH: i64 = 30 * SECS_PER_DAY;
 /// Configurable GFS retention window counts.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct GfsPolicy {
+    pub hourly_keep: i64,
     pub daily_keep: i64,
     pub weekly_keep: i64,
     pub monthly_keep: i64,
@@ -30,6 +31,7 @@ pub struct GfsPolicy {
 impl Default for GfsPolicy {
     fn default() -> Self {
         Self {
+            hourly_keep: 24,
             daily_keep: 7,
             weekly_keep: 4,
             monthly_keep: 6,
@@ -64,48 +66,38 @@ impl GarbageCollector {
         now_unix_secs: i64,
         policy: GfsPolicy,
     ) -> Vec<String> {
-        let mut sorted: Vec<&SnapshotRecord> = snapshots.iter().collect();
-        sorted.sort_by_key(|s| std::cmp::Reverse(s.created_at));
-
-        let daily_cutoff = now_unix_secs - policy.daily_keep * SECS_PER_DAY;
-        let weekly_cutoff = now_unix_secs - policy.weekly_keep * SECS_PER_WEEK;
-        let monthly_cutoff = now_unix_secs - policy.monthly_keep * SECS_PER_MONTH;
-
-        let mut seen_days: HashSet<i64> = HashSet::with_capacity(32);
-        let mut seen_weeks: HashSet<i64> = HashSet::with_capacity(32);
-        let mut seen_months: HashSet<i64> = HashSet::with_capacity(32);
         let mut expired = Vec::new();
-
-        for snap in sorted {
-            if snap.retention_tier == RetentionTier::Pinned {
-                continue;
-            }
-
-            let mut retained = false;
-
-            if snap.created_at >= daily_cutoff {
-                let day_bucket = snap.created_at.div_euclid(SECS_PER_DAY);
-                if seen_days.insert(day_bucket) {
-                    retained = true;
+        let mut scopes: std::collections::BTreeMap<(&str, &str), Vec<&SnapshotRecord>> =
+            std::collections::BTreeMap::new();
+        for snapshot in snapshots {
+            scopes
+                .entry((snapshot.rule_id.as_str(), snapshot.device_id.as_str()))
+                .or_default()
+                .push(snapshot);
+        }
+        for scope in scopes.values_mut() {
+            scope.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.created_at));
+            let mut seen = HashSet::new();
+            for snap in scope {
+                if snap.retention_tier == RetentionTier::Pinned {
+                    continue;
                 }
-            }
-
-            if !retained && snap.created_at >= weekly_cutoff {
-                let week_bucket = snap.created_at.div_euclid(SECS_PER_WEEK);
-                if seen_weeks.insert(week_bucket) {
-                    retained = true;
+                let (window_secs, bucket_secs) = match snap.retention_tier {
+                    RetentionTier::Hourly => (policy.hourly_keep * 3_600, 3_600),
+                    RetentionTier::Daily => (policy.daily_keep * SECS_PER_DAY, SECS_PER_DAY),
+                    RetentionTier::Weekly => (policy.weekly_keep * SECS_PER_WEEK, SECS_PER_WEEK),
+                    RetentionTier::Monthly => {
+                        (policy.monthly_keep * SECS_PER_MONTH, SECS_PER_MONTH)
+                    }
+                    RetentionTier::Pinned => continue,
+                };
+                let cutoff = now_unix_secs.saturating_sub(window_secs);
+                let bucket = snap.created_at.div_euclid(bucket_secs);
+                if snap.created_at < cutoff
+                    || !seen.insert((snap.retention_tier.as_str(), bucket))
+                {
+                    expired.push(snap.snapshot_id.clone());
                 }
-            }
-
-            if !retained && snap.created_at >= monthly_cutoff {
-                let month_bucket = snap.created_at.div_euclid(SECS_PER_MONTH);
-                if seen_months.insert(month_bucket) {
-                    retained = true;
-                }
-            }
-
-            if !retained {
-                expired.push(snap.snapshot_id.clone());
             }
         }
 
@@ -129,18 +121,41 @@ impl GarbageCollector {
             Some(format!("vault_id={vault_id}, snapshots={evaluated_snapshots}")),
         );
         let expired_count = self.db.delete_snapshots_batch(&expired_ids)? as u64;
+        if !expired_ids.is_empty() {
+            if let Ok(roots) = self.vault_store.manifest_backup_roots(vault_id) {
+                for root in roots {
+                    for snapshot_id in &expired_ids {
+                        let path = root
+                            .join("manifests")
+                            .join(format!("{snapshot_id}.json"));
+                        if let Err(err) = std::fs::remove_file(&path) {
+                            if err.kind() != std::io::ErrorKind::NotFound {
+                                tracing::warn!(
+                                    path = %path.display(),
+                                    "failed to remove expired snapshot manifest: {err}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let orphans = self.db.list_orphan_chunks(vault_id)?;
-        let mut orphan_hashes: Vec<[u8; 32]> = Vec::with_capacity(orphans.len());
         let mut reclaimed_bytes = 0u64;
+        let mut deleted_chunks = 0u64;
 
         for orphan in &orphans {
-            self.vault_store
-                .delete_chunk_files(vault_id, &orphan.hash_blake3)?;
-            orphan_hashes.push(orphan.hash_blake3);
-            reclaimed_bytes = reclaimed_bytes.saturating_add(orphan.stored_size);
+            if self
+                .db
+                .delete_chunk(vault_id, &orphan.hash_blake3)?
+            {
+                self.vault_store
+                    .delete_chunk_files(vault_id, &orphan.hash_blake3)?;
+                deleted_chunks += 1;
+                reclaimed_bytes = reclaimed_bytes.saturating_add(orphan.stored_size);
+            }
         }
-        let deleted_chunks = self.db.delete_chunks_batch(vault_id, &orphan_hashes)? as u64;
 
         if reclaimed_bytes > 0 {
             self.db

@@ -116,11 +116,13 @@ mod win_scm {
             let mut cfg = ServerConfig::load_from_file(&path)
                 .with_context(|| format!("failed to load server config from {}", path.display()))?;
             cfg.keep_alive_level = "WIN_SERVICE".to_string();
+            validate_service_config(&cfg)?;
             return Ok(cfg);
         }
 
         let mut cfg = ServerConfig {
             port: DEFAULT_LAN_PORT,
+            bind_addr: "0.0.0.0".to_string(),
             vault_root: PathBuf::from(DEFAULT_PROGRAM_DATA_ROOT),
             keep_alive_level: "WIN_SERVICE".to_string(),
             ..ServerConfig::default()
@@ -143,7 +145,17 @@ mod win_scm {
         if let Ok(web_password) = std::env::var("LANVAULT_WEB_PASSWORD") {
             cfg.web_password = web_password;
         }
+        validate_service_config(&cfg)?;
         Ok(cfg)
+    }
+
+    fn validate_service_config(config: &ServerConfig) -> Result<()> {
+        if config.web_password.len() < 8 {
+            anyhow::bail!(
+                "LANVAULT_WEB_PASSWORD or web_password in LANVAULT_CONFIG_PATH must be at least 8 characters"
+            );
+        }
+        Ok(())
     }
 
     /// 将当前系统枚举到的 Volume GUID 盘符映射写回 `index.db` 的 `vault_volumes` 表，落实盘符漂移自愈。
@@ -203,6 +215,29 @@ mod win_scm {
         Ok(())
     }
 
+    fn backfill_volume_guids(db_path: &Path) -> Result<()> {
+        if !db_path.exists() {
+            return Ok(());
+        }
+        let db = Database::open(db_path)
+            .with_context(|| format!("failed to open index.db at {}", db_path.display()))?;
+        for vault in db.list_vaults()? {
+            for volume in db.list_vault_volumes(&vault.vault_id)? {
+                if volume.volume_guid.is_some() {
+                    continue;
+                }
+                let guid = volume_guid::guid_for_mount_path(Path::new(&volume.mount_path))?;
+                db.update_volume_guid(&volume.volume_id, &guid)?;
+                info!(
+                    volume_id = %volume.volume_id,
+                    guid = %guid,
+                    "backfilled missing Windows Volume GUID"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// 若旧挂载路径包含 Windows 盘符前缀（如 `D:\LanVault`），将其替换为新盘符根路径（如 `E:\LanVault`）。
     fn rebind_mount_path(old_mount: &str, new_root: &Path) -> String {
         let bytes = old_mount.as_bytes();
@@ -211,7 +246,20 @@ mod win_scm {
             && bytes[1] == b':'
             && (bytes[2] == b'\\' || bytes[2] == b'/')
         {
-            let suffix = old_mount[3..].trim_start_matches(['\\', '/']);
+            let raw_suffix = old_mount[3..].trim_start_matches(['\\', '/']);
+            let mount_name = new_root.file_name().and_then(|name| name.to_str());
+            let suffix = match mount_name {
+                Some(name)
+                    if raw_suffix.starts_with(name)
+                        && raw_suffix
+                            .as_bytes()
+                            .get(name.len())
+                            .is_some_and(|next| *next == b'\\' || *next == b'/') =>
+                {
+                    raw_suffix[name.len() + 1..].to_string()
+                }
+                _ => raw_suffix.to_string(),
+            };
             if suffix.is_empty() {
                 return new_root.to_string_lossy().into_owned();
             }
@@ -264,6 +312,7 @@ mod win_scm {
 
         let (svc_stop_tx, svc_stop_rx) = watch::channel(false);
         let (bound_tx, bound_rx) = oneshot::channel::<SocketAddr>();
+        let (server_exit_tx, server_exit_rx) = mpsc::channel::<()>();
         let mut initial_bound_tx = Some(bound_tx);
 
         let mut server_task = runtime.spawn(async move {
@@ -305,6 +354,7 @@ mod win_scm {
                     }
                 }
             }
+            let _ = server_exit_tx.send(());
         });
 
         let bound_addr = runtime.block_on(async {
@@ -314,6 +364,7 @@ mod win_scm {
                 .context("EveryoneNAS server exited before binding a port")
         })?;
         info!(addr = %bound_addr, "EveryoneNAS Windows Session 0 server bound and ready");
+        backfill_volume_guids(&db_path)?;
 
         status_handle.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
@@ -325,8 +376,31 @@ mod win_scm {
             process_id: None,
         })?;
 
-        // 阻塞等待 SCM 下发 Stop 或 Shutdown 控制信号。
-        let _ = stop_rx.recv();
+        let unexpected_exit = loop {
+            match server_exit_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(()) => break true,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if stop_rx.try_recv().is_ok() {
+                        break false;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break true,
+            }
+        };
+
+        if unexpected_exit {
+            checkpoint_default_db(&db_path)?;
+            status_handle.set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::ServiceSpecific(1),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            })?;
+            anyhow::bail!("EveryoneNAS server exited while the service was running");
+        }
 
         status_handle.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
@@ -396,6 +470,7 @@ mod win_scm {
             .create_service(&service_info, service_access)
             .or_else(|_| service_manager.open_service(SERVICE_NAME, service_access))?;
 
+        service.change_config(&service_info)?;
         service.set_description(SERVICE_DESCRIPTION)?;
 
         // 底层调用 Win32 `ChangeServiceConfig2W(SERVICE_CONFIG_FAILURE_ACTIONS)` 配置 1s / 5s / 10s 自动重启。
@@ -421,7 +496,11 @@ mod win_scm {
         service.update_failure_actions(failure_actions)?;
         service.set_failure_actions_on_non_crash_failures(true)?;
 
-        firewall::ensure_firewall_rules(DEFAULT_LAN_PORT)?;
+        let firewall_port = std::env::var("LANVAULT_PORT")
+            .ok()
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(DEFAULT_LAN_PORT);
+        firewall::ensure_firewall_rules(firewall_port)?;
         info!(
             service = SERVICE_NAME,
             "installed Windows service with 1s/5s/10s crash recovery"
@@ -437,10 +516,17 @@ mod win_scm {
             ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
         let service = service_manager.open_service(SERVICE_NAME, service_access)?;
 
-        service.delete()?;
         if service.query_status()?.current_state != ServiceState::Stopped {
             service.stop()?;
+            let stop_deadline = Instant::now() + Duration::from_secs(30);
+            while service.query_status()?.current_state != ServiceState::Stopped {
+                if Instant::now() >= stop_deadline {
+                    anyhow::bail!("Windows service did not stop within 30 seconds");
+                }
+                sleep(Duration::from_millis(250));
+            }
         }
+        service.delete()?;
         drop(service);
 
         let start = Instant::now();

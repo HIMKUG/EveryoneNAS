@@ -31,6 +31,8 @@ struct StartLocalServerPayload {
     vault_path: String,
     quota_gb: u64,
     web_password: String,
+    #[serde(default)]
+    port: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -44,6 +46,13 @@ struct UpdatePowerNetworkPolicyPayload {
     allowed_ssids: Vec<String>,
     require_charging: bool,
     max_kbps: u32,
+}
+
+#[derive(Deserialize)]
+struct UpdateDeviceEnvironmentPayload {
+    on_wifi: bool,
+    current_ssid: Option<String>,
+    is_charging: bool,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +83,17 @@ fn default_true() -> bool {
 #[derive(Deserialize)]
 struct DeleteSyncRulePayload {
     rule_id: String,
+}
+
+#[derive(Deserialize)]
+struct KeyBackupPayload {
+    passphrase: String,
+}
+
+#[derive(Deserialize)]
+struct ImportKeyBackupPayload {
+    passphrase: String,
+    backup_json: String,
 }
 
 fn dispatch_json(fn_name: &str, payload_json: &str) -> Result<Value> {
@@ -117,10 +137,11 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
         "start_local_server" => {
             let req: StartLocalServerPayload = serde_json::from_str(payload_json)
                 .context("invalid start_local_server JSON payload")?;
-            let port = api::block_on(api::start_local_server(
+            let port = api::block_on(api::start_local_server_with_port(
                 req.vault_path,
                 req.quota_gb,
                 req.web_password,
+                req.port,
             ))??;
             Ok(json!({ "ok": true, "port": port }))
         }
@@ -161,6 +182,16 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
             ))??;
             Ok(json!({ "ok": true }))
         }
+        "update_device_environment" => {
+            let req: UpdateDeviceEnvironmentPayload = serde_json::from_str(payload_json)
+                .context("invalid update_device_environment JSON payload")?;
+            api::block_on(api::update_device_environment(
+                req.on_wifi,
+                req.current_ssid,
+                req.is_charging,
+            ))??;
+            Ok(json!({ "ok": true }))
+        }
         "push_clipboard_text" => {
             let req: PushClipboardTextPayload = serde_json::from_str(payload_json)
                 .context("invalid push_clipboard_text JSON payload")?;
@@ -197,6 +228,21 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
                 .context("invalid delete_sync_rule JSON payload")?;
             let deleted = api::block_on(api::delete_sync_rule(req.rule_id))??;
             Ok(json!({ "ok": true, "deleted": deleted }))
+        }
+        "export_vault_key_backup" => {
+            let req: KeyBackupPayload = serde_json::from_str(payload_json)
+                .context("invalid export_vault_key_backup JSON payload")?;
+            let backup = api::block_on(api::export_vault_key_backup(req.passphrase))??;
+            Ok(json!({ "ok": true, "backup": backup }))
+        }
+        "import_vault_key_backup" => {
+            let req: ImportKeyBackupPayload = serde_json::from_str(payload_json)
+                .context("invalid import_vault_key_backup JSON payload")?;
+            api::block_on(api::import_vault_key_backup(
+                req.passphrase,
+                req.backup_json,
+            ))??;
+            Ok(json!({ "ok": true }))
         }
         "set_debug_mode" => {
             let req: SetDebugModePayload = serde_json::from_str(payload_json)
@@ -344,6 +390,7 @@ mod android_jni {
         vault_path: JString,
         quota_gb: i64,
         port: i32,
+        supplied_web_password: Option<String>,
     ) -> JBoolean {
         let Some(path) = (unsafe { jstring_to_rust_string(env, vault_path) }) else {
             error!("JNI start server received null or non-UTF-8 vaultPath");
@@ -359,9 +406,11 @@ mod android_jni {
         }
         let requested_port = if port > 0 { Some(port as u16) } else { None };
 
-        let web_password = match std::env::var("LANVAULT_WEB_PASSWORD") {
-            Ok(v) if v.len() >= 6 => v,
-            _ => match api::load_or_generate_jni_web_password() {
+        let web_password = match supplied_web_password.map(|value| value.trim().to_string()) {
+            Some(value) if value.len() >= 8 => value,
+            _ => match std::env::var("LANVAULT_WEB_PASSWORD") {
+                Ok(value) if value.len() >= 8 => value,
+                _ => match api::load_or_generate_jni_web_password() {
                 Ok(generated) => generated,
                 // The Kotlin signature is `Boolean`, so the only failure channel is `false`;
                 // the cause is logged rather than encoded in the return value.
@@ -369,6 +418,7 @@ mod android_jni {
                     error!(error = %err, "JNI web password generation failed");
                     return JNI_FALSE;
                 }
+                },
             },
         };
 
@@ -411,8 +461,15 @@ mod android_jni {
         vault_path: JString,
         quota_gb: i64,
         port: i32,
+        web_password: JString,
     ) -> JBoolean {
-        jni_start_server_impl(env, vault_path, quota_gb, port)
+        jni_start_server_impl(
+            env,
+            vault_path,
+            quota_gb,
+            port,
+            unsafe { jstring_to_rust_string(env, web_password) },
+        )
     }
 
     #[no_mangle]
@@ -430,12 +487,45 @@ mod android_jni {
         vault_path: JString,
         quota_gb: i64,
         port: i32,
+        web_password: JString,
     ) -> JBoolean {
-        jni_start_server_impl(env, vault_path, quota_gb, port)
+        jni_start_server_impl(
+            env,
+            vault_path,
+            quota_gb,
+            port,
+            unsafe { jstring_to_rust_string(env, web_password) },
+        )
     }
 
     #[no_mangle]
     pub extern "system" fn Java_com_lanvault_app_privilege_RootDaemonService_nativeGracefulRestartRootServer(
+        _env: JniEnvPtr,
+        _class: JClass,
+    ) -> JBoolean {
+        jni_graceful_restart_impl()
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_lanvault_app_privilege_KeepAliveService_nativeStartKeepAliveServer(
+        env: JniEnvPtr,
+        _class: JClass,
+        vault_path: JString,
+        quota_gb: i64,
+        port: i32,
+        web_password: JString,
+    ) -> JBoolean {
+        jni_start_server_impl(
+            env,
+            vault_path,
+            quota_gb,
+            port,
+            unsafe { jstring_to_rust_string(env, web_password) },
+        )
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_lanvault_app_privilege_KeepAliveService_nativeGracefulRestartKeepAliveServer(
         _env: JniEnvPtr,
         _class: JClass,
     ) -> JBoolean {

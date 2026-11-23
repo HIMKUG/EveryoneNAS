@@ -3,9 +3,9 @@
 //! 与全量分块上传后的快照提交闭环 (`POST /api/vaults/{vault_id}/snapshots`)。
 
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::BufReader;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use lanvault_core::{
@@ -15,7 +15,7 @@ use lanvault_core::{
 };
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock, Semaphore};
 use tokio::time;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -125,8 +125,8 @@ impl TokenBucket {
         }
     }
 
-    pub fn update_max_kbps(&self, max_kbps: u32) {
-        let mut state = self.inner.lock().expect("token bucket mutex poisoned");
+    pub async fn update_max_kbps(&self, max_kbps: u32) {
+        let mut state = self.inner.lock().await;
         let rate = (max_kbps as f64) * 1024.0;
         state.rate_bytes_per_sec = rate;
         state.capacity = rate.max(64.0 * 1024.0);
@@ -136,30 +136,26 @@ impl TokenBucket {
 
     /// 申请发送 `bytes` 字节的令牌；若限速为 0 则立即放行，否则精确休眠补齐赤字。
     pub async fn acquire(&self, bytes: usize) {
-        let sleep_dur = {
-            let mut state = self.inner.lock().expect("token bucket mutex poisoned");
-            if state.rate_bytes_per_sec <= 0.0 {
-                return;
-            }
-            let now = Instant::now();
-            let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-            state.tokens = (state.tokens + elapsed * state.rate_bytes_per_sec).min(state.capacity);
-            state.last_refill = now;
-
-            let needed = bytes as f64;
-            if state.tokens >= needed {
-                state.tokens -= needed;
-                None
-            } else {
-                let deficit = needed - state.tokens;
-                state.tokens = 0.0;
-                Some(Duration::from_secs_f64(deficit / state.rate_bytes_per_sec))
-            }
-        };
-
-        if let Some(dur) = sleep_dur {
-            time::sleep(dur).await;
+        let mut state = self.inner.lock().await;
+        if state.rate_bytes_per_sec <= 0.0 {
+            return;
         }
+        let now = Instant::now();
+        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
+        state.tokens = (state.tokens + elapsed * state.rate_bytes_per_sec).min(state.capacity);
+        state.last_refill = now;
+
+        let needed = bytes as f64;
+        if state.tokens >= needed {
+            state.tokens -= needed;
+            return;
+        }
+        let deficit = needed - state.tokens;
+        state.tokens = 0.0;
+        let wait = Duration::from_secs_f64(deficit / state.rate_bytes_per_sec);
+        time::sleep(wait).await;
+        state.tokens = 0.0;
+        state.last_refill = Instant::now();
     }
 }
 
@@ -187,6 +183,7 @@ struct SnapshotFileManifestEntry {
 #[derive(Debug, Serialize)]
 struct CommitSnapshotRequest {
     snapshot_id: String,
+    rule_id: String,
     device_id: String,
     root_tree_hash_hex: String,
     retention_tier: String,
@@ -214,11 +211,14 @@ impl SyncEngine {
         device_id: String,
         vault_master_key: SymmetricKey,
         initial_policy: PowerNetworkPolicy,
+        environment: DeviceEnvironment,
+        shared_rate_limiter: Option<Arc<TokenBucket>>,
     ) -> Result<Self, ClientError> {
         let http = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
-        let rate_limiter = Arc::new(TokenBucket::new(initial_policy.max_kbps));
+        let rate_limiter = shared_rate_limiter
+            .unwrap_or_else(|| Arc::new(TokenBucket::new(initial_policy.max_kbps)));
         let (progress_tx, _) = broadcast::channel(256);
 
         Ok(Self {
@@ -228,7 +228,7 @@ impl SyncEngine {
             device_id,
             vault_master_key,
             policy: Arc::new(RwLock::new(initial_policy)),
-            env: Arc::new(RwLock::new(DeviceEnvironment::default())),
+            env: Arc::new(RwLock::new(environment)),
             rate_limiter,
             progress_tx,
             known_remote_chunks: Arc::new(RwLock::new(HashSet::new())),
@@ -240,7 +240,7 @@ impl SyncEngine {
     }
 
     pub async fn update_policy(&self, policy: PowerNetworkPolicy) {
-        self.rate_limiter.update_max_kbps(policy.max_kbps);
+        self.rate_limiter.update_max_kbps(policy.max_kbps).await;
         *self.policy.write().await = policy;
     }
 
@@ -315,6 +315,7 @@ impl SyncEngine {
             }
             pending_db_states.push(LocalFileStateRecord {
                 rule_id: rule_id.to_string(),
+                target_vault_id: vault_id.to_string(),
                 rel_path: snapshot.rel_path.clone(),
                 size: snapshot.size,
                 mtime_ns: snapshot.mtime_ns,
@@ -324,17 +325,31 @@ impl SyncEngine {
             summary.files_synced += 1;
         }
 
-        if !pending_db_states.is_empty() {
-            db.upsert_local_file_states_batch(&pending_db_states)?;
-        }
-
-        if !diff.deleted.is_empty() {
-            delete_file_states(db, rule_id, &diff.deleted)?;
-        }
-
         if !diff.is_empty() {
-            let snapshot_id = self.commit_snapshot(db, rule_id, vault_id).await?;
+            let mut projected_states = db.list_local_file_states(rule_id)?;
+            let deleted: HashSet<&str> = diff.deleted.iter().map(String::as_str).collect();
+            projected_states.retain(|state| !deleted.contains(state.rel_path.as_str()));
+            for pending in &pending_db_states {
+                if let Some(existing) = projected_states
+                    .iter_mut()
+                    .find(|state| state.rel_path == pending.rel_path)
+                {
+                    *existing = pending.clone();
+                } else {
+                    projected_states.push(pending.clone());
+                }
+            }
+            let snapshot_id = self
+                .commit_snapshot(rule_id, vault_id, &mut projected_states)
+                .await?;
             summary.snapshot_id = Some(snapshot_id);
+
+            if !pending_db_states.is_empty() {
+                db.upsert_local_file_states_batch(&pending_db_states)?;
+            }
+            if !diff.deleted.is_empty() {
+                delete_file_states(db, rule_id, &diff.deleted)?;
+            }
         }
 
         info!(
@@ -374,6 +389,8 @@ impl SyncEngine {
         let upload_concurrency = cpu_workers.min(8);
 
         let abs_path = snapshot.abs_path.clone();
+        let expected_size = snapshot.size;
+        let expected_mtime_ns = snapshot.mtime_ns;
         let (tx, mut rx) = mpsc::channel::<
             Result<(usize, tokio::task::JoinHandle<Result<PackedChunk, ClientError>>), ClientError>,
         >(upload_concurrency * 2);
@@ -407,6 +424,30 @@ impl SyncEngine {
             });
             if let Err(err) = res {
                 let _ = tx.blocking_send(Err(ClientError::Core(err)));
+                return;
+            }
+            match fs::metadata(&abs_path) {
+                Ok(metadata)
+                    if metadata.len() == expected_size
+                        && metadata
+                            .modified()
+                            .ok()
+                            .and_then(|modified| {
+                                modified
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .ok()
+                                    .map(|duration| duration.as_nanos() as i64)
+                            })
+                            == Some(expected_mtime_ns) => {}
+                Ok(_) => {
+                    let _ = tx.blocking_send(Err(ClientError::InvalidInput(format!(
+                        "file changed while it was being backed up: {}",
+                        abs_path.display()
+                    ))));
+                }
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(ClientError::Io(err)));
+                }
             }
         });
 
@@ -489,6 +530,7 @@ impl SyncEngine {
                 let mut req = http
                     .put(&url)
                     .header("Content-Type", "application/octet-stream")
+                    .header("X-LanVault-Encoding", "xchacha20poly1305+zstd")
                     .header("X-LanVault-Raw-Size", raw_size.to_string())
                     .body(stored_bytes);
                 if let Some(c) = cookie {
@@ -593,11 +635,10 @@ impl SyncEngine {
 
     async fn commit_snapshot(
         &self,
-        db: &Database,
         rule_id: &str,
         vault_id: &str,
+        states: &mut [LocalFileStateRecord],
     ) -> Result<String, ClientError> {
-        let mut states = db.list_local_file_states(rule_id)?;
         states.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
 
         let mut tree_input = Vec::new();
@@ -619,7 +660,7 @@ impl SyncEngine {
                 .collect();
 
             files.push(SnapshotFileManifestEntry {
-                rel_path: state.rel_path,
+                rel_path: state.rel_path.clone(),
                 size: state.size,
                 mtime_ns: state.mtime_ns,
                 chunk_hashes_hex,
@@ -630,6 +671,7 @@ impl SyncEngine {
         let snapshot_id = Uuid::new_v4().to_string();
         let payload = CommitSnapshotRequest {
             snapshot_id: snapshot_id.clone(),
+            rule_id: rule_id.to_string(),
             device_id: self.device_id.clone(),
             root_tree_hash_hex: hex::encode(root_tree_hash),
             retention_tier: "daily".to_string(),
@@ -644,9 +686,11 @@ impl SyncEngine {
 
         let resp = req.send().await?;
         if !resp.status().is_success() {
-            return Err(ClientError::RemoteStatus {
-                url,
-                status: resp.status().as_u16(),
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(ClientError::RemoteRejected {
+                status: status.as_u16(),
+                body: format!("{url}: {body}"),
             });
         }
         Ok(snapshot_id)

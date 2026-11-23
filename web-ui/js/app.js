@@ -631,7 +631,10 @@
     copyBtn.type = 'button';
     copyBtn.className = 'neu-btn neu-btn--compact';
     copyBtn.textContent = '复制';
+    copyBtn.disabled = payload.encrypted === true;
+    if (copyBtn.disabled) copyBtn.textContent = '需客户端解密';
     bindPressAction(copyBtn, async () => {
+      if (payload.encrypted === true) return;
       const ok = await copyTextToClipboard(payload.content);
       setFeedback(
         el.clipFeedback,
@@ -644,7 +647,9 @@
 
     const body = document.createElement('pre');
     body.className = 'clip-item__body';
-    body.textContent = payload.content;
+    body.textContent = payload.encrypted === true
+      ? '内容已端到端加密，请在已配对的原生客户端中查看。'
+      : payload.content;
 
     item.append(head, body);
     el.clipboardFeed.prepend(item);

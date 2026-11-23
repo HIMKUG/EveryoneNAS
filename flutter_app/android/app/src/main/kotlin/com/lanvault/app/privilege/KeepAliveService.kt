@@ -47,20 +47,60 @@ class KeepAliveService : Service() {
         const val EXTRA_VAULT_PATH = "vault_path"
         const val EXTRA_QUOTA_GB = "quota_gb"
         const val EXTRA_PORT = "port"
+        const val EXTRA_WEB_PASSWORD = "web_password"
 
         private const val WORK_NAME = "lanvault_level0_periodic_recovery"
         private const val PREFS_NAME = "lanvault_keep_alive_prefs"
 
-        fun start(context: Context, vaultPath: String, quotaGb: Long, port: Int) {
-            saveLastConfig(context, vaultPath, quotaGb, port)
+        data class LastConfig(
+            val vaultPath: String,
+            val quotaGb: Long,
+            val port: Int,
+            val webPassword: String,
+        )
+
+        init {
+            System.loadLibrary("lanvault_ffi")
+        }
+
+        @JvmStatic
+        external fun nativeStartKeepAliveServer(
+            vaultPath: String,
+            quotaGb: Long,
+            port: Int,
+            webPassword: String,
+        ): Boolean
+
+        @JvmStatic
+        external fun nativeGracefulRestartKeepAliveServer(): Boolean
+
+        fun start(
+            context: Context,
+            vaultPath: String,
+            quotaGb: Long,
+            port: Int,
+            webPassword: String,
+        ) {
+            saveLastConfig(context, vaultPath, quotaGb, port, webPassword)
             val intent = Intent(context, KeepAliveService::class.java).apply {
                 action = ACTION_START
                 putExtra(EXTRA_VAULT_PATH, vaultPath)
                 putExtra(EXTRA_QUOTA_GB, quotaGb)
                 putExtra(EXTRA_PORT, port)
+                putExtra(EXTRA_WEB_PASSWORD, webPassword)
             }
             ContextCompat.startForegroundService(context, intent)
             scheduleRecoveryWork(context)
+        }
+
+        fun rememberConfig(
+            context: Context,
+            vaultPath: String,
+            quotaGb: Long,
+            port: Int,
+            webPassword: String,
+        ) {
+            saveLastConfig(context, vaultPath, quotaGb, port, webPassword)
         }
 
         fun requestGracefulRestart(context: Context) {
@@ -107,13 +147,30 @@ class KeepAliveService : Service() {
             )
         }
 
-        private fun saveLastConfig(context: Context, vaultPath: String, quotaGb: Long, port: Int) {
+        private fun saveLastConfig(
+            context: Context,
+            vaultPath: String,
+            quotaGb: Long,
+            port: Int,
+            webPassword: String,
+        ) {
             context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit()
                 .putString(EXTRA_VAULT_PATH, vaultPath)
                 .putLong(EXTRA_QUOTA_GB, quotaGb)
                 .putInt(EXTRA_PORT, port)
+                .putString(EXTRA_WEB_PASSWORD, webPassword)
                 .apply()
+        }
+
+        fun loadLastConfig(context: Context): LastConfig? {
+            val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            val path = prefs.getString(EXTRA_VAULT_PATH, null) ?: return null
+            val quotaGb = prefs.getLong(EXTRA_QUOTA_GB, 0L)
+            val port = prefs.getInt(EXTRA_PORT, 0)
+            val webPassword = prefs.getString(EXTRA_WEB_PASSWORD, null) ?: return null
+            if (quotaGb <= 0L || port <= 0 || webPassword.length < 8) return null
+            return LastConfig(path, quotaGb, port, webPassword)
         }
     }
 
@@ -122,6 +179,7 @@ class KeepAliveService : Service() {
     private var activeVaultPath: String = "/storage/emulated/0/LanVault"
     private var activeQuotaGb: Long = 100L
     private var activePort: Int = 7842
+    private var activeWebPassword: String = ""
 
     override fun onCreate() {
         super.onCreate()
@@ -155,8 +213,19 @@ class KeepAliveService : Service() {
                     ?: prefs.getLong(EXTRA_QUOTA_GB, activeQuotaGb)
                 activePort = intent?.getIntExtra(EXTRA_PORT, -1)?.takeIf { it > 0 }
                     ?: prefs.getInt(EXTRA_PORT, activePort)
+                activeWebPassword = intent?.getStringExtra(EXTRA_WEB_PASSWORD)
+                    ?: prefs.getString(EXTRA_WEB_PASSWORD, activeWebPassword)!!
 
                 promoteToForeground("运行中 · 端口 $activePort (Level 0)")
+                val vaultPath = activeVaultPath
+                val quotaGb = activeQuotaGb
+                val port = activePort
+                val webPassword = activeWebPassword
+                Thread {
+                    if (!nativeStartKeepAliveServer(vaultPath, quotaGb, port, webPassword)) {
+                        stopSelf(startId)
+                    }
+                }.start()
                 return START_STICKY
             }
         }
@@ -226,7 +295,18 @@ class KeepAliveService : Service() {
     private fun performGracefulRestart() {
         releaseTransferLocks()
         promoteToForeground("正在执行优雅重启（WAL 刷盘）…")
-        promoteToForeground("运行中 · 端口 $activePort (Level 0)")
+        val vaultPath = activeVaultPath
+        val quotaGb = activeQuotaGb
+        val port = activePort
+        val webPassword = activeWebPassword
+        Thread {
+            val stopped = nativeGracefulRestartKeepAliveServer()
+            val restarted =
+                stopped && nativeStartKeepAliveServer(vaultPath, quotaGb, port, webPassword)
+            if (!restarted) {
+                stopSelf()
+            }
+        }.start()
     }
 
     private fun promoteToForeground(contentText: String) {
@@ -305,19 +385,51 @@ class KeepAliveRecoveryWorker(
         return when (PrivilegeDetector.detect()) {
             KeepAliveLevel.LEVEL_3_MAGISK_DAEMON -> Result.success()
             KeepAliveLevel.LEVEL_2_ROOT_LIBSU -> {
-                withContext(Dispatchers.Main) {
-                    RootDaemonService.ensureBound(applicationContext)
+                val config = KeepAliveService.loadLastConfig(applicationContext)
+                if (config == null) {
+                    Result.failure()
+                } else {
+                    val started = RootDaemonService.bindAndStart(
+                        applicationContext,
+                        config.vaultPath,
+                        config.quotaGb,
+                        config.port,
+                        config.webPassword,
+                    )
+                    if (started) Result.success() else Result.retry()
                 }
-                Result.success()
             }
             KeepAliveLevel.LEVEL_1_SHIZUKU -> {
-                ShizukuBridge.ensureBound(applicationContext)
-                Result.success()
+                val config = KeepAliveService.loadLastConfig(applicationContext)
+                if (config == null) {
+                    Result.failure()
+                } else {
+                    val started = ShizukuBridge.bindAndStart(
+                        applicationContext,
+                        config.vaultPath,
+                        config.quotaGb,
+                        config.port,
+                        config.webPassword,
+                    )
+                    if (started) Result.success() else Result.retry()
+                }
             }
             KeepAliveLevel.LEVEL_0_FOREGROUND -> {
                 // Level 0 在后台 WorkManager 窗口内执行增量扫描与健康检查，
                 // 避免违反 Android 15 后台拉起 dataSync 前台服务限制。
-                Result.success()
+                val config = KeepAliveService.loadLastConfig(applicationContext)
+                if (config == null) {
+                    Result.failure()
+                } else {
+                    KeepAliveService.start(
+                        applicationContext,
+                        config.vaultPath,
+                        config.quotaGb,
+                        config.port,
+                        config.webPassword,
+                    )
+                    Result.success()
+                }
             }
         }
     }

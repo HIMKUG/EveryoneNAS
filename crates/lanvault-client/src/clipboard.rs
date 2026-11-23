@@ -13,14 +13,13 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::error::ClientError;
+use lanvault_core::CLIPBOARD_AAD;
 
 /// 单次剪贴板/快传 JSON 请求体上限（12 MiB，匹配服务端 16 MiB 帧与请求体限制）。
 pub const MAX_CLIPBOARD_JSON_BYTES: usize = 12 * 1024 * 1024;
 
 /// 临时文件快传原始字节上限（5 MiB，经十六进制编码与 AEAD 封装后严格不超过 12 MiB JSON 上限）。
 pub const MAX_TEMP_FILE_BYTES: u64 = 5 * 1024 * 1024;
-
-const CLIPBOARD_AAD: &[u8] = b"lanvault.clipboard.v1";
 
 /// 对齐契约 `POST /api/clipboard` 请求载荷。
 #[derive(Debug, Clone, Serialize, Deserialize)]

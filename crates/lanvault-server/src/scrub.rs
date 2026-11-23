@@ -104,22 +104,17 @@ impl BitRotScrubber {
 
                         for chunk in part {
                             local_bytes = local_bytes.saturating_add(chunk.stored_size);
-                            let on_disk_ok = match store
-                                .read_chunk_raw_on_primary(vault_id, &chunk.hash_blake3)
-                            {
-                                Ok(bytes) => blake3_hash(&bytes) == chunk.hash_blake3,
-                                Err(_) => false,
-                            };
-
-                            if on_disk_ok {
+                            let replica_report =
+                                store.inspect_chunk_copies(vault_id, &chunk.hash_blake3)?;
+                            if replica_report.healthy_copies >= replica_report.required_copies {
                                 local_updates.push((chunk.hash_blake3, ScrubStatus::Ok));
                                 continue;
                             }
 
                             let hash_hex = hex::encode(chunk.hash_blake3);
-                            if is_raid1 {
-                                if let Some(healthy_bytes) =
-                                    store.try_read_healthy_mirror(vault_id, &chunk.hash_blake3)?
+                            if is_raid1 && replica_report.healthy_copies > 0 {
+                                if let Ok(healthy_bytes) =
+                                    store.get_chunk(vault_id, &chunk.hash_blake3)
                                 {
                                     store.overwrite_chunk_for_heal(
                                         vault_id,

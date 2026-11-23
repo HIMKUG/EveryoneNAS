@@ -7,16 +7,18 @@ pub mod scrub;
 pub mod vault;
 pub mod web;
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashSet;
 use lanvault_core::{
-    Database, DeviceIdentity, DiscoveryAnnouncement, LanVaultError, MdnsRegistrar, PoolMode,
-    Result,
+    blake3_hash, Database, DeviceIdentity, DiscoveryAnnouncement, LanVaultError, MdnsRegistrar,
+    PoolMode, Result, RetentionTier, SnapshotRecord, TrustedPeer, VaultRecord,
+    VaultVolumeRecord,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -32,6 +34,12 @@ use crate::web::{build_router, AppState, WsServerEvent};
 
 /// Periodic background GFS snapshot GC interval (6 hours).
 const GC_INTERVAL_SECS: u64 = 6 * 3600;
+const GC_CHECK_INTERVAL_SECS: u64 = 10 * 60;
+const GC_LAST_RUN_SETTING: &str = "gc_last_run_unix_secs";
+const SCRUB_INTERVAL_SECS: u64 = 24 * 3600;
+const SCRUB_CHECK_INTERVAL_SECS: u64 = 30 * 60;
+const SCRUB_LAST_RUN_SETTING: &str = "scrub_last_run_unix_secs";
+const INDEX_RECOVERY_SETTING: &str = "index_recovery_version";
 
 /// Reason why the LanVault HTTP/WS server exited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +50,7 @@ pub enum ServerExitReason {
 
 /// Server startup configuration (can be loaded from JSON or `key = value` TOML via `--config`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub bind_addr: String,
     pub port: u16,
@@ -55,11 +64,11 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0".to_string(),
+            bind_addr: "127.0.0.1".to_string(),
             port: 7842,
             vault_root: PathBuf::from("./everyonenas_data"),
             default_quota_bytes: 100 * 1024 * 1024 * 1024,
-            web_password: "everyonenas-change-me".to_string(),
+            web_password: String::new(),
             device_name: "EveryoneNAS-Server".to_string(),
             keep_alive_level: default_keep_alive_level().to_string(),
         }
@@ -105,7 +114,12 @@ impl ServerConfig {
                 "web_password" => cfg.web_password = val.to_string(),
                 "device_name" => cfg.device_name = val.to_string(),
                 "keep_alive_level" => cfg.keep_alive_level = val.to_string(),
-                _ => {}
+                _ => {
+                    return Err(LanVaultError::InvalidInput(format!(
+                        "unknown config key `{key}` on line {}",
+                        line_no + 1
+                    )));
+                }
             }
         }
         Ok(cfg)
@@ -128,7 +142,17 @@ pub async fn serve_with_shutdown(
     shutdown_rx: oneshot::Receiver<()>,
     bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
 ) -> Result<ServerExitReason> {
+    #[cfg(unix)]
+    let vault_root_existed = config.vault_root.exists();
     std::fs::create_dir_all(&config.vault_root)?;
+    #[cfg(unix)]
+    if !vault_root_existed {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &config.vault_root,
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+    }
     lanvault_core::install_rust_panic_hook();
     lanvault_core::configure_debug_log_file(&config.vault_root.join("lanvault_debug.log"));
     let db_path = config.vault_root.join("index.db");
@@ -137,19 +161,56 @@ pub async fn serve_with_shutdown(
 
     // Ensure at least one default vault exists on first boot.
     if db.list_vaults()?.is_empty() {
-        vault_store.create_vault(
-            "Default Vault".to_string(),
-            config.vault_root.to_string_lossy().into_owned(),
-            None,
-            PoolMode::Single,
-            config.default_quota_bytes,
-            true,
-            Vec::new(),
-        )?;
+        let metadata_path = config.vault_root.join("vault.meta.json");
+        if metadata_path.exists() {
+            let meta = VaultStore::read_vault_meta(&config.vault_root)?;
+            let vault = VaultRecord {
+                vault_id: meta.vault_id.clone(),
+                name: meta.name.clone(),
+                pool_mode: meta.pool_mode,
+                quota_bytes: meta.quota_bytes,
+                used_bytes: 0,
+                e2ee_enabled: meta.e2ee_enabled,
+                created_at: meta.created_at,
+            };
+            let volumes: Vec<VaultVolumeRecord> = meta
+                .volumes
+                .iter()
+                .map(|volume| VaultVolumeRecord {
+                    volume_id: volume.volume_id.clone(),
+                    vault_id: meta.vault_id.clone(),
+                    mount_path: volume.mount_path.clone(),
+                    volume_guid: volume.volume_guid.clone(),
+                    role: volume.role,
+                    is_online: true,
+                })
+                .collect();
+            db.insert_vault(&vault, &volumes)?;
+        } else {
+            vault_store.create_vault(
+                "Default Vault".to_string(),
+                config.vault_root.to_string_lossy().into_owned(),
+                None,
+                PoolMode::Single,
+                config.default_quota_bytes,
+                true,
+                Vec::new(),
+            )?;
+        }
+    }
+    if db.get_setting(INDEX_RECOVERY_SETTING)?.as_deref() != Some("1") {
+        if recover_index_from_volumes(&db, &config.vault_root)? {
+            db.set_setting(INDEX_RECOVERY_SETTING, "1")?;
+        } else {
+            warn!("index recovery was incomplete and will be retried on next startup");
+        }
     }
 
-    let identity = DeviceIdentity::load_or_generate(&config.vault_root.join("device.key"))?;
+    let identity = Arc::new(DeviceIdentity::load_or_generate(
+        &config.vault_root.join("device.key"),
+    )?);
     let device_id = format!("lv-{}", &identity.fingerprint_hex()[..12]);
+    let clipboard_key = identity.derive_local_storage_key("clipboard-group");
     let pairing_pin = generate_six_digit_pin();
 
     let (ws_tx, _) = broadcast::channel::<WsServerEvent>(256);
@@ -158,45 +219,15 @@ pub async fn serve_with_shutdown(
     // Forward Bit-Rot alerts into the unified WebSocket broadcast channel.
     let ws_tx_for_alerts = ws_tx.clone();
     let alert_task = tokio::spawn(async move {
-        while let Ok(alert) = alert_rx.recv().await {
-            let _ = ws_tx_for_alerts.send(WsServerEvent::BitRotAlert(alert));
-        }
-    });
-
-    // Background periodic GFS snapshot retention & orphan chunk GC task.
-    let gc_db = Arc::clone(&db);
-    let gc_store = Arc::clone(&vault_store);
-    let gc_task = tokio::spawn(async move {
-        let interval_dur = Duration::from_secs(GC_INTERVAL_SECS);
-        let mut ticker =
-            tokio::time::interval_at(tokio::time::Instant::now() + interval_dur, interval_dur);
         loop {
-            ticker.tick().await;
-            let db_clone = Arc::clone(&gc_db);
-            let store_clone = Arc::clone(&gc_store);
-            let run_res = tokio::task::spawn_blocking(move || -> Result<()> {
-                let collector = GarbageCollector::new(Arc::clone(&db_clone), store_clone);
-                let now = unix_timestamp_secs();
-                for vault in db_clone.list_vaults()? {
-                    match collector.run_gc(&vault.vault_id, now, GfsPolicy::default()) {
-                        Ok(report) => info!(
-                            vault_id = %vault.vault_id,
-                            expired_snapshots = report.expired_snapshots,
-                            deleted_chunks = report.deleted_chunks,
-                            reclaimed_bytes = report.reclaimed_bytes,
-                            "periodic GFS garbage collection completed"
-                        ),
-                        Err(err) => warn!(
-                            vault_id = %vault.vault_id,
-                            "periodic GFS garbage collection failed: {err}"
-                        ),
-                    }
+            match alert_rx.recv().await {
+                Ok(alert) => {
+                    let _ = ws_tx_for_alerts.send(WsServerEvent::BitRotAlert(alert));
                 }
-                Ok(())
-            })
-            .await;
-            if let Err(err) = run_res {
-                warn!("periodic GC task join error: {err}");
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "bit-rot alert subscriber lagged");
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     });
@@ -207,10 +238,21 @@ pub async fn serve_with_shutdown(
         alert_tx,
     ));
 
+    if config.web_password.len() < 8 {
+        return Err(LanVaultError::InvalidInput(
+            "web_password must be explicitly configured with at least 8 characters".to_string(),
+        ));
+    }
     let auth = Arc::new(if config.web_password.starts_with("$argon2") {
-        AuthManager::from_password_hash(config.web_password.clone())?
+        AuthManager::from_password_hash(
+            config.web_password.clone(),
+            Arc::clone(&identity),
+        )?
     } else {
-        AuthManager::from_plaintext_password(&config.web_password)?
+        AuthManager::from_plaintext_password(
+            &config.web_password,
+            Arc::clone(&identity),
+        )?
     });
 
     let bind_ip: IpAddr = config.bind_addr.parse().map_err(|_| {
@@ -240,6 +282,8 @@ pub async fn serve_with_shutdown(
     let restart_notify = Arc::new(Notify::new());
     let state = Arc::new(AppState {
         device_id,
+        identity: Arc::clone(&identity),
+        clipboard_key,
         os_name: current_os_name().to_string(),
         keep_alive_level: config.keep_alive_level,
         lan_ip,
@@ -247,17 +291,106 @@ pub async fn serve_with_shutdown(
         mdns_active: AtomicBool::new(mdns_handle.is_some()),
         started_at: Instant::now(),
         throughput_bps: AtomicU64::new(0),
+        transfer_bytes: AtomicU64::new(0),
+        throughput_sample: std::sync::Mutex::new((Instant::now(), 0)),
         active_chunk_writes: AtomicU64::new(0),
         accepting_tasks: AtomicBool::new(true),
-        pairing_pin,
+        pairing_pin: std::sync::Mutex::new(pairing_pin),
         online_peers: DashSet::new(),
-        peer_session_keys: DashMap::new(),
         db: Arc::clone(&db),
-        vault_store,
-        scrubber,
+        vault_store: Arc::clone(&vault_store),
+        scrubber: Arc::clone(&scrubber),
         auth,
         ws_tx,
         restart_notify: Arc::clone(&restart_notify),
+        telemetry_cache: std::sync::RwLock::new(None),
+    });
+
+    let gc_db = Arc::clone(&db);
+    let gc_store = Arc::clone(&vault_store);
+    let gc_task = tokio::spawn(async move {
+        let interval_dur = Duration::from_secs(GC_CHECK_INTERVAL_SECS);
+        let mut ticker = tokio::time::interval(interval_dur);
+        loop {
+            ticker.tick().await;
+            let db_clone = Arc::clone(&gc_db);
+            let store_clone = Arc::clone(&gc_store);
+            let run_res = tokio::task::spawn_blocking(move || -> Result<()> {
+                let now = unix_timestamp_secs();
+                let last_run = db_clone
+                    .get_setting(GC_LAST_RUN_SETTING)?
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(0);
+                if now.saturating_sub(last_run) < GC_INTERVAL_SECS as i64 {
+                    return Ok(());
+                }
+                let collector = GarbageCollector::new(Arc::clone(&db_clone), store_clone);
+                for vault in db_clone.list_vaults()? {
+                    match collector.run_gc(&vault.vault_id, now, GfsPolicy::default()) {
+                        Ok(report) => info!(
+                            vault_id = %vault.vault_id,
+                            expired_snapshots = report.expired_snapshots,
+                            deleted_chunks = report.deleted_chunks,
+                            reclaimed_bytes = report.reclaimed_bytes,
+                            "periodic GFS garbage collection completed"
+                        ),
+                        Err(err) => warn!(
+                            vault_id = %vault.vault_id,
+                            "periodic GFS garbage collection failed: {err}"
+                        ),
+                    }
+                }
+                db_clone.set_setting(GC_LAST_RUN_SETTING, &now.to_string())?;
+                Ok(())
+            })
+            .await;
+            if let Err(err) = run_res {
+                warn!("periodic GC task join error: {err}");
+            }
+        }
+    });
+
+    let scrub_db = Arc::clone(&db);
+    let scrubber_task = Arc::clone(&scrubber);
+    let scrub_task = tokio::spawn(async move {
+        let interval_dur = Duration::from_secs(SCRUB_CHECK_INTERVAL_SECS);
+        let mut ticker = tokio::time::interval(interval_dur);
+        loop {
+            ticker.tick().await;
+            let db_clone = Arc::clone(&scrub_db);
+            let scrubber_clone = Arc::clone(&scrubber_task);
+            let result = tokio::task::spawn_blocking(move || -> Result<()> {
+                let now = unix_timestamp_secs();
+                let last_run = db_clone
+                    .get_setting(SCRUB_LAST_RUN_SETTING)?
+                    .and_then(|value| value.parse::<i64>().ok())
+                    .unwrap_or(0);
+                if now.saturating_sub(last_run) < SCRUB_INTERVAL_SECS as i64 {
+                    return Ok(());
+                }
+                for vault in db_clone.list_vaults()? {
+                    match scrubber_clone.run_scrub(&vault.vault_id) {
+                        Ok(report) => info!(
+                            vault_id = %vault.vault_id,
+                            checked = report.checked_chunks,
+                            corrupted = report.corrupted_chunks,
+                            healed = report.healed_chunks,
+                            "periodic bit-rot scrub completed"
+                        ),
+                        Err(err) => warn!(
+                            vault_id = %vault.vault_id,
+                            "periodic bit-rot scrub failed: {err}"
+                        ),
+                    }
+                }
+                db_clone.set_setting(SCRUB_LAST_RUN_SETTING, &now.to_string())?;
+                Ok(())
+            })
+            .await;
+            if let Err(err) = result {
+                warn!("periodic scrub task join error: {err}");
+            }
+        }
     });
 
     let app = build_router(Arc::clone(&state));
@@ -266,6 +399,20 @@ pub async fn serve_with_shutdown(
     let graceful_restart = Arc::new(AtomicBool::new(false));
     let graceful_restart_flag = Arc::clone(&graceful_restart);
     let state_for_shutdown = Arc::clone(&state);
+    let terminate_signal = async {
+        #[cfg(unix)]
+        {
+            if let Ok(mut signal) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            {
+                signal.recv().await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            std::future::pending::<()>().await;
+        }
+    };
     let shutdown_signal = async move {
         tokio::select! {
             _ = restart_notify.notified() => {
@@ -274,6 +421,10 @@ pub async fn serve_with_shutdown(
             }
             _ = shutdown_rx => {
                 info!("external shutdown signal received; draining active tasks and checkpointing WAL");
+                Arc::clone(&state_for_shutdown).execute_graceful_restart().await;
+            }
+            _ = terminate_signal => {
+                info!("SIGTERM received; draining active tasks and checkpointing WAL");
                 Arc::clone(&state_for_shutdown).execute_graceful_restart().await;
             }
             _ = tokio::signal::ctrl_c() => {
@@ -291,6 +442,7 @@ pub async fn serve_with_shutdown(
     .await?;
 
     gc_task.abort();
+    scrub_task.abort();
     alert_task.abort();
 
     if let Some(reg) = mdns_handle {
@@ -304,7 +456,205 @@ pub async fn serve_with_shutdown(
     }
 }
 
-fn generate_six_digit_pin() -> String {
+#[derive(Debug, Deserialize)]
+struct RecoveredManifest {
+    snapshot_id: String,
+    vault_id: String,
+    #[serde(default)]
+    rule_id: String,
+    device_id: String,
+    root_tree_hash_hex: String,
+    created_at: i64,
+    files: Vec<RecoveredManifestFile>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RecoveredManifestFile {
+    rel_path: String,
+    size: u64,
+    #[serde(default)]
+    mtime_ns: i64,
+    #[serde(default)]
+    chunk_hashes_hex: Vec<String>,
+}
+
+fn recover_index_from_volumes(db: &Database, vault_root: &Path) -> Result<bool> {
+    let mut processed_manifests = HashSet::new();
+    let mut complete = true;
+    for vault in db.list_vaults()? {
+        for volume in db.list_vault_volumes(&vault.vault_id)? {
+            if !volume.is_online {
+                complete = false;
+                continue;
+            }
+            let root = PathBuf::from(&volume.mount_path);
+            let chunks_root = root.join("chunks");
+            if let Ok(buckets) = std::fs::read_dir(&chunks_root) {
+                for bucket in buckets.flatten() {
+                    let Ok(entries) = std::fs::read_dir(bucket.path()) else {
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if !path.is_file() {
+                            continue;
+                        }
+                        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                            continue;
+                        };
+                        let Ok(hash) = hex::decode(name) else {
+                            continue;
+                        };
+                        let Ok(hash) = <Vec<u8> as TryInto<[u8; 32]>>::try_into(hash) else {
+                            continue;
+                        };
+                        let stored_size = entry.metadata()?.len();
+                        db.insert_chunk_if_missing(
+                            &vault.vault_id,
+                            &hash,
+                            0,
+                            stored_size,
+                        )?;
+                    }
+                }
+            } else {
+                complete = false;
+            }
+
+            let manifests_root = root.join("manifests");
+            let Ok(manifests) = std::fs::read_dir(&manifests_root) else {
+                complete = false;
+                continue;
+            };
+            for entry in manifests.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|extension| extension.to_str()) != Some("json")
+                    || !processed_manifests.insert(path.clone())
+                {
+                    continue;
+                }
+                let manifest: RecoveredManifest = match serde_json::from_slice(
+                    &std::fs::read(&path)?,
+                ) {
+                    Ok(manifest) => manifest,
+                    Err(err) => {
+                        warn!(path = %path.display(), "skipping invalid recovery manifest: {err}");
+                        complete = false;
+                        continue;
+                    }
+                };
+                let root_hash: [u8; 32] = match hex::decode(&manifest.root_tree_hash_hex)
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                {
+                    Some(hash) => hash,
+                    None => {
+                        warn!(
+                            path = %path.display(),
+                            "skipping manifest with invalid root hash"
+                        );
+                        complete = false;
+                        continue;
+                    }
+                };
+                let mut hashes = Vec::new();
+                let mut canonical = Vec::new();
+                for hash_hex in manifest
+                    .files
+                    .iter()
+                    .flat_map(|file| file.chunk_hashes_hex.iter())
+                {
+                    let Ok(hash) = hex::decode(hash_hex) else {
+                        continue;
+                    };
+                    let Ok(hash) = <Vec<u8> as TryInto<[u8; 32]>>::try_into(hash) else {
+                        continue;
+                    };
+                    hashes.push(hash);
+                }
+                let mut files = manifest.files.clone();
+                files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+                for file in &files {
+                    canonical.extend_from_slice(file.rel_path.as_bytes());
+                    canonical.push(0);
+                    canonical.extend_from_slice(&file.size.to_le_bytes());
+                    canonical.extend_from_slice(&file.mtime_ns.to_le_bytes());
+                    for hash_hex in &file.chunk_hashes_hex {
+                        let hash: Option<[u8; 32]> = hex::decode(hash_hex)
+                            .ok()
+                            .and_then(|bytes| bytes.try_into().ok());
+                        if let Some(hash) = hash {
+                            canonical.extend_from_slice(&hash);
+                        }
+                    }
+                }
+                if blake3_hash(&canonical) != root_hash {
+                    warn!(
+                        path = %path.display(),
+                        "skipping manifest whose root hash does not match its contents"
+                    );
+                    complete = false;
+                    continue;
+                }
+                hashes.sort_unstable();
+                hashes.dedup();
+                if hashes.iter().any(|hash| {
+                    db.get_chunk(&manifest.vault_id, hash)
+                        .map(|chunk| chunk.is_none())
+                        .unwrap_or(true)
+                }) {
+                    warn!(
+                        path = %path.display(),
+                        "skipping manifest with missing chunks"
+                    );
+                    complete = false;
+                    continue;
+                }
+                if db.get_trusted_peer(&manifest.device_id)?.is_none() {
+                    db.upsert_trusted_peer(&TrustedPeer {
+                        device_id: manifest.device_id.clone(),
+                        device_name: "recovered-device".to_string(),
+                        os_type: "unknown".to_string(),
+                        ed25519_pubkey: Vec::new(),
+                        last_ip: None,
+                        last_port: None,
+                        auto_connect: false,
+                        paired_at: manifest.created_at,
+                        revoked_at: Some(manifest.created_at),
+                    })?;
+                }
+                let record = SnapshotRecord {
+                    snapshot_id: manifest.snapshot_id,
+                    vault_id: manifest.vault_id,
+                    rule_id: if manifest.rule_id.is_empty() {
+                        "legacy".to_string()
+                    } else {
+                        manifest.rule_id
+                    },
+                    device_id: manifest.device_id,
+                    root_tree_hash: root_hash,
+                    retention_tier: RetentionTier::Daily,
+                    file_count: manifest.files.len() as u64,
+                    total_bytes: manifest
+                        .files
+                        .iter()
+                        .fold(0u64, |total, file| total.saturating_add(file.size)),
+                    created_at: manifest.created_at,
+                };
+                db.insert_snapshot_with_chunks(&record, &hashes)?;
+            }
+        }
+        let actual_bytes = db
+            .list_all_chunks(&vault.vault_id)?
+            .iter()
+            .fold(0u64, |total, chunk| total.saturating_add(chunk.stored_size));
+        db.set_vault_used_bytes(&vault.vault_id, actual_bytes)?;
+    }
+    let _ = vault_root;
+    Ok(complete)
+}
+
+pub(crate) fn generate_six_digit_pin() -> String {
     let mut rng = rand::thread_rng();
     let num: u32 = rng.gen_range(0..1_000_000);
     format!("{num:06}")

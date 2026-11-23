@@ -21,6 +21,9 @@ import android.util.Log
 import com.topjohnwu.superuser.ipc.RootService
 import java.io.File
 import java.io.IOException
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Level 2 Root Daemon 模式保活服务（UID 0）：
@@ -34,6 +37,7 @@ class RootDaemonService : RootService() {
         private const val DESCRIPTOR = "com.lanvault.app.privilege.IRootDaemon"
         private const val TX_START_SERVER = IBinder.FIRST_CALL_TRANSACTION + 1
         private const val TX_GRACEFUL_RESTART = IBinder.FIRST_CALL_TRANSACTION + 2
+        private const val TX_STOP_SERVER = IBinder.FIRST_CALL_TRANSACTION + 3
 
         init {
             // 与 libsu AIDLService 示例一致：仅在 UID 0 的 Root 进程中加载 JNI .so，
@@ -44,7 +48,12 @@ class RootDaemonService : RootService() {
         }
 
         @JvmStatic
-        external fun nativeStartRootServer(vaultPath: String, quotaGb: Long, port: Int): Boolean
+        external fun nativeStartRootServer(
+            vaultPath: String,
+            quotaGb: Long,
+            port: Int,
+            webPassword: String,
+        ): Boolean
 
         @JvmStatic
         external fun nativeGracefulRestartRootServer(): Boolean
@@ -54,22 +63,48 @@ class RootDaemonService : RootService() {
         @Volatile
         private var remoteBinder: IBinder? = null
 
+        private data class PendingLaunch(
+            val vaultPath: String,
+            val quotaGb: Long,
+            val port: Int,
+            val webPassword: String,
+            val latch: CountDownLatch,
+            val result: AtomicBoolean,
+        )
+
         @Volatile
-        private var pendingLaunch: Triple<String, Long, Int>? = null
+        private var pendingLaunch: PendingLaunch? = null
 
         private val connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-                if (service == null || !service.pingBinder()) return
+                if (service == null || !service.pingBinder()) {
+                    completePending(false)
+                    return
+                }
                 remoteBinder = service
                 val pending = pendingLaunch
                 if (pending != null) {
                     pendingLaunch = null
-                    transactStart(service, pending.first, pending.second, pending.third)
+                    Thread {
+                        try {
+                            val ok = transactStart(
+                                service,
+                                pending.vaultPath,
+                                pending.quotaGb,
+                                pending.port,
+                                pending.webPassword,
+                            )
+                            pending.result.set(ok)
+                        } finally {
+                            pending.latch.countDown()
+                        }
+                    }.start()
                 }
             }
 
             override fun onServiceDisconnected(name: ComponentName?) {
                 remoteBinder = null
+                completePending(false)
             }
         }
 
@@ -88,15 +123,43 @@ class RootDaemonService : RootService() {
             }
         }
 
-        fun bindAndStart(context: Context, vaultPath: String, quotaGb: Long, port: Int) {
+        fun bindAndStart(
+            context: Context,
+            vaultPath: String,
+            quotaGb: Long,
+            port: Int,
+            webPassword: String,
+        ): Boolean {
+            val latch = CountDownLatch(1)
+            val result = AtomicBoolean(false)
             val existing = remoteBinder
             if (existing != null && existing.pingBinder()) {
                 pendingLaunch = null
-                transactStart(existing, vaultPath, quotaGb, port)
-                return
+                return transactStart(existing, vaultPath, quotaGb, port, webPassword)
             }
-            pendingLaunch = Triple(vaultPath, quotaGb, port)
+            completePending(false)
+            val pending = PendingLaunch(
+                vaultPath,
+                quotaGb,
+                port,
+                webPassword,
+                latch,
+                result,
+            )
+            pendingLaunch = pending
             bindOnMainThread(context)
+            val completed = latch.await(10, TimeUnit.SECONDS)
+            if (!completed && pendingLaunch === pending) {
+                pendingLaunch = null
+            }
+            return completed && result.get()
+        }
+
+        private fun completePending(value: Boolean) {
+            val pending = pendingLaunch ?: return
+            pendingLaunch = null
+            pending.result.set(value)
+            pending.latch.countDown()
         }
 
         fun ensureBound(context: Context) {
@@ -123,11 +186,30 @@ class RootDaemonService : RootService() {
             }
         }
 
+        fun stopServer(context: Context): Boolean {
+            val binder = remoteBinder ?: run {
+                ensureBound(context)
+                return false
+            }
+            val data = Parcel.obtain()
+            val reply = Parcel.obtain()
+            try {
+                data.writeInterfaceToken(DESCRIPTOR)
+                binder.transact(TX_STOP_SERVER, data, reply, 0)
+                reply.readException()
+                return reply.readInt() == 1
+            } finally {
+                data.recycle()
+                reply.recycle()
+            }
+        }
+
         private fun transactStart(
             binder: IBinder,
             vaultPath: String,
             quotaGb: Long,
             port: Int,
+            webPassword: String,
         ): Boolean {
             val data = Parcel.obtain()
             val reply = Parcel.obtain()
@@ -136,6 +218,7 @@ class RootDaemonService : RootService() {
                 data.writeString(vaultPath)
                 data.writeLong(quotaGb)
                 data.writeInt(port)
+                data.writeString(webPassword)
                 binder.transact(TX_START_SERVER, data, reply, 0)
                 reply.readException()
                 return reply.readInt() == 1
@@ -146,6 +229,16 @@ class RootDaemonService : RootService() {
         }
     }
 
+    private data class LaunchConfig(
+        val vaultPath: String,
+        val quotaGb: Long,
+        val port: Int,
+        val webPassword: String,
+    )
+
+    @Volatile
+    private var lastLaunch: LaunchConfig? = null
+
     private val daemonBinder = object : Binder() {
         override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
             return when (code) {
@@ -154,7 +247,11 @@ class RootDaemonService : RootService() {
                     val vaultPath = data.readString()!!
                     val quotaGb = data.readLong()
                     val port = data.readInt()
-                    val ok = nativeStartRootServer(vaultPath, quotaGb, port)
+                    val webPassword = data.readString()!!
+                    val ok = nativeStartRootServer(vaultPath, quotaGb, port, webPassword)
+                    if (ok) {
+                        lastLaunch = LaunchConfig(vaultPath, quotaGb, port, webPassword)
+                    }
                     reply?.writeNoException()
                     reply?.writeInt(if (ok) 1 else 0)
                     true
@@ -162,7 +259,29 @@ class RootDaemonService : RootService() {
 
                 TX_GRACEFUL_RESTART -> {
                     data.enforceInterface(DESCRIPTOR)
+                    val launch = lastLaunch
+                    val ok = launch != null &&
+                        nativeGracefulRestartRootServer() &&
+                        nativeStartRootServer(
+                            launch.vaultPath,
+                            launch.quotaGb,
+                            launch.port,
+                            launch.webPassword,
+                        )
+                    if (ok) {
+                        lastLaunch = launch
+                    }
+                    reply?.writeNoException()
+                    reply?.writeInt(if (ok) 1 else 0)
+                    true
+                }
+
+                TX_STOP_SERVER -> {
+                    data.enforceInterface(DESCRIPTOR)
                     val ok = nativeGracefulRestartRootServer()
+                    if (ok) {
+                        lastLaunch = null
+                    }
                     reply?.writeNoException()
                     reply?.writeInt(if (ok) 1 else 0)
                     true

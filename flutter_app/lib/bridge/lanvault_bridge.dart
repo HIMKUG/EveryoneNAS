@@ -193,6 +193,7 @@ class AndroidKeepAliveChannel {
     required String vaultPath,
     required int quotaGb,
     required int port,
+    required String webPassword,
   }) async {
     if (!Platform.isAndroid) return true;
     final started = await _channel.invokeMethod<bool>(
@@ -201,6 +202,7 @@ class AndroidKeepAliveChannel {
         'vaultPath': vaultPath,
         'quotaGb': quotaGb,
         'port': port,
+        'webPassword': webPassword,
       },
     );
     if (started == null) {
@@ -243,6 +245,39 @@ class AndroidKeepAliveChannel {
       throw StateError('requestStoragePermission returned null.');
     }
     return granted;
+  }
+
+  Future<({bool onWifi, String? currentSsid, bool isCharging})>
+      getDeviceEnvironment() async {
+    if (!Platform.isAndroid) {
+      return (onWifi: true, currentSsid: null, isCharging: true);
+    }
+    final raw = await _channel.invokeMapMethod<String, Object?>(
+      'getDeviceEnvironment',
+    );
+    if (raw == null) {
+      throw StateError('getDeviceEnvironment returned null.');
+    }
+    return (
+      onWifi: raw['onWifi'] as bool? ?? false,
+      currentSsid: raw['currentSsid'] as String?,
+      isCharging: raw['isCharging'] as bool? ?? false,
+    );
+  }
+
+  Future<({String vaultPath, int quotaGb, int port, String webPassword})?>
+      getLastServerConfig() async {
+    if (!Platform.isAndroid) return null;
+    final raw = await _channel.invokeMapMethod<String, Object?>(
+      'getLastServerConfig',
+    );
+    if (raw == null) return null;
+    return (
+      vaultPath: raw['vaultPath'] as String,
+      quotaGb: (raw['quotaGb'] as num).toInt(),
+      port: (raw['port'] as num).toInt(),
+      webPassword: raw['webPassword'] as String,
+    );
   }
 }
 
@@ -319,6 +354,7 @@ abstract class LanVaultRustFfi {
     required String vaultPath,
     required int quotaGb,
     required String webPassword,
+    int? port,
   });
   Future<void> prepareGracefulRestart();
   Stream<SyncProgressEvent> subscribeSyncProgress();
@@ -328,6 +364,11 @@ abstract class LanVaultRustFfi {
     required List<String> allowedSsids,
     required bool requireCharging,
     required int maxKbps,
+  });
+  Future<void> updateDeviceEnvironment({
+    required bool onWifi,
+    String? currentSsid,
+    required bool isCharging,
   });
   Future<void> pushClipboardText({
     String? targetDeviceId,
@@ -343,6 +384,8 @@ abstract class LanVaultRustFfi {
     bool enabled = true,
   });
   Future<bool> deleteSyncRule(String ruleId);
+  Future<String> exportVaultKeyBackup(String passphrase);
+  Future<void> importVaultKeyBackup(String passphrase, String backupJson);
   Future<bool> setDebugMode(bool enabled);
   Future<bool> getDebugMode();
   Future<List<DebugLogEntryModel>> getDebugLogs({int limit = 200});
@@ -506,11 +549,13 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
     required String vaultPath,
     required int quotaGb,
     required String webPassword,
+    int? port,
   }) async {
     final resp = await _callAsync('start_local_server', <String, Object?>{
       'vault_path': vaultPath,
       'quota_gb': quotaGb,
       'web_password': webPassword,
+      'port': port,
     });
     return (resp['port'] as num).toInt();
   }
@@ -551,6 +596,19 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
       'allowed_ssids': allowedSsids,
       'require_charging': requireCharging,
       'max_kbps': maxKbps,
+    });
+  }
+
+  @override
+  Future<void> updateDeviceEnvironment({
+    required bool onWifi,
+    String? currentSsid,
+    required bool isCharging,
+  }) async {
+    await _callAsync('update_device_environment', <String, Object?>{
+      'on_wifi': onWifi,
+      'current_ssid': currentSsid,
+      'is_charging': isCharging,
     });
   }
 
@@ -613,6 +671,25 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
   }
 
   @override
+  Future<String> exportVaultKeyBackup(String passphrase) async {
+    final resp = await _callAsync('export_vault_key_backup', <String, Object?>{
+      'passphrase': passphrase,
+    });
+    return resp['backup'] as String;
+  }
+
+  @override
+  Future<void> importVaultKeyBackup(
+    String passphrase,
+    String backupJson,
+  ) async {
+    await _callAsync('import_vault_key_backup', <String, Object?>{
+      'passphrase': passphrase,
+      'backup_json': backupJson,
+    });
+  }
+
+  @override
   Future<bool> setDebugMode(bool enabled) async {
     final resp = await _callAsync('set_debug_mode', <String, Object?>{
       'enabled': enabled,
@@ -667,12 +744,21 @@ class LanVaultBridge {
     RoleMode initialRoleMode = RoleMode.dual,
   })  : _rustFfi = rustFfi,
         _keepAliveChannel = keepAliveChannel ?? const AndroidKeepAliveChannel(),
-        roleModeNotifier = ValueNotifier<RoleMode>(initialRoleMode);
+        roleModeNotifier = ValueNotifier<RoleMode>(initialRoleMode) {
+    _environmentTimer = Timer.periodic(
+      const Duration(seconds: 15),
+      (_) => _refreshDeviceEnvironment(),
+    );
+    unawaited(_refreshDeviceEnvironment());
+  }
 
   static const int defaultServerPort = 7842;
 
   LanVaultRustFfi? _rustFfi;
   final AndroidKeepAliveChannel _keepAliveChannel;
+  Timer? _environmentTimer;
+  ({String vaultPath, int quotaGb, String webPassword, int port, bool elevated})?
+      _lastServerConfig;
 
   /// 运行模式单一真相源，供 Shell 导航栏与 Dashboard 实时联动。
   final ValueNotifier<RoleMode> roleModeNotifier;
@@ -682,7 +768,21 @@ class LanVaultBridge {
   LanVaultRustFfi get _ffi => _rustFfi ??= NativeLanVaultRustFfi();
 
   void dispose() {
+    _environmentTimer?.cancel();
     roleModeNotifier.dispose();
+  }
+
+  Future<void> _refreshDeviceEnvironment() async {
+    try {
+      final environment = await _keepAliveChannel.getDeviceEnvironment();
+      await _ffi.updateDeviceEnvironment(
+        onWifi: environment.onWifi,
+        currentSsid: environment.currentSsid,
+        isCharging: environment.isCharging,
+      );
+    } catch (_) {
+      // A subsequent periodic refresh retries transient platform failures.
+    }
   }
 
   // --- 运行模式管理（三态切换） ---
@@ -698,7 +798,21 @@ class LanVaultBridge {
     final applied = await _ffi.setRoleMode(mode);
 
     if (Platform.isAndroid && previous.hasServer && !applied.hasServer) {
-      await _keepAliveChannel.stopKeepAliveServer();
+      final stopped = await _keepAliveChannel.stopKeepAliveServer();
+      if (!stopped) {
+        final config = _lastServerConfig;
+        if (config != null && !config.elevated) {
+          await _ffi.startLocalServer(
+            vaultPath: config.vaultPath,
+            quotaGb: config.quotaGb,
+            webPassword: config.webPassword,
+            port: config.port,
+          );
+        }
+        final reverted = await _ffi.setRoleMode(previous);
+        roleModeNotifier.value = reverted;
+        throw StateError('后台服务未能停止，运行模式已回滚到 ${reverted.wireValue}。');
+      }
     }
 
     roleModeNotifier.value = applied;
@@ -739,9 +853,15 @@ class LanVaultBridge {
     if (quotaGb <= 0) {
       throw RangeError.value(quotaGb, 'quotaGb', '存储配额必须大于 0 GB');
     }
-    if (webPassword.length < 6) {
-      throw ArgumentError.value(webPassword, 'webPassword', 'Web 管理密码至少 6 位');
+    if (webPassword.length < 8) {
+      throw ArgumentError.value(webPassword, 'webPassword', 'Web 管理密码至少 8 位');
     }
+    final environment = await _keepAliveChannel.getDeviceEnvironment();
+    await _ffi.updateDeviceEnvironment(
+      onWifi: environment.onWifi,
+      currentSsid: environment.currentSsid,
+      isCharging: environment.isCharging,
+    );
 
     if (Platform.isAndroid) {
       final level = await _keepAliveChannel.detectKeepAliveLevel();
@@ -750,10 +870,18 @@ class LanVaultBridge {
           vaultPath: trimmedPath,
           quotaGb: quotaGb,
           port: port,
+          webPassword: webPassword,
         );
         if (!started) {
           throw StateError('提权守护进程启动失败（${level.wireValue}）');
         }
+        _lastServerConfig = (
+          vaultPath: trimmedPath,
+          quotaGb: quotaGb,
+          webPassword: webPassword,
+          port: port,
+          elevated: true,
+        );
         return port;
       }
 
@@ -761,20 +889,38 @@ class LanVaultBridge {
         vaultPath: trimmedPath,
         quotaGb: quotaGb,
         webPassword: webPassword,
+        port: port,
       );
       await _keepAliveChannel.startKeepAliveServer(
         vaultPath: trimmedPath,
         quotaGb: quotaGb,
         port: boundPort,
+        webPassword: webPassword,
+      );
+      _lastServerConfig = (
+        vaultPath: trimmedPath,
+        quotaGb: quotaGb,
+        webPassword: webPassword,
+        port: boundPort,
+        elevated: false,
       );
       return boundPort;
     }
 
-    return _ffi.startLocalServer(
+    final boundPort = await _ffi.startLocalServer(
       vaultPath: trimmedPath,
       quotaGb: quotaGb,
       webPassword: webPassword,
+      port: port,
     );
+    _lastServerConfig = (
+      vaultPath: trimmedPath,
+      quotaGb: quotaGb,
+      webPassword: webPassword,
+      port: boundPort,
+      elevated: false,
+    );
+    return boundPort;
   }
 
   Future<void> prepareGracefulRestart() => _ffi.prepareGracefulRestart();
@@ -815,16 +961,36 @@ class LanVaultBridge {
     return _ffi.deleteSyncRule(ruleId.trim());
   }
 
+  Future<String> exportVaultKeyBackup(String passphrase) {
+    if (passphrase.length < 12) {
+      throw ArgumentError.value(passphrase, 'passphrase', '密钥备份口令至少 12 位');
+    }
+    return _ffi.exportVaultKeyBackup(passphrase);
+  }
+
+  Future<void> importVaultKeyBackup(String passphrase, String backupJson) {
+    if (passphrase.length < 12 || backupJson.trim().isEmpty) {
+      throw ArgumentError('密钥备份口令或备份内容无效');
+    }
+    return _ffi.importVaultKeyBackup(passphrase, backupJson.trim());
+  }
+
   Future<void> updatePowerNetworkPolicy({
     required bool wifiOnly,
     required List<String> allowedSsids,
     required bool requireCharging,
     required int maxKbps,
-  }) {
+  }) async {
     if (maxKbps < 0) {
       throw RangeError.value(maxKbps, 'maxKbps', '限速值不能为负数');
     }
-    return _ffi.updatePowerNetworkPolicy(
+    final environment = await _keepAliveChannel.getDeviceEnvironment();
+    await _ffi.updateDeviceEnvironment(
+      onWifi: environment.onWifi,
+      currentSsid: environment.currentSsid,
+      isCharging: environment.isCharging,
+    );
+    await _ffi.updatePowerNetworkPolicy(
       wifiOnly: wifiOnly,
       allowedSsids: allowedSsids,
       requireCharging: requireCharging,
@@ -850,13 +1016,55 @@ class LanVaultBridge {
   Future<KeepAliveLevel> detectKeepAliveLevel() =>
       _keepAliveChannel.detectKeepAliveLevel();
 
-  Future<bool> stopKeepAliveServer() =>
-      _keepAliveChannel.stopKeepAliveServer();
+  Future<bool> stopKeepAliveServer() async {
+    final config = _lastServerConfig;
+    if (config != null && !config.elevated) {
+      await _ffi.prepareGracefulRestart();
+    }
+    final stopped = await _keepAliveChannel.stopKeepAliveServer();
+    if (stopped) {
+      _lastServerConfig = null;
+    }
+    return stopped;
+  }
 
   /// 完整优雅重启流程：先通知 Rust 停接新任务与 WAL 刷盘，再通过 Android 提权通道拉起。
   Future<bool> executeGracefulRestart() async {
+    var config = _lastServerConfig;
+    if (config == null && Platform.isAndroid) {
+      final saved = await _keepAliveChannel.getLastServerConfig();
+      final level = await _keepAliveChannel.detectKeepAliveLevel();
+      if (saved != null) {
+        config = (
+          vaultPath: saved.vaultPath,
+          quotaGb: saved.quotaGb,
+          webPassword: saved.webPassword,
+          port: saved.port,
+          elevated: level.isElevatedAndroidDaemon,
+        );
+      }
+    }
+    if (config == null) {
+      throw StateError('服务器尚未启动，无法执行优雅重启。');
+    }
+    if (config.elevated) {
+      return _keepAliveChannel.gracefulRestartServer();
+    }
     await _ffi.prepareGracefulRestart();
-    return _keepAliveChannel.gracefulRestartServer();
+    final boundPort = await _ffi.startLocalServer(
+      vaultPath: config.vaultPath,
+      quotaGb: config.quotaGb,
+      webPassword: config.webPassword,
+      port: config.port,
+    );
+    _lastServerConfig = (
+      vaultPath: config.vaultPath,
+      quotaGb: config.quotaGb,
+      webPassword: config.webPassword,
+      port: boundPort,
+      elevated: false,
+    );
+    return true;
   }
 
   Future<bool> requestBatteryExemption() =>

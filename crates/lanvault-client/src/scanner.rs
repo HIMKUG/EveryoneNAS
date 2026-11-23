@@ -10,7 +10,7 @@ use std::time::UNIX_EPOCH;
 
 use lanvault_core::{Database, LocalFileStateRecord};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::ClientError;
 
@@ -32,6 +32,7 @@ pub struct FileMetadataSnapshot {
 /// 数据库中存储的本地文件状态记录。
 #[derive(Debug, Clone)]
 pub struct StoredFileState {
+    pub target_vault_id: String,
     pub size: u64,
     pub mtime_ns: i64,
     pub file_id: Option<i64>,
@@ -67,6 +68,7 @@ impl DiffResult {
 pub fn reconcile_directory(
     db: &Database,
     rule_id: &str,
+    target_vault_id: &str,
     root_dir: &Path,
 ) -> Result<DiffResult, ClientError> {
     if !root_dir.is_dir() {
@@ -83,6 +85,7 @@ pub fn reconcile_directory(
             (
                 rec.rel_path,
                 StoredFileState {
+                    target_vault_id: rec.target_vault_id,
                     size: rec.size,
                     mtime_ns: rec.mtime_ns,
                     file_id: rec.file_id,
@@ -114,12 +117,20 @@ pub fn reconcile_directory(
             }
 
             let meta = entry.metadata()?;
-            let snapshot = build_snapshot(root_dir, &path, &meta)?;
+            let snapshot = match build_snapshot(root_dir, &path, &meta) {
+                Ok(snapshot) => snapshot,
+                Err(ClientError::InvalidPath { path, reason }) => {
+                    warn!(path = %path.display(), "skipping unportable file path: {reason}");
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
 
             match stored_map.remove(&snapshot.rel_path) {
                 None => diff.added.push(snapshot),
                 Some(prev) => {
-                    if prev.size != snapshot.size
+                    if prev.target_vault_id != target_vault_id
+                        || prev.size != snapshot.size
                         || prev.mtime_ns != snapshot.mtime_ns
                         || prev.file_id != snapshot.file_id
                     {
@@ -164,11 +175,13 @@ pub fn inspect_single_file(
 pub fn upsert_file_state(
     db: &Database,
     rule_id: &str,
+    target_vault_id: &str,
     snapshot: &FileMetadataSnapshot,
     chunk_hashes_blob: &[u8],
 ) -> Result<(), ClientError> {
     db.upsert_local_file_state(&LocalFileStateRecord {
         rule_id: rule_id.to_string(),
+        target_vault_id: target_vault_id.to_string(),
         rel_path: snapshot.rel_path.clone(),
         size: snapshot.size,
         mtime_ns: snapshot.mtime_ns,
@@ -199,7 +212,7 @@ fn build_snapshot(
             reason: format!("path is outside watch root {}", root_dir.display()),
         })?;
 
-    let rel_path = normalize_rel_path(rel);
+    let rel_path = normalize_rel_path(rel)?;
     let mtime_ns = meta
         .modified()?
         .duration_since(UNIX_EPOCH)
@@ -215,11 +228,18 @@ fn build_snapshot(
     })
 }
 
-fn normalize_rel_path(rel: &Path) -> String {
-    rel.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+fn normalize_rel_path(rel: &Path) -> Result<String, ClientError> {
+    let mut parts = Vec::new();
+    for component in rel.components() {
+        let Some(part) = component.as_os_str().to_str() else {
+            return Err(ClientError::InvalidPath {
+                path: rel.to_path_buf(),
+                reason: "file names must be valid UTF-8 for portable snapshots".to_string(),
+            });
+        };
+        parts.push(part);
+    }
+    Ok(parts.join("/"))
 }
 
 #[cfg(unix)]

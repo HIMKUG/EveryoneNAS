@@ -1294,11 +1294,13 @@ name = "lanvault-ffi"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "argon2",
  "flutter_rust_bridge",
  "hex",
  "lanvault-client",
  "lanvault-core",
  "lanvault-server",
+ "rand 0.8.8",
  "reqwest",
  "serde",
  "serde_json",

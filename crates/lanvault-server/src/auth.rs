@@ -2,16 +2,18 @@
 //! and `lv_session` (`HttpOnly; SameSite=Strict; Path=/`) cookie session management.
 
 use std::net::IpAddr;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::rand_core::OsRng as ArgonOsRng;
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use dashmap::mapref::entry::Entry;
-use dashmap::DashMap;
-use lanvault_core::{LanVaultError, Result};
+use dashmap::{DashMap, DashSet};
+use lanvault_core::{verify_ed25519, DeviceIdentity, LanVaultError, Result};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use tower_cookies::cookie::time::Duration as CookieDuration;
 use tower_cookies::cookie::SameSite;
 use tower_cookies::Cookie;
@@ -50,39 +52,82 @@ pub enum AuthOutcome {
     LockedOut { retry_after_secs: u64 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub is_admin: bool,
+    pub device_id: Option<String>,
+}
+
+struct SessionRecord {
+    expires_at: Instant,
+    info: SessionInfo,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SignedSession {
+    version: u8,
+    expires_at_secs: u64,
+    nonce_hex: String,
+    info: SessionInfo,
+}
+
 /// Manages Argon2id password verification, per-IP rate limiting, and session cookies.
 pub struct AuthManager {
     password_hash: String,
+    identity: Arc<DeviceIdentity>,
     ip_locks: DashMap<IpAddr, LockState>,
-    sessions: DashMap<String, Instant>,
+    pair_locks: DashMap<IpAddr, LockState>,
+    login_gates: DashMap<IpAddr, Arc<Mutex<()>>>,
+    sessions: DashMap<String, SessionRecord>,
+    revoked_tokens: DashMap<String, ()>,
+    revoked_devices: DashSet<String>,
 }
 
 impl AuthManager {
     /// Creates an `AuthManager` from an Argon2id PHC hash string.
-    pub fn from_password_hash(password_hash: String) -> Result<Self> {
+    pub fn from_password_hash(
+        password_hash: String,
+        identity: Arc<DeviceIdentity>,
+    ) -> Result<Self> {
         PasswordHash::new(&password_hash)
             .map_err(|e| LanVaultError::Auth(format!("invalid Argon2id hash: {e}")))?;
         Ok(Self {
             password_hash,
+            identity,
             ip_locks: DashMap::new(),
+            pair_locks: DashMap::new(),
+            login_gates: DashMap::new(),
             sessions: DashMap::new(),
+            revoked_tokens: DashMap::new(),
+            revoked_devices: DashSet::new(),
         })
     }
 
     /// Creates an `AuthManager` by hashing a plaintext password with Argon2id.
-    pub fn from_plaintext_password(password: &str) -> Result<Self> {
+    pub fn from_plaintext_password(
+        password: &str,
+        identity: Arc<DeviceIdentity>,
+    ) -> Result<Self> {
         let hash = hash_password(password)?;
-        Self::from_password_hash(hash)
+        Self::from_password_hash(hash, identity)
     }
 
-    /// Checks per-IP lockout status and records a pairing PIN attempt using the shared
-    /// 3-strike / 60-second `ip_locks` policy.
+    /// Checks per-IP lockout status for pairing PIN attempts.
     pub fn check_and_record_pair_attempt(&self, client_ip: IpAddr, matched: bool) -> AuthOutcome {
-        if self.ip_locks.len() >= MAX_IP_LOCKS {
+        self.check_and_record_lockout(&self.pair_locks, client_ip, matched)
+    }
+
+    fn check_and_record_lockout(
+        &self,
+        locks: &DashMap<IpAddr, LockState>,
+        client_ip: IpAddr,
+        matched: bool,
+    ) -> AuthOutcome {
+        if locks.len() >= MAX_IP_LOCKS {
             self.prune_expired();
         }
         let now = Instant::now();
-        match self.ip_locks.entry(client_ip) {
+        match locks.entry(client_ip) {
             Entry::Occupied(mut entry) => {
                 if let Some(until) = entry.get().locked_until {
                     if until > now {
@@ -147,6 +192,12 @@ impl AuthManager {
     /// - 1st & 2nd consecutive failure -> `InvalidPassword { remaining_attempts }` (HTTP 401)
     /// - 3rd consecutive failure -> immediate 60s IP lockout -> `LockedOut { retry_after_secs: 60 }` (HTTP 429)
     pub fn login(&self, client_ip: IpAddr, password: &str) -> LoginOutcome {
+        let gate = self
+            .login_gates
+            .entry(client_ip)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _login_guard = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Instant::now();
 
         // Phase 1: Atomically check active lockout and evict expired lockout entries
@@ -164,7 +215,7 @@ impl AuthManager {
         }
 
         let verified = verify_password(password, &self.password_hash);
-        match self.check_and_record_pair_attempt(client_ip, verified) {
+        match self.check_and_record_lockout(&self.ip_locks, client_ip, verified) {
             AuthOutcome::Allowed => {
                 let token = self.issue_session();
                 LoginOutcome::Authenticated {
@@ -185,42 +236,144 @@ impl AuthManager {
     /// Evicts expired sessions and stale IP lockout entries to bound memory growth.
     pub fn prune_expired(&self) {
         let now = Instant::now();
-        self.sessions.retain(|_, expires_at| *expires_at > now);
+        self.sessions
+            .retain(|_, session| session.expires_at > now);
         self.ip_locks.retain(|_, state| {
             state.locked_until.map(|u| u > now).unwrap_or(state.failed_attempts > 0)
         });
-        if self.ip_locks.len() > MAX_IP_LOCKS {
-            self.ip_locks.retain(|_, state| {
-                state.locked_until.map(|u| u > now).unwrap_or(false)
-            });
+        while self.ip_locks.len() > MAX_IP_LOCKS {
+            let Some(key) = self
+                .ip_locks
+                .iter()
+                .next()
+                .map(|entry| *entry.key())
+            else {
+                break;
+            };
+            self.ip_locks.remove(&key);
+        }
+        self.pair_locks.retain(|_, state| {
+            state.locked_until.map(|until| until > now).unwrap_or(state.failed_attempts > 0)
+        });
+        while self.pair_locks.len() > MAX_IP_LOCKS {
+            let Some(key) = self
+                .pair_locks
+                .iter()
+                .next()
+                .map(|entry| *entry.key())
+            else {
+                break;
+            };
+            self.pair_locks.remove(&key);
+        }
+        while self.login_gates.len() > MAX_IP_LOCKS {
+            let Some(key) = self
+                .login_gates
+                .iter()
+                .next()
+                .map(|entry| *entry.key())
+            else {
+                break;
+            };
+            self.login_gates.remove(&key);
         }
     }
 
     pub fn issue_session(&self) -> String {
-        let token = generate_session_token();
+        self.issue_scoped_session(SessionInfo {
+            is_admin: true,
+            device_id: None,
+        })
+    }
+
+    pub fn issue_peer_session(&self, device_id: String) -> String {
+        self.issue_scoped_session(SessionInfo {
+            is_admin: false,
+            device_id: Some(device_id),
+        })
+    }
+
+    fn issue_scoped_session(&self, info: SessionInfo) -> String {
         let expires_at = Instant::now() + Duration::from_secs(SESSION_TTL_SECS);
+        let expires_at_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            + SESSION_TTL_SECS;
+        let payload = SignedSession {
+            version: 1,
+            expires_at_secs,
+            nonce_hex: generate_session_token(),
+            info: info.clone(),
+        };
+        let payload_bytes = serde_json::to_vec(&payload)
+            .expect("signed session payload is always serializable");
+        let signature = self.identity.sign(&payload_bytes);
+        let token = format!("{}.{}", hex::encode(payload_bytes), hex::encode(signature));
         if self.sessions.len() >= MAX_SESSIONS {
             self.prune_expired();
         }
-        self.sessions.insert(token.clone(), expires_at);
+        if self.sessions.len() >= MAX_SESSIONS {
+            if let Some(oldest) = self
+                .sessions
+                .iter()
+                .min_by_key(|entry| entry.value().expires_at)
+                .map(|entry| entry.key().clone())
+            {
+                self.sessions.remove(&oldest);
+                self.revoked_tokens.insert(oldest, ());
+            }
+        }
+        self.sessions.insert(
+            token.clone(),
+            SessionRecord { expires_at, info },
+        );
         token
     }
 
     /// Validates an active `lv_session` token, evicting it if expired.
-    pub fn validate_session(&self, token: &str) -> bool {
-        let now = Instant::now();
-        if let Some(expires_at) = self.sessions.get(token) {
-            if *expires_at > now {
-                return true;
-            }
+    pub fn validate_session(&self, token: &str) -> Option<SessionInfo> {
+        if self.revoked_tokens.contains_key(token) {
+            return None;
         }
-        self.sessions.remove(token);
-        false
+        let (payload_hex, signature_hex) = token.split_once('.')?;
+        let payload_bytes = hex::decode(payload_hex).ok()?;
+        let signature = hex::decode(signature_hex).ok()?;
+        verify_ed25519(&self.identity.public_key_bytes(), &payload_bytes, &signature).ok()?;
+        let payload: SignedSession = serde_json::from_slice(&payload_bytes).ok()?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if payload.version != 1 || payload.expires_at_secs <= now {
+            return None;
+        }
+        if payload
+            .info
+            .device_id
+            .as_ref()
+            .is_some_and(|device_id| self.revoked_devices.contains(device_id))
+        {
+            return None;
+        }
+        Some(payload.info)
     }
 
     /// Invalidates a session token on logout.
     pub fn revoke_session(&self, token: &str) {
         self.sessions.remove(token);
+        self.revoked_tokens.insert(token.to_string(), ());
+    }
+
+    pub fn revoke_device_sessions(&self, device_id: &str) {
+        self.revoked_devices.insert(device_id.to_string());
+        self.sessions.retain(|_, session| {
+            session
+                .info
+                .device_id
+                .as_deref()
+                .is_none_or(|session_device_id| session_device_id != device_id)
+        });
     }
 }
 
@@ -278,7 +431,11 @@ mod tests {
 
     #[test]
     fn pair_attempts_enforce_three_strike_lockout() {
-        let auth = AuthManager::from_plaintext_password("secret-pass").unwrap();
+        let auth = AuthManager::from_plaintext_password(
+            "secret-pass",
+            Arc::new(DeviceIdentity::generate()),
+        )
+        .unwrap();
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42));
 
         assert_eq!(

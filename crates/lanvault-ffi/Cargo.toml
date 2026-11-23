@@ -19,3 +19,5 @@ serde_json.workspace = true
 tracing.workspace = true
 reqwest.workspace = true
 hex.workspace = true
+argon2.workspace = true
+rand.workspace = true

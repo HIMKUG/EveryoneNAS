@@ -28,15 +28,32 @@ class BootReceiver : BroadcastReceiver() {
         val appContext = context.applicationContext
         Thread {
             try {
+                val lastConfig = KeepAliveService.loadLastConfig(appContext)
                 when (PrivilegeDetector.detect()) {
                     KeepAliveLevel.LEVEL_3_MAGISK_DAEMON -> {
                         // Level 3 由 /data/adb/modules/lanvault_daemon/service.sh 独立拉起与看门狗守护。
                     }
                     KeepAliveLevel.LEVEL_2_ROOT_LIBSU -> {
-                        RootDaemonService.ensureBound(appContext)
+                        if (lastConfig != null) {
+                            RootDaemonService.bindAndStart(
+                                appContext,
+                                lastConfig.vaultPath,
+                                lastConfig.quotaGb,
+                                lastConfig.port,
+                                lastConfig.webPassword,
+                            )
+                        }
                     }
                     KeepAliveLevel.LEVEL_1_SHIZUKU -> {
-                        ShizukuBridge.ensureBound(appContext)
+                        if (lastConfig != null) {
+                            ShizukuBridge.bindAndStart(
+                                appContext,
+                                lastConfig.vaultPath,
+                                lastConfig.quotaGb,
+                                lastConfig.port,
+                                lastConfig.webPassword,
+                            )
+                        }
                     }
                     KeepAliveLevel.LEVEL_0_FOREGROUND -> {
                         // 严禁在此处调用 ContextCompat.startForegroundService(KeepAliveService)

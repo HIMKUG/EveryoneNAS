@@ -75,7 +75,7 @@ impl DirectoryWatcher {
             });
         }
 
-        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<RawSignal>();
+        let (raw_tx, raw_rx) = mpsc::channel::<RawSignal>(4096);
         let rule_id_cb = rule_id.clone();
 
         let mut watcher = RecommendedWatcher::new(
@@ -86,7 +86,7 @@ impl DirectoryWatcher {
                             rule_id = %rule_id_cb,
                             "notify reported Flag::Rescan (queue overflow); triggering metadata diff reconciliation"
                         );
-                        let _ = raw_tx.send(RawSignal::Rescan(RescanReason::NotifyFlagRescan));
+                        let _ = raw_tx.try_send(RawSignal::Rescan(RescanReason::NotifyFlagRescan));
                         return;
                     }
 
@@ -96,7 +96,7 @@ impl DirectoryWatcher {
                     }
 
                     if !event.paths.is_empty() {
-                        let _ = raw_tx.send(RawSignal::Paths(event.paths));
+                        let _ = raw_tx.try_send(RawSignal::Paths(event.paths));
                     }
                 }
                 Err(err) => {
@@ -105,7 +105,8 @@ impl DirectoryWatcher {
                             rule_id = %rule_id_cb,
                             "caught Win32 ERROR_NOTIFY_ENUM_DIR (1022); triggering metadata diff reconciliation"
                         );
-                        let _ = raw_tx.send(RawSignal::Rescan(RescanReason::Win32NotifyEnumDir));
+                        let _ =
+                            raw_tx.try_send(RawSignal::Rescan(RescanReason::Win32NotifyEnumDir));
                     } else {
                         error!(rule_id = %rule_id_cb, error = %err, "filesystem watcher error");
                     }
@@ -136,7 +137,7 @@ fn is_win32_notify_enum_dir(err: &notify::Error) -> bool {
 async fn run_debounce_loop(
     rule_id: String,
     root_dir: PathBuf,
-    mut raw_rx: mpsc::UnboundedReceiver<RawSignal>,
+    mut raw_rx: mpsc::Receiver<RawSignal>,
     event_tx: mpsc::Sender<WatchEvent>,
 ) {
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();

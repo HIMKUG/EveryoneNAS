@@ -22,8 +22,13 @@ pub(super) async fn handle_get_debug_config(
     State(state): State<Arc<AppState>>,
     cookies: Cookies,
 ) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
+    match require_auth(&state, &cookies) {
+        Ok(session) => {
+            if let Err(resp) = require_admin(&session) {
+                return resp;
+            }
+        }
+        Err(resp) => return resp,
     }
     Json(serde_json::json!({
         "debug_enabled": lanvault_core::is_debug_enabled(),
@@ -36,8 +41,13 @@ pub(super) async fn handle_set_debug_config(
     cookies: Cookies,
     Json(req): Json<SetDebugConfigRequest>,
 ) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
+    match require_auth(&state, &cookies) {
+        Ok(session) => {
+            if let Err(resp) = require_admin(&session) {
+                return resp;
+            }
+        }
+        Err(resp) => return resp,
     }
     lanvault_core::set_debug_mode(req.enabled);
     Json(serde_json::json!({
@@ -51,8 +61,13 @@ pub(super) async fn handle_get_debug_logs(
     cookies: Cookies,
     Query(query): Query<DebugLogsQuery>,
 ) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
+    match require_auth(&state, &cookies) {
+        Ok(session) => {
+            if let Err(resp) = require_admin(&session) {
+                return resp;
+            }
+        }
+        Err(resp) => return resp,
     }
     let limit = query.limit.unwrap_or(200);
     let entries = lanvault_core::get_debug_logs(limit);
@@ -67,8 +82,13 @@ pub(super) async fn handle_clear_debug_logs(
     State(state): State<Arc<AppState>>,
     cookies: Cookies,
 ) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
+    match require_auth(&state, &cookies) {
+        Ok(session) => {
+            if let Err(resp) = require_admin(&session) {
+                return resp;
+            }
+        }
+        Err(resp) => return resp,
     }
     lanvault_core::clear_debug_logs();
     Json(serde_json::json!({ "cleared": true })).into_response()

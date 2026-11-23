@@ -47,6 +47,11 @@ Write-Host "[LanVault][Android] 校验构建工具链..." -ForegroundColor Cyan
 Assert-Command "cargo"
 Assert-Command "flutter"
 
+$KeyPropertiesPath = Join-Path $FlutterDir "android\key.properties"
+if (-not (Test-Path -LiteralPath $KeyPropertiesPath)) {
+    throw "Release build requires android/key.properties so the APK is not debug-signed."
+}
+
 & cargo ndk --version | Out-Null
 if ($LASTEXITCODE -ne 0) {
     throw "未检测到 cargo-ndk，请先执行: cargo install cargo-ndk"

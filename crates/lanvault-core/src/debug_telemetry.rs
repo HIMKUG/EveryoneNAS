@@ -15,6 +15,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 const RING_CAPACITY: usize = 2000;
+const MAX_RING_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CLIENT_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_CLIENT_DETAIL_BYTES: usize = 64 * 1024;
 const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB rotation cap
 
 static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -35,6 +38,7 @@ pub struct DebugLogEntry {
 
 struct TelemetrySink {
     ring: VecDeque<DebugLogEntry>,
+    ring_bytes: usize,
     log_file_path: Option<PathBuf>,
 }
 
@@ -44,6 +48,7 @@ fn sink() -> &'static Mutex<TelemetrySink> {
     SINK.get_or_init(|| {
         Mutex::new(TelemetrySink {
             ring: VecDeque::with_capacity(RING_CAPACITY),
+            ring_bytes: 0,
             log_file_path: None,
         })
     })
@@ -148,20 +153,33 @@ pub fn record_event_always(
         seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
         timestamp_ms: now_ms(),
         level: level.to_uppercase(),
-        source: source.to_string(),
+        source: truncate_utf8(source.to_string(), 128),
         probe: probe.map(str::to_string),
         duration_us,
-        message: message.into(),
-        detail,
+        message: truncate_utf8(message.into(), MAX_CLIENT_MESSAGE_BYTES),
+        detail: detail.map(|value| truncate_utf8(value, MAX_CLIENT_DETAIL_BYTES)),
     };
     if let Ok(mut guard) = sink().lock() {
-        if guard.ring.len() >= RING_CAPACITY {
-            guard.ring.pop_front();
+        let entry_bytes = serialized_entry_bytes(&entry);
+        while guard.ring.len() >= RING_CAPACITY
+            || guard.ring_bytes.saturating_add(entry_bytes) > MAX_RING_BYTES
+        {
+            let Some(removed) = guard.ring.pop_front() else {
+                break;
+            };
+            guard.ring_bytes = guard
+                .ring_bytes
+                .saturating_sub(serialized_entry_bytes(&removed));
         }
         guard.ring.push_back(entry.clone());
-        if let Some(path) = guard.log_file_path.clone() {
-            write_file_line(&path, &entry);
-        }
+        guard.ring_bytes = guard.ring_bytes.saturating_add(entry_bytes);
+    }
+    let path = sink()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.log_file_path.clone());
+    if let Some(path) = path {
+        write_file_line(&path, &entry);
     }
 }
 
@@ -187,6 +205,10 @@ pub fn record_frontend_log(
     message: String,
     stack_or_detail: Option<String>,
 ) {
+    let source = match source {
+        "flutter" | "web" | "rust.ffi" | "frontend" => source.to_string(),
+        _ => "frontend.unknown".to_string(),
+    };
     let upper = level.trim().to_uppercase();
     let normalized = match upper.as_str() {
         "FATAL" | "ERROR" | "WARN" | "INFO" | "DEBUG" => upper,
@@ -197,7 +219,7 @@ pub fn record_frontend_log(
     }
     record_event_always(
         &normalized,
-        source,
+        &source,
         Some("frontend.error_hook"),
         None,
         message,
@@ -218,9 +240,39 @@ pub fn get_debug_logs(limit: usize) -> Vec<DebugLogEntry> {
 
 /// Clears the in-memory ring buffer.
 pub fn clear_debug_logs() {
-    if let Ok(mut guard) = sink().lock() {
+    let path = if let Ok(mut guard) = sink().lock() {
         guard.ring.clear();
+        guard.ring_bytes = 0;
+        guard.log_file_path.clone()
+    } else {
+        None
+    };
+    if let Some(path) = path {
+        let _ = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path);
+        let _ = fs::remove_file(path.with_extension("log.1"));
     }
+}
+
+fn serialized_entry_bytes(entry: &DebugLogEntry) -> usize {
+    serde_json::to_vec(entry)
+        .map(|bytes| bytes.len())
+        .unwrap_or_default()
+}
+
+fn truncate_utf8(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value
 }
 
 /// RAII microsecond performance probe.

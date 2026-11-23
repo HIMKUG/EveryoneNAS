@@ -18,7 +18,20 @@ pub struct VolumeInfo {
 
 /// 校验字符串是否符合 Win32 Volume GUID 规范前缀。
 pub fn is_valid_volume_guid(guid: &str) -> bool {
-    guid.starts_with(r"\\?\Volume{") && guid.ends_with(r"}\")
+    let Some(inner) = guid
+        .strip_prefix(r"\\?\Volume{")
+        .and_then(|value| value.strip_suffix(r"}\"))
+    else {
+        return false;
+    };
+    inner.len() == 36
+        && inner
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                8 | 13 | 18 | 23 => byte == b'-',
+                _ => byte.is_ascii_hexdigit(),
+            })
 }
 
 /// RAII 守卫：托管 `FindFirstVolumeW` 返回的 Win32 句柄，确保任意错误早退路径都自动调用 `FindVolumeClose`。
@@ -56,7 +69,16 @@ pub fn enumerate_volumes() -> Result<Vec<VolumeInfo>> {
         let volume_guid = OsString::from_wide(&buffer[..nul_pos])
             .to_string_lossy()
             .into_owned();
-        let mount_paths = mount_paths_for_guid(&volume_guid)?;
+        let mount_paths = match mount_paths_for_guid(&volume_guid) {
+            Ok(paths) => paths,
+            Err(err) => {
+                tracing::warn!(
+                    volume_guid = %volume_guid,
+                    "skipping volume whose mount points cannot be queried: {err}"
+                );
+                Vec::new()
+            }
+        };
         volumes.push(VolumeInfo {
             volume_guid,
             mount_paths,

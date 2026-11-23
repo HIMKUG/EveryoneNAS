@@ -34,6 +34,7 @@ pub const ED25519_SIG_LEN: usize = 64;
 const SESSION_KDF_CONTEXT: &str = "lanvault.session.xchacha20poly1305.v1";
 const VAULT_CHUNK_KDF_CONTEXT: &str = "lanvault.vault.chunk.key.v1";
 const CHUNK_NONCE_KDF_CONTEXT: &str = "lanvault.chunk.nonce.v1";
+const LOCAL_STORAGE_KDF_CONTEXT: &str = "lanvault.local.storage.v1";
 
 /// 256-bit symmetric key that is securely zeroized on drop.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -150,6 +151,14 @@ impl DeviceIdentity {
     /// Signs arbitrary message bytes with Ed25519.
     pub fn sign(&self, message: &[u8]) -> [u8; ED25519_SIG_LEN] {
         self.signing_key.sign(message).to_bytes()
+    }
+
+    pub fn derive_local_storage_key(&self, purpose: &str) -> SymmetricKey {
+        let seed = self.seed_bytes();
+        let mut input = Vec::with_capacity(seed.len() + purpose.len());
+        input.extend_from_slice(seed.as_ref());
+        input.extend_from_slice(purpose.as_bytes());
+        SymmetricKey(blake3::derive_key(LOCAL_STORAGE_KDF_CONTEXT, &input))
     }
 }
 

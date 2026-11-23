@@ -149,6 +149,7 @@ pub struct TrustedPeer {
     pub last_port: Option<u16>,
     pub auto_connect: bool,
     pub paired_at: i64,
+    pub revoked_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +188,7 @@ pub struct ChunkRecord {
 pub struct SnapshotRecord {
     pub snapshot_id: String,
     pub vault_id: String,
+    pub rule_id: String,
     pub device_id: String,
     pub root_tree_hash: [u8; 32],
     pub retention_tier: RetentionTier,
@@ -210,6 +212,7 @@ pub struct SyncRuleRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalFileStateRecord {
     pub rule_id: String,
+    pub target_vault_id: String,
     pub rel_path: String,
     pub size: u64,
     pub mtime_ns: i64,
@@ -261,7 +264,7 @@ impl Database {
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
+            PRAGMA synchronous = FULL;
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
             PRAGMA cache_size = -65536;
@@ -277,7 +280,8 @@ impl Database {
                 last_ip         TEXT,
                 last_port       INTEGER,
                 auto_connect    INTEGER NOT NULL DEFAULT 1,
-                paired_at       INTEGER NOT NULL
+                paired_at       INTEGER NOT NULL,
+                revoked_at      INTEGER
             );
 
             CREATE TABLE IF NOT EXISTS vaults (
@@ -313,6 +317,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS snapshots (
                 snapshot_id     TEXT PRIMARY KEY,
                 vault_id        TEXT NOT NULL REFERENCES vaults(vault_id),
+                rule_id         TEXT NOT NULL DEFAULT '',
                 device_id       TEXT NOT NULL REFERENCES trusted_peers(device_id),
                 root_tree_hash  BLOB NOT NULL,
                 retention_tier  TEXT NOT NULL DEFAULT 'daily',
@@ -334,6 +339,7 @@ impl Database {
 
             CREATE TABLE IF NOT EXISTS local_file_state (
                 rule_id         TEXT NOT NULL,
+                target_vault_id TEXT NOT NULL DEFAULT '',
                 rel_path        TEXT NOT NULL,
                 size            INTEGER NOT NULL,
                 mtime_ns        INTEGER NOT NULL,
@@ -347,6 +353,18 @@ impl Database {
                 value           TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS snapshot_chunks (
+                snapshot_id TEXT NOT NULL REFERENCES snapshots(snapshot_id) ON DELETE CASCADE,
+                vault_id    TEXT NOT NULL,
+                chunk_hash  BLOB NOT NULL,
+                PRIMARY KEY (snapshot_id, chunk_hash)
+            );
+
+            CREATE TABLE IF NOT EXISTS revoked_sessions (
+                token_hash TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_vault_volumes_vault_id ON vault_volumes(vault_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_scrub_status ON chunks(scrub_status);
             CREATE INDEX IF NOT EXISTS idx_chunks_vault_scrub_status ON chunks(vault_id, scrub_status);
@@ -354,7 +372,27 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_snapshots_vault_created ON snapshots(vault_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_snapshots_retention ON snapshots(vault_id, retention_tier);
             CREATE INDEX IF NOT EXISTS idx_local_file_state_rule ON local_file_state(rule_id);
+            CREATE INDEX IF NOT EXISTS idx_snapshot_chunks_vault_hash
+                ON snapshot_chunks(vault_id, chunk_hash);
             "#,
+        )?;
+        ensure_column(
+            &conn,
+            "trusted_peers",
+            "revoked_at",
+            "revoked_at INTEGER",
+        )?;
+        ensure_column(
+            &conn,
+            "snapshots",
+            "rule_id",
+            "rule_id TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "local_file_state",
+            "target_vault_id",
+            "target_vault_id TEXT NOT NULL DEFAULT ''",
         )?;
         Ok(())
     }
@@ -375,6 +413,12 @@ impl Database {
                 checkpointed_frames: row.get(2)?,
             })
         })?;
+        if report.busy != 0 {
+            return Err(LanVaultError::InvalidState(format!(
+                "WAL checkpoint remained busy with {} frames",
+                report.log_frames
+            )));
+        }
         Ok(report)
     }
 
@@ -396,7 +440,8 @@ impl Database {
                 ed25519_pubkey = excluded.ed25519_pubkey,
                 last_ip = excluded.last_ip,
                 last_port = excluded.last_port,
-                auto_connect = excluded.auto_connect
+                auto_connect = excluded.auto_connect,
+                revoked_at = excluded.revoked_at
             "#,
             params![
                 peer.device_id,
@@ -418,9 +463,9 @@ impl Database {
             .query_row(
                 r#"
                 SELECT device_id, device_name, os_type, ed25519_pubkey,
-                       last_ip, last_port, auto_connect, paired_at
+                       last_ip, last_port, auto_connect, paired_at, revoked_at
                 FROM trusted_peers
-                WHERE device_id = ?1
+                WHERE device_id = ?1 AND revoked_at IS NULL
                 "#,
                 params![device_id],
                 row_to_trusted_peer,
@@ -434,8 +479,9 @@ impl Database {
         let mut stmt = conn.prepare(
             r#"
             SELECT device_id, device_name, os_type, ed25519_pubkey,
-                   last_ip, last_port, auto_connect, paired_at
+                   last_ip, last_port, auto_connect, paired_at, revoked_at
             FROM trusted_peers
+            WHERE revoked_at IS NULL
             ORDER BY paired_at DESC
             "#,
         )?;
@@ -448,8 +494,10 @@ impl Database {
     pub fn delete_trusted_peer(&self, device_id: &str) -> Result<bool> {
         let conn = self.lock_conn();
         let affected = conn.execute(
-            "DELETE FROM trusted_peers WHERE device_id = ?1",
-            params![device_id],
+            "UPDATE trusted_peers
+             SET revoked_at = ?1, auto_connect = 0
+             WHERE device_id = ?2 AND revoked_at IS NULL",
+            params![unix_timestamp_secs(), device_id],
         )?;
         Ok(affected > 0)
     }
@@ -554,6 +602,15 @@ impl Database {
         Ok(())
     }
 
+    pub fn set_vault_used_bytes(&self, vault_id: &str, used_bytes: u64) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE vaults SET used_bytes = ?1 WHERE vault_id = ?2",
+            params![used_bytes as i64, vault_id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_volume_mount_path(
         &self,
         volume_id: &str,
@@ -564,6 +621,15 @@ impl Database {
         conn.execute(
             "UPDATE vault_volumes SET mount_path = ?1, is_online = ?2 WHERE volume_id = ?3",
             params![mount_path, i64::from(is_online), volume_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_volume_guid(&self, volume_id: &str, volume_guid: &str) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE vault_volumes SET volume_guid = ?1 WHERE volume_id = ?2",
+            params![volume_guid, volume_id],
         )?;
         Ok(())
     }
@@ -590,15 +656,22 @@ impl Database {
 
         if existing.is_some() {
             conn.execute(
-                "UPDATE chunks SET ref_count = ref_count + 1 WHERE vault_id = ?1 AND hash_blake3 = ?2",
-                params![vault_id, hash_blake3.as_slice()],
+                "UPDATE chunks
+                 SET raw_size = ?1, stored_size = ?2, scrub_status = 'ok', last_scrub_at = NULL
+                 WHERE vault_id = ?3 AND hash_blake3 = ?4",
+                params![
+                    raw_size as i64,
+                    stored_size as i64,
+                    vault_id,
+                    hash_blake3.as_slice()
+                ],
             )?;
             Ok(false)
         } else {
             conn.execute(
                 r#"
                 INSERT INTO chunks (vault_id, hash_blake3, raw_size, stored_size, ref_count, scrub_status)
-                VALUES (?1, ?2, ?3, ?4, 1, 'ok')
+                VALUES (?1, ?2, ?3, ?4, 0, 'ok')
                 "#,
                 params![
                     vault_id,
@@ -609,6 +682,28 @@ impl Database {
             )?;
             Ok(true)
         }
+    }
+
+    pub fn insert_chunk_if_missing(
+        &self,
+        vault_id: &str,
+        hash_blake3: &[u8; 32],
+        raw_size: u64,
+        stored_size: u64,
+    ) -> Result<bool> {
+        let conn = self.lock_conn();
+        let affected = conn.execute(
+            "INSERT OR IGNORE INTO chunks
+                (vault_id, hash_blake3, raw_size, stored_size, ref_count, scrub_status)
+             VALUES (?1, ?2, ?3, ?4, 0, 'ok')",
+            params![
+                vault_id,
+                hash_blake3.as_slice(),
+                raw_size as i64,
+                stored_size as i64
+            ],
+        )?;
+        Ok(affected == 1)
     }
 
     pub fn get_chunk(&self, vault_id: &str, hash_blake3: &[u8; 32]) -> Result<Option<ChunkRecord>> {
@@ -720,17 +815,82 @@ impl Database {
     // -------------------------------------------------------------------------
 
     pub fn insert_snapshot(&self, snap: &SnapshotRecord) -> Result<()> {
-        let conn = self.lock_conn();
-        conn.execute(
+        self.insert_snapshot_with_chunks(snap, &[])?;
+        Ok(())
+    }
+
+    pub fn insert_snapshot_with_chunks(
+        &self,
+        snap: &SnapshotRecord,
+        chunk_hashes: &[[u8; 32]],
+    ) -> Result<bool> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let existing = tx
+            .query_row(
+                "SELECT vault_id, rule_id, device_id, root_tree_hash, retention_tier,
+                        file_count, total_bytes, created_at
+                 FROM snapshots WHERE snapshot_id = ?1",
+                params![snap.snapshot_id],
+                |row| {
+                    let root: Vec<u8> = row.get(3)?;
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        root,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let identical = existing.0 == snap.vault_id
+                && existing.1 == snap.rule_id
+                && existing.2 == snap.device_id
+                && existing.3 == snap.root_tree_hash
+                && existing.4 == snap.retention_tier.as_str()
+                && existing.5 == snap.file_count as i64
+                && existing.6 == snap.total_bytes as i64
+                && existing.7 == snap.created_at;
+            if !identical {
+                return Err(LanVaultError::InvalidInput(format!(
+                    "snapshot_id {} already exists with different contents",
+                    snap.snapshot_id
+                )));
+            }
+            for hash in chunk_hashes {
+                let inserted = tx.execute(
+                    "INSERT OR IGNORE INTO snapshot_chunks
+                        (snapshot_id, vault_id, chunk_hash)
+                     VALUES (?1, ?2, ?3)",
+                    params![snap.snapshot_id, snap.vault_id, hash.as_slice()],
+                )?;
+                if inserted == 1 {
+                    tx.execute(
+                        "UPDATE chunks SET ref_count = ref_count + 1
+                         WHERE vault_id = ?1 AND hash_blake3 = ?2",
+                        params![snap.vault_id, hash.as_slice()],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
             r#"
             INSERT INTO snapshots (
-                snapshot_id, vault_id, device_id, root_tree_hash,
+                snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
                 retention_tier, file_count, total_bytes, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             "#,
             params![
                 snap.snapshot_id,
                 snap.vault_id,
+                snap.rule_id,
                 snap.device_id,
                 snap.root_tree_hash.as_slice(),
                 snap.retention_tier.as_str(),
@@ -739,7 +899,27 @@ impl Database {
                 snap.created_at,
             ],
         )?;
-        Ok(())
+        for hash in chunk_hashes {
+            tx.execute(
+                "INSERT OR IGNORE INTO snapshot_chunks (snapshot_id, vault_id, chunk_hash)
+                 VALUES (?1, ?2, ?3)",
+                params![snap.snapshot_id, snap.vault_id, hash.as_slice()],
+            )?;
+            let affected = tx.execute(
+                "UPDATE chunks SET ref_count = ref_count + 1
+                 WHERE vault_id = ?1 AND hash_blake3 = ?2",
+                params![snap.vault_id, hash.as_slice()],
+            )?;
+            if affected != 1 {
+                return Err(LanVaultError::NotFound(format!(
+                    "chunk {} for snapshot {}",
+                    hex::encode(hash),
+                    snap.snapshot_id
+                )));
+            }
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn get_snapshot(&self, snapshot_id: &str) -> Result<Option<SnapshotRecord>> {
@@ -747,7 +927,7 @@ impl Database {
         let row = conn
             .query_row(
                 r#"
-                SELECT snapshot_id, vault_id, device_id, root_tree_hash,
+                SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
                        retention_tier, file_count, total_bytes, created_at
                 FROM snapshots
                 WHERE snapshot_id = ?1
@@ -765,7 +945,7 @@ impl Database {
             Some(vid) => {
                 let mut stmt = conn.prepare(
                     r#"
-                    SELECT snapshot_id, vault_id, device_id, root_tree_hash,
+                    SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
                            retention_tier, file_count, total_bytes, created_at
                     FROM snapshots
                     WHERE vault_id = ?1
@@ -780,7 +960,7 @@ impl Database {
             None => {
                 let mut stmt = conn.prepare(
                     r#"
-                    SELECT snapshot_id, vault_id, device_id, root_tree_hash,
+                    SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
                            retention_tier, file_count, total_bytes, created_at
                     FROM snapshots
                     ORDER BY created_at DESC
@@ -795,11 +975,36 @@ impl Database {
     }
 
     pub fn delete_snapshot(&self, snapshot_id: &str) -> Result<bool> {
-        let conn = self.lock_conn();
-        let affected = conn.execute(
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE chunks
+             SET ref_count = MAX(
+                 0,
+                 ref_count - (
+                     SELECT COUNT(*) FROM snapshot_chunks sc
+                     WHERE sc.snapshot_id = ?1
+                       AND sc.vault_id = chunks.vault_id
+                       AND sc.chunk_hash = chunks.hash_blake3
+                 )
+             )
+             WHERE EXISTS (
+                 SELECT 1 FROM snapshot_chunks sc
+                 WHERE sc.snapshot_id = ?1
+                   AND sc.vault_id = chunks.vault_id
+                   AND sc.chunk_hash = chunks.hash_blake3
+             )",
+            params![snapshot_id],
+        )?;
+        tx.execute(
+            "DELETE FROM snapshot_chunks WHERE snapshot_id = ?1",
+            params![snapshot_id],
+        )?;
+        let affected = tx.execute(
             "DELETE FROM snapshots WHERE snapshot_id = ?1",
             params![snapshot_id],
         )?;
+        tx.commit()?;
         Ok(affected > 0)
     }
 
@@ -872,11 +1077,17 @@ impl Database {
     }
 
     pub fn delete_sync_rule(&self, rule_id: &str) -> Result<bool> {
-        let conn = self.lock_conn();
-        let affected = conn.execute(
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM local_file_state WHERE rule_id = ?1",
+            params![rule_id],
+        )?;
+        let affected = tx.execute(
             "DELETE FROM sync_rules WHERE rule_id = ?1",
             params![rule_id],
         )?;
+        tx.commit()?;
         Ok(affected > 0)
     }
 
@@ -889,9 +1100,10 @@ impl Database {
         conn.execute(
             r#"
             INSERT INTO local_file_state (
-                rule_id, rel_path, size, mtime_ns, file_id, chunk_hashes
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                rule_id, target_vault_id, rel_path, size, mtime_ns, file_id, chunk_hashes
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
             ON CONFLICT(rule_id, rel_path) DO UPDATE SET
+                target_vault_id = excluded.target_vault_id,
                 size = excluded.size,
                 mtime_ns = excluded.mtime_ns,
                 file_id = excluded.file_id,
@@ -899,6 +1111,7 @@ impl Database {
             "#,
             params![
                 state.rule_id,
+                state.target_vault_id,
                 state.rel_path,
                 state.size as i64,
                 state.mtime_ns,
@@ -913,7 +1126,7 @@ impl Database {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(
             r#"
-            SELECT rule_id, rel_path, size, mtime_ns, file_id, chunk_hashes
+            SELECT rule_id, target_vault_id, rel_path, size, mtime_ns, file_id, chunk_hashes
             FROM local_file_state
             WHERE rule_id = ?1
             "#,
@@ -950,6 +1163,11 @@ impl Database {
         }
         tx.commit()?;
         Ok(total_deleted)
+    }
+
+    pub fn clear_local_file_states(&self) -> Result<usize> {
+        let conn = self.lock_conn();
+        Ok(conn.execute("DELETE FROM local_file_state", [])?)
     }
 
     // -------------------------------------------------------------------------
@@ -1000,11 +1218,34 @@ impl Database {
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         let mut total = 0usize;
-        {
-            let mut stmt = tx.prepare_cached("DELETE FROM snapshots WHERE snapshot_id = ?1")?;
-            for id in snapshot_ids {
-                total += stmt.execute(params![id])?;
-            }
+        for id in snapshot_ids {
+            tx.execute(
+                "UPDATE chunks
+                 SET ref_count = MAX(
+                     0,
+                     ref_count - (
+                         SELECT COUNT(*) FROM snapshot_chunks sc
+                         WHERE sc.snapshot_id = ?1
+                           AND sc.vault_id = chunks.vault_id
+                           AND sc.chunk_hash = chunks.hash_blake3
+                     )
+                 )
+                 WHERE EXISTS (
+                     SELECT 1 FROM snapshot_chunks sc
+                     WHERE sc.snapshot_id = ?1
+                       AND sc.vault_id = chunks.vault_id
+                       AND sc.chunk_hash = chunks.hash_blake3
+                 )",
+                params![id],
+            )?;
+            tx.execute(
+                "DELETE FROM snapshot_chunks WHERE snapshot_id = ?1",
+                params![id],
+            )?;
+            total += tx.execute(
+                "DELETE FROM snapshots WHERE snapshot_id = ?1",
+                params![id],
+            )?;
         }
         tx.commit()?;
         Ok(total)
@@ -1025,7 +1266,12 @@ impl Database {
         let mut total = 0usize;
         {
             let mut stmt = tx.prepare_cached(
-                "DELETE FROM chunks WHERE vault_id = ?1 AND hash_blake3 = ?2",
+                "DELETE FROM chunks
+                 WHERE vault_id = ?1 AND hash_blake3 = ?2 AND ref_count <= 0
+                   AND NOT EXISTS (
+                       SELECT 1 FROM snapshot_chunks sc
+                       WHERE sc.vault_id = ?1 AND sc.chunk_hash = ?2
+                   )",
             )?;
             for h in hashes {
                 total += stmt.execute(params![vault_id, h.as_slice()])?;
@@ -1051,9 +1297,11 @@ impl Database {
         {
             let mut stmt = tx.prepare_cached(
                 r#"
-                INSERT INTO local_file_state (rule_id, rel_path, size, mtime_ns, file_id, chunk_hashes)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                INSERT INTO local_file_state
+                    (rule_id, target_vault_id, rel_path, size, mtime_ns, file_id, chunk_hashes)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                 ON CONFLICT(rule_id, rel_path) DO UPDATE SET
+                    target_vault_id = excluded.target_vault_id,
                     size = excluded.size,
                     mtime_ns = excluded.mtime_ns,
                     file_id = excluded.file_id,
@@ -1063,6 +1311,7 @@ impl Database {
             for s in states {
                 total += stmt.execute(params![
                     s.rule_id,
+                    s.target_vault_id,
                     s.rel_path,
                     s.size as i64,
                     s.mtime_ns,
@@ -1099,6 +1348,33 @@ impl Database {
         )?;
         Ok(())
     }
+
+    pub fn revoke_session(&self, token_hash: &str, expires_at: i64) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT INTO revoked_sessions (token_hash, expires_at)
+             VALUES (?1, ?2)
+             ON CONFLICT(token_hash) DO UPDATE SET expires_at = excluded.expires_at",
+            params![token_hash, expires_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_session_revoked(&self, token_hash: &str, now: i64) -> Result<bool> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "DELETE FROM revoked_sessions WHERE expires_at <= ?1",
+            params![now],
+        )?;
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM revoked_sessions WHERE token_hash = ?1",
+                params![token_hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
 }
 
 fn row_to_trusted_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrustedPeer> {
@@ -1113,6 +1389,7 @@ fn row_to_trusted_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<TrustedPeer>
         last_port: last_port.map(|p| p as u16),
         auto_connect: auto_connect != 0,
         paired_at: row.get(7)?,
+        revoked_at: row.get(8)?,
     })
 }
 
@@ -1193,10 +1470,10 @@ fn row_to_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRecord> {
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> {
-    let hash_vec: Vec<u8> = row.get(3)?;
+    let hash_vec: Vec<u8> = row.get(4)?;
     let root_tree_hash: [u8; 32] = hash_vec.try_into().map_err(|v: Vec<u8>| {
         rusqlite::Error::FromSqlConversionFailure(
-            3,
+            4,
             rusqlite::types::Type::Blob,
             Box::new(LanVaultError::InvalidHashLength {
                 expected: 32,
@@ -1204,25 +1481,26 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> 
             }),
         )
     })?;
-    let tier_str: String = row.get(4)?;
+    let tier_str: String = row.get(5)?;
     let retention_tier = RetentionTier::parse(&tier_str).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(
-            4,
+            5,
             rusqlite::types::Type::Text,
             Box::new(e),
         )
     })?;
-    let file_count: i64 = row.get(5)?;
-    let total_bytes: i64 = row.get(6)?;
+    let file_count: i64 = row.get(6)?;
+    let total_bytes: i64 = row.get(7)?;
     Ok(SnapshotRecord {
         snapshot_id: row.get(0)?,
         vault_id: row.get(1)?,
-        device_id: row.get(2)?,
+        rule_id: row.get(2)?,
+        device_id: row.get(3)?,
         root_tree_hash,
         retention_tier,
         file_count: file_count as u64,
         total_bytes: total_bytes as u64,
-        created_at: row.get(7)?,
+        created_at: row.get(8)?,
     })
 }
 
@@ -1244,15 +1522,42 @@ fn row_to_sync_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<SyncRuleRecord>
 }
 
 fn row_to_local_file_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalFileStateRecord> {
-    let size: i64 = row.get(2)?;
+    let size: i64 = row.get(3)?;
     Ok(LocalFileStateRecord {
         rule_id: row.get(0)?,
-        rel_path: row.get(1)?,
+        target_vault_id: row.get(1)?,
+        rel_path: row.get(2)?,
         size: size as u64,
-        mtime_ns: row.get(3)?,
-        file_id: row.get(4)?,
-        chunk_hashes: row.get(5)?,
+        mtime_ns: row.get(4)?,
+        file_id: row.get(5)?,
+        chunk_hashes: row.get(6)?,
     })
+}
+
+fn unix_timestamp_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn ensure_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .iter()
+        .any(|name| name == column);
+    drop(stmt);
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {definition};"))?;
+    }
+    Ok(())
 }
 
 
@@ -1294,6 +1599,7 @@ mod tests {
         for name in ["a.txt", "b.txt", "c.txt"] {
             db.upsert_local_file_state(&LocalFileStateRecord {
                 rule_id: "rule-1".to_string(),
+                target_vault_id: "vault-1".to_string(),
                 rel_path: name.to_string(),
                 size: 10,
                 mtime_ns: 100,
@@ -1309,5 +1615,71 @@ mod tests {
         let remaining = db.list_local_file_states("rule-1").unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].rel_path, "b.txt");
+    }
+
+    #[test]
+    fn snapshot_references_are_counted_once_and_released_transactionally() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_vault(
+            &VaultRecord {
+                vault_id: "vault-1".to_string(),
+                name: "Vault".to_string(),
+                pool_mode: PoolMode::Single,
+                quota_bytes: 1024,
+                used_bytes: 0,
+                e2ee_enabled: true,
+                created_at: 1,
+            },
+            &[],
+        )
+        .unwrap();
+        db.upsert_trusted_peer(&TrustedPeer {
+            device_id: "device-1".to_string(),
+            device_name: "Device".to_string(),
+            os_type: "test".to_string(),
+            ed25519_pubkey: vec![1; 32],
+            last_ip: None,
+            last_port: None,
+            auto_connect: false,
+            paired_at: 1,
+            revoked_at: None,
+        })
+        .unwrap();
+        let hash = [7u8; 32];
+        assert!(db
+            .upsert_chunk("vault-1", &hash, 10, 10)
+            .unwrap());
+        let snapshot = SnapshotRecord {
+            snapshot_id: "snapshot-1".to_string(),
+            vault_id: "vault-1".to_string(),
+            rule_id: "rule-1".to_string(),
+            device_id: "device-1".to_string(),
+            root_tree_hash: [9u8; 32],
+            retention_tier: RetentionTier::Daily,
+            file_count: 1,
+            total_bytes: 10,
+            created_at: 100,
+        };
+        assert!(db
+            .insert_snapshot_with_chunks(&snapshot, &[hash])
+            .unwrap());
+        assert!(!db
+            .insert_snapshot_with_chunks(&snapshot, &[hash])
+            .unwrap());
+        assert_eq!(
+            db.get_chunk("vault-1", &hash)
+                .unwrap()
+                .unwrap()
+                .ref_count,
+            1
+        );
+        assert!(db.delete_snapshot("snapshot-1").unwrap());
+        assert_eq!(
+            db.get_chunk("vault-1", &hash)
+                .unwrap()
+                .unwrap()
+                .ref_count,
+            0
+        );
     }
 }

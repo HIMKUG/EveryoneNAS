@@ -7,15 +7,17 @@
 //!   保障 `client_only` 模式下 `trigger_incremental_scan` 与 `update_power_network_policy` 独立可用。
 //! - `RoleMode`、`DeviceIdentity` 与 `vault_master_key` 全部持久化，重启不漂移。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use argon2::Argon2;
+use rand::{rngs::OsRng, RngCore};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
@@ -24,11 +26,13 @@ use tracing::{error, info, warn};
 
 use lanvault_client::{
     reconcile_directory, ClipboardClient, DirectoryWatcher, PowerNetworkPolicy,
-    ReconnectController, ReconnectEvent, ReconnectTarget, SyncEngine, WatchEvent,
+    DeviceEnvironment, ReconnectController, ReconnectEvent, ReconnectTarget, SyncEngine,
+    TokenBucket, WatchEvent,
 };
 use lanvault_core::{
-    parse_role_mode, Database, DeviceIdentity, DiscoveredPeerInfo, DiscoveryBrowser, RoleMode,
-    SessionKeyExchange, SymmetricKey, SyncRuleRecord,
+    blake3_hash, decrypt_aead, encrypt_aead, pairing_identity_message, pairing_response_message,
+    parse_role_mode, verify_ed25519, Database, DeviceIdentity, DiscoveredPeerInfo,
+    DiscoveryBrowser, RoleMode, SessionKeyExchange, SymmetricKey, SyncRuleRecord,
 };
 use lanvault_server::{ServerConfig, ServerExitReason};
 
@@ -47,10 +51,12 @@ const SETTING_ROLE_MODE: &str = "role_mode";
 const SETTING_VAULT_MASTER_KEY_HEX: &str = "vault_master_key_hex";
 const SETTING_POWER_POLICY_JSON: &str = "power_network_policy";
 const SETTING_ACTIVE_PEER_JSON: &str = "active_peer_session_json";
-const PAIR_KEX_TRANSCRIPT: &[u8] = b"lanvault.pair.v1";
+const SETTING_AUTO_RECONNECT: &str = "auto_reconnect_enabled";
+const SETTING_DEFAULTS_INITIALIZED: &str = "default_sync_rules_initialized";
+const SETTING_DEBUG_MODE: &str = "debug_mode";
 
 /// FFI DTO: mDNS / 局域网发现的对端设备。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DiscoveredPeer {
     pub device_id: String,
     pub device_name: String,
@@ -58,6 +64,8 @@ pub struct DiscoveredPeer {
     pub ip: String,
     pub port: u16,
     pub fingerprint: String,
+    #[serde(skip)]
+    last_seen: Instant,
 }
 
 impl From<DiscoveredPeerInfo> for DiscoveredPeer {
@@ -69,6 +77,7 @@ impl From<DiscoveredPeerInfo> for DiscoveredPeer {
             ip: info.ip.to_string(),
             port: info.port,
             fingerprint: info.fingerprint,
+            last_seen: Instant::now(),
         }
     }
 }
@@ -105,6 +114,8 @@ struct LocalServerHandle {
     port: u16,
     vault_path: PathBuf,
     db_path: PathBuf,
+    quota_bytes: u64,
+    password_hash: [u8; 32],
     stop_tx: watch::Sender<bool>,
     task: JoinHandle<()>,
 }
@@ -112,6 +123,7 @@ struct LocalServerHandle {
 /// 受单一异步互斥锁保护的三态模式与本地服务生命周期状态，杜绝并发竞态。
 struct LifecycleState {
     role_mode: RoleMode,
+    last_server_config: Option<ServerConfig>,
     server_handle: Option<LocalServerHandle>,
     watchers: Vec<DirectoryWatcher>,
     watcher_dispatch_task: Option<JoinHandle<()>>,
@@ -158,24 +170,40 @@ struct PersistedPeerSession {
     default_vault_id: Option<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct EncryptedSetting {
+    ciphertext_hex: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VaultKeyBackup {
+    version: u8,
+    salt_hex: String,
+    ciphertext_hex: String,
+}
+
 /// 全局 FFI 异步运行时与服务句柄容器。
 struct FfiRuntimeState {
     runtime: tokio::runtime::Runtime,
     client_db: Arc<Database>,
     client_identity: DeviceIdentity,
     client_device_id: String,
-    vault_master_key: SymmetricKey,
+    vault_master_key: RwLock<SymmetricKey>,
     lifecycle: AsyncMutex<LifecycleState>,
     reconnect: ReconnectController,
     policy: Arc<RwLock<PowerNetworkPolicy>>,
+    rate_limiter: Arc<TokenBucket>,
     progress_tx: broadcast::Sender<SyncProgressEvent>,
     latest_progress: Arc<Mutex<SyncProgressEvent>>,
     discovered_peers: Arc<Mutex<HashMap<String, DiscoveredPeer>>>,
     mdns_browser_started: Mutex<bool>,
     active_peer: Arc<RwLock<Option<ActivePeerSession>>>,
+    environment: Arc<RwLock<DeviceEnvironment>>,
+    sync_inflight: Arc<AsyncMutex<HashSet<String>>>,
 }
 
 static GLOBAL_STATE: OnceLock<Arc<FfiRuntimeState>> = OnceLock::new();
+static INIT_LOCK: Mutex<()> = Mutex::new(());
 
 fn client_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LANVAULT_DATA_DIR") {
@@ -184,40 +212,94 @@ fn client_data_dir() -> PathBuf {
             return PathBuf::from(trimmed);
         }
     }
-    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-        let trimmed = appdata.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("EveryoneNAS");
-        }
+    #[cfg(target_os = "android")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = fs::metadata("/proc/self")
+            .map(|metadata| metadata.uid())
+            .unwrap_or(20_000);
+        return match uid {
+            0 => PathBuf::from("/data/adb/lanvault"),
+            2000 => PathBuf::from("/data/local/tmp/lanvault"),
+            _ => std::env::var_os("TMPDIR")
+                .and_then(|tmp| PathBuf::from(tmp).parent().map(Path::to_path_buf))
+                .map(|files| files.join("lanvault"))
+                .unwrap_or_else(|| PathBuf::from("/data/user/0/com.lanvault.app/files/lanvault")),
+        };
     }
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        let trimmed = xdg.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed).join("lanvault");
+    #[cfg(not(target_os = "android"))]
+    {
+        if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
+            let trimmed = appdata.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("EveryoneNAS");
+            }
         }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let trimmed = home.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed)
-                .join(".local")
-                .join("share")
-                .join("lanvault");
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            let trimmed = xdg.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed).join("lanvault");
+            }
         }
+        if let Ok(home) = std::env::var("HOME") {
+            let trimmed = home.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed)
+                    .join(".local")
+                    .join("share")
+                    .join("lanvault");
+            }
+        }
+        std::env::temp_dir().join("lanvault")
     }
-    std::env::temp_dir().join("lanvault")
 }
 
-fn load_or_generate_vault_master_key(db: &Database) -> Result<SymmetricKey> {
-    if let Some(hex_key) = db.get_setting(SETTING_VAULT_MASTER_KEY_HEX)? {
-        let bytes = hex::decode(hex_key.trim())
-            .context("persisted vault_master_key_hex is not valid hex")?;
+fn encrypt_setting(value: &[u8], protection_key: &SymmetricKey, aad: &[u8]) -> Result<String> {
+    let encrypted = encrypt_aead(protection_key, value, aad)?;
+    serde_json::to_string(&EncryptedSetting {
+        ciphertext_hex: hex::encode(encrypted),
+    })
+    .map_err(Into::into)
+}
+
+fn decrypt_setting(
+    raw: &str,
+    protection_key: &SymmetricKey,
+    aad: &[u8],
+) -> Result<Vec<u8>> {
+    let envelope: EncryptedSetting =
+        serde_json::from_str(raw).context("invalid encrypted local setting")?;
+    let ciphertext =
+        hex::decode(envelope.ciphertext_hex).context("invalid encrypted setting hex")?;
+    Ok(decrypt_aead(protection_key, &ciphertext, aad)?)
+}
+
+fn load_or_generate_vault_master_key(
+    db: &Database,
+    protection_key: &SymmetricKey,
+) -> Result<SymmetricKey> {
+    const AAD: &[u8] = b"lanvault.local.vault-master-key.v1";
+    if let Some(raw) = db.get_setting(SETTING_VAULT_MASTER_KEY_HEX)? {
+        let bytes = if raw.trim_start().starts_with('{') {
+            decrypt_setting(&raw, protection_key, AAD)?
+        } else {
+            let legacy = hex::decode(raw.trim())
+                .context("persisted vault_master_key_hex is not valid hex")?;
+            db.set_setting(
+                SETTING_VAULT_MASTER_KEY_HEX,
+                &encrypt_setting(&legacy, protection_key, AAD)?,
+            )?;
+            legacy
+        };
         return SymmetricKey::from_slice(&bytes)
-            .context("persisted vault_master_key_hex has invalid length");
+            .context("persisted vault master key has invalid length");
     }
 
     let key = SymmetricKey::generate();
-    db.set_setting(SETTING_VAULT_MASTER_KEY_HEX, &hex::encode(key.as_bytes()))?;
+    db.set_setting(
+        SETTING_VAULT_MASTER_KEY_HEX,
+        &encrypt_setting(key.as_bytes(), protection_key, AAD)?,
+    )?;
     Ok(key)
 }
 
@@ -266,7 +348,7 @@ fn default_sync_dirs() -> Vec<(&'static str, PathBuf)> {
 }
 
 fn ensure_default_sync_rules(db: &Database, policy: &PowerNetworkPolicy) -> Result<()> {
-    if !db.list_sync_rules()?.is_empty() {
+    if db.get_setting(SETTING_DEFAULTS_INITIALIZED)?.as_deref() == Some("1") {
         return Ok(());
     }
     let ssids_json = if policy.allowed_ssids.is_empty() {
@@ -286,15 +368,30 @@ fn ensure_default_sync_rules(db: &Database, policy: &PowerNetworkPolicy) -> Resu
             enabled: true,
         })?;
     }
+    db.set_setting(SETTING_DEFAULTS_INITIALIZED, "1")?;
     Ok(())
 }
 
-fn load_persisted_peer(db: &Database) -> Result<Option<ActivePeerSession>> {
+fn load_persisted_peer(
+    db: &Database,
+    protection_key: &SymmetricKey,
+) -> Result<Option<ActivePeerSession>> {
+    const AAD: &[u8] = b"lanvault.local.active-peer.v1";
     let Some(raw) = db.get_setting(SETTING_ACTIVE_PEER_JSON)? else {
         return Ok(None);
     };
+    let decoded = if raw.trim_start().starts_with('{') {
+        decrypt_setting(&raw, protection_key, AAD)?
+    } else {
+        let legacy = raw.into_bytes();
+        db.set_setting(
+            SETTING_ACTIVE_PEER_JSON,
+            &encrypt_setting(&legacy, protection_key, AAD)?,
+        )?;
+        legacy
+    };
     let persisted: PersistedPeerSession =
-        serde_json::from_str(&raw).context("invalid persisted active_peer_session_json")?;
+        serde_json::from_slice(&decoded).context("invalid persisted active_peer_session_json")?;
     let addr: SocketAddr = persisted
         .addr
         .parse()
@@ -314,7 +411,12 @@ fn load_persisted_peer(db: &Database) -> Result<Option<ActivePeerSession>> {
     }))
 }
 
-fn save_persisted_peer(db: &Database, peer: &ActivePeerSession) -> Result<()> {
+fn save_persisted_peer(
+    db: &Database,
+    peer: &ActivePeerSession,
+    protection_key: &SymmetricKey,
+) -> Result<()> {
+    const AAD: &[u8] = b"lanvault.local.active-peer.v1";
     let persisted = PersistedPeerSession {
         device_id: peer.device_id.clone(),
         addr: peer.addr.to_string(),
@@ -323,8 +425,11 @@ fn save_persisted_peer(db: &Database, peer: &ActivePeerSession) -> Result<()> {
         channel_key_hex: hex::encode(peer.channel_key.as_bytes()),
         default_vault_id: peer.default_vault_id.clone(),
     };
-    let json = serde_json::to_string(&persisted)?;
-    db.set_setting(SETTING_ACTIVE_PEER_JSON, &json)?;
+    let json = serde_json::to_vec(&persisted)?;
+    db.set_setting(
+        SETTING_ACTIVE_PEER_JSON,
+        &encrypt_setting(&json, protection_key, AAD)?,
+    )?;
     Ok(())
 }
 
@@ -417,16 +522,43 @@ fn start_client_background_tasks(
         }));
         let mut rx = state.reconnect.subscribe();
         let db = Arc::clone(&state.client_db);
+        let event_state = Arc::clone(state);
         life.reconnect_event_task = Some(state.runtime.spawn(async move {
-            while let Ok(ev) = rx.recv().await {
-                if matches!(ev, ReconnectEvent::PeerConnected { .. }) {
-                    if let Ok(rules) = db.list_sync_rules() {
-                        for rule in rules.into_iter().filter(|r| r.enabled) {
-                            if let Err(err) = trigger_incremental_scan(rule.rule_id.clone()).await {
-                                warn!(rule_id = %rule.rule_id, "reconnect reconciliation failed: {err}");
+            loop {
+                match rx.recv().await {
+                    Ok(ReconnectEvent::PeerConnected { .. }) => {
+                        if let Ok(rules) = db.list_sync_rules() {
+                            for rule in rules.into_iter().filter(|r| r.enabled) {
+                                if let Err(err) =
+                                    trigger_incremental_scan(rule.rule_id.clone()).await
+                                {
+                                    warn!(
+                                        rule_id = %rule.rule_id,
+                                        "reconnect reconciliation failed: {err}"
+                                    );
+                                }
                             }
                         }
                     }
+                    Ok(ReconnectEvent::PeerDisconnected { .. }) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "reconnect event subscriber lagged");
+                        if event_state.reconnect.is_enabled() {
+                            if let Ok(rules) = db.list_sync_rules() {
+                                for rule in rules.into_iter().filter(|r| r.enabled) {
+                                    if let Err(err) =
+                                        trigger_incremental_scan(rule.rule_id.clone()).await
+                                    {
+                                        warn!(
+                                            rule_id = %rule.rule_id,
+                                            "lagged reconciliation failed: {err}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         }));
@@ -438,6 +570,13 @@ fn runtime_state() -> Result<Arc<FfiRuntimeState>> {
         return Ok(Arc::clone(state));
     }
 
+    let _init_guard = INIT_LOCK
+        .lock()
+        .map_err(|_| anyhow!("FFI initialization lock poisoned"))?;
+    if let Some(state) = GLOBAL_STATE.get() {
+        return Ok(Arc::clone(state));
+    }
+
     let data_dir = client_data_dir();
     fs::create_dir_all(&data_dir).with_context(|| {
         format!(
@@ -445,6 +584,11 @@ fn runtime_state() -> Result<Arc<FfiRuntimeState>> {
             data_dir.display()
         )
     })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700))?;
+    }
 
     lanvault_core::install_rust_panic_hook();
     lanvault_core::configure_debug_log_file(&data_dir.join("lanvault_debug.log"));
@@ -456,11 +600,18 @@ fn runtime_state() -> Result<Arc<FfiRuntimeState>> {
     let client_identity = DeviceIdentity::load_or_generate(&data_dir.join("client_device.key"))
         .context("failed to load or generate client DeviceIdentity")?;
     let client_device_id = format!("lv-{}", &client_identity.fingerprint_hex()[..12]);
-    let vault_master_key = load_or_generate_vault_master_key(&client_db)?;
+    let local_storage_key = client_identity.derive_local_storage_key("client-state");
+    let vault_master_key =
+        load_or_generate_vault_master_key(&client_db, &local_storage_key)?;
     let persisted_role = load_persisted_role_mode(&client_db)?;
     let persisted_policy = load_persisted_policy(&client_db)?;
     ensure_default_sync_rules(&client_db, &persisted_policy)?;
-    let persisted_peer = load_persisted_peer(&client_db)?;
+    let persisted_peer = load_persisted_peer(&client_db, &local_storage_key)?;
+    let debug_enabled = client_db
+        .get_setting(SETTING_DEBUG_MODE)?
+        .as_deref()
+        == Some("1");
+    lanvault_core::set_debug_mode(debug_enabled);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -469,15 +620,21 @@ fn runtime_state() -> Result<Arc<FfiRuntimeState>> {
         .context("failed to initialize global Tokio runtime for LanVault FFI")?;
 
     let (progress_tx, _) = broadcast::channel(256);
-    let reconnect_enabled = persisted_role != RoleMode::ServerOnly;
+    let reconnect_enabled = persisted_role != RoleMode::ServerOnly
+        && client_db
+            .get_setting(SETTING_AUTO_RECONNECT)?
+            .as_deref()
+            != Some("0");
+    let rate_limiter = Arc::new(TokenBucket::new(persisted_policy.max_kbps));
     let state = Arc::new(FfiRuntimeState {
         runtime,
         client_db,
         client_identity,
         client_device_id,
-        vault_master_key,
+        vault_master_key: RwLock::new(vault_master_key),
         lifecycle: AsyncMutex::new(LifecycleState {
             role_mode: persisted_role,
+            last_server_config: None,
             server_handle: None,
             watchers: Vec::new(),
             watcher_dispatch_task: None,
@@ -486,11 +643,18 @@ fn runtime_state() -> Result<Arc<FfiRuntimeState>> {
         }),
         reconnect: ReconnectController::new(reconnect_enabled),
         policy: Arc::new(RwLock::new(persisted_policy)),
+        rate_limiter,
         progress_tx,
         latest_progress: Arc::new(Mutex::new(SyncProgressEvent::default())),
         discovered_peers: Arc::new(Mutex::new(HashMap::new())),
         mdns_browser_started: Mutex::new(false),
         active_peer: Arc::new(RwLock::new(persisted_peer.clone())),
+        environment: Arc::new(RwLock::new(DeviceEnvironment {
+            on_wifi: !cfg!(target_os = "android"),
+            current_ssid: None,
+            is_charging: !cfg!(target_os = "android"),
+        })),
+        sync_inflight: Arc::new(AsyncMutex::new(HashSet::new())),
     });
 
     if persisted_role != RoleMode::ServerOnly {
@@ -498,10 +662,12 @@ fn runtime_state() -> Result<Arc<FfiRuntimeState>> {
         start_client_background_tasks(&state, &mut life, persisted_peer);
     }
 
-    let _ = GLOBAL_STATE.set(Arc::clone(&state));
-    Ok(Arc::clone(
-        GLOBAL_STATE.get().expect("GLOBAL_STATE initialized"),
-    ))
+    if GLOBAL_STATE.set(Arc::clone(&state)).is_err() {
+        return Ok(Arc::clone(
+            GLOBAL_STATE.get().expect("initialized by competing caller"),
+        ));
+    }
+    Ok(state)
 }
 
 /// 供 `c_abi` 与 Android JNI 同步桥接复用的全局 Tokio 执行入口。
@@ -579,8 +745,16 @@ pub(crate) fn poll_mdns_peers() -> Result<Vec<DiscoveredPeer>> {
 
     if should_start {
         let (tx, mut rx) = mpsc::channel::<DiscoveredPeerInfo>(64);
-        let browser = DiscoveryBrowser::start(state.client_device_id.clone(), tx)
-            .context("failed to start dual-channel DiscoveryBrowser")?;
+        let browser = match DiscoveryBrowser::start(state.client_device_id.clone(), tx) {
+            Ok(browser) => browser,
+            Err(err) => {
+                *state
+                    .mdns_browser_started
+                    .lock()
+                    .expect("mdns_browser_started mutex poisoned") = false;
+                return Err(err).context("failed to start dual-channel DiscoveryBrowser");
+            }
+        };
         let peers_cache = Arc::clone(&state.discovered_peers);
 
         state.runtime.spawn(async move {
@@ -595,23 +769,42 @@ pub(crate) fn poll_mdns_peers() -> Result<Vec<DiscoveredPeer>> {
         });
     }
 
-    let peers = state
+    let mut peers_cache = state
         .discovered_peers
         .lock()
-        .expect("discovered_peers mutex poisoned")
-        .values()
-        .cloned()
-        .collect();
+        .expect("discovered_peers mutex poisoned");
+    peers_cache.retain(|_, peer| peer.last_seen.elapsed() < Duration::from_secs(30));
+    let peers = peers_cache.values().cloned().collect();
+    drop(peers_cache);
     Ok(peers)
 }
 
 /// 1. 启动 mDNS + UDP 7843 局域网双通道设备发现（自动过滤本机）并通过 `StreamSink` 流式推送至 Flutter。
 pub fn start_mdns_scan(sink: StreamSink<DiscoveredPeer>) -> Result<()> {
     let state = runtime_state()?;
+    {
+        let mut started = state
+            .mdns_browser_started
+            .lock()
+            .expect("mdns_browser_started mutex poisoned");
+        if *started {
+            return Ok(());
+        }
+        *started = true;
+    }
     let (tx, mut rx) = mpsc::channel::<DiscoveredPeerInfo>(64);
-    let browser = DiscoveryBrowser::start(state.client_device_id.clone(), tx)
-        .context("failed to start dual-channel DiscoveryBrowser")?;
+    let browser = match DiscoveryBrowser::start(state.client_device_id.clone(), tx) {
+        Ok(browser) => browser,
+        Err(err) => {
+            *state
+                .mdns_browser_started
+                .lock()
+                .expect("mdns_browser_started mutex poisoned") = false;
+            return Err(err).context("failed to start dual-channel DiscoveryBrowser");
+        }
+    };
     let peers_cache = Arc::clone(&state.discovered_peers);
+    let scan_state = Arc::clone(&state);
 
     state.runtime.spawn(async move {
         while let Some(info) = rx.recv().await {
@@ -627,6 +820,10 @@ pub fn start_mdns_scan(sink: StreamSink<DiscoveredPeer>) -> Result<()> {
             }
         }
         let _ = browser.shutdown();
+        *scan_state
+            .mdns_browser_started
+            .lock()
+            .expect("mdns_browser_started mutex poisoned") = false;
     });
 
     Ok(())
@@ -637,6 +834,7 @@ struct PairPinRequest {
     pin: String,
     client_ed25519_pubkey_hex: String,
     client_x25519_pubkey_hex: String,
+    client_ed25519_signature_hex: String,
     device_name: String,
     os_type: String,
 }
@@ -644,7 +842,10 @@ struct PairPinRequest {
 #[derive(Deserialize)]
 struct PairPinResponse {
     device_id: String,
+    server_ed25519_pubkey_hex: String,
     server_x25519_pubkey_hex: String,
+    server_ed25519_signature_hex: String,
+    clipboard_key_envelope_hex: String,
     session_cookie: Option<String>,
 }
 
@@ -663,6 +864,18 @@ pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String>
 
     let state = runtime_state()?;
     let kex = SessionKeyExchange::new();
+    let client_ed25519_pubkey = state.client_identity.public_key_bytes();
+    let client_x25519_pubkey = kex.public_key_bytes();
+    let device_name = current_hostname();
+    let os_type = std::env::consts::OS.to_string();
+    let identity_message = pairing_identity_message(
+        &pin,
+        &client_ed25519_pubkey,
+        &client_x25519_pubkey,
+        &device_name,
+        &os_type,
+    );
+    let client_signature = state.client_identity.sign(&identity_message);
 
     let socket_addr = SocketAddr::new(parsed_ip, port);
     let endpoint_base_url = format!("http://{socket_addr}");
@@ -672,11 +885,12 @@ pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String>
     let resp = client
         .post(&url)
         .json(&PairPinRequest {
-            pin,
-            client_ed25519_pubkey_hex: hex::encode(state.client_identity.public_key_bytes()),
-            client_x25519_pubkey_hex: hex::encode(kex.public_key_bytes()),
-            device_name: current_hostname(),
-            os_type: std::env::consts::OS.to_string(),
+            pin: pin.clone(),
+            client_ed25519_pubkey_hex: hex::encode(client_ed25519_pubkey),
+            client_x25519_pubkey_hex: hex::encode(client_x25519_pubkey),
+            client_ed25519_signature_hex: hex::encode(client_signature),
+            device_name,
+            os_type,
         })
         .send()
         .await
@@ -690,11 +904,50 @@ pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String>
     }
 
     let body: PairPinResponse = resp.json().await.context("invalid pairing response JSON")?;
+    let server_ed25519_pubkey = hex::decode(&body.server_ed25519_pubkey_hex)
+        .context("invalid server_ed25519_pubkey_hex")?;
     let peer_pub_bytes = hex::decode(&body.server_x25519_pubkey_hex)
         .context("invalid server_x25519_pubkey_hex")?;
-    let channel_key = kex
-        .agree(&peer_pub_bytes, PAIR_KEX_TRANSCRIPT)
+    let server_signature = hex::decode(&body.server_ed25519_signature_hex)
+        .context("invalid server_ed25519_signature_hex")?;
+    let clipboard_envelope = hex::decode(&body.clipboard_key_envelope_hex)
+        .context("invalid clipboard_key_envelope_hex")?;
+    let response_message = pairing_response_message(
+        &pin,
+        &client_ed25519_pubkey,
+        &client_x25519_pubkey,
+        &server_ed25519_pubkey,
+        &peer_pub_bytes,
+        &body.device_id,
+        &clipboard_envelope,
+    );
+    verify_ed25519(
+        &server_ed25519_pubkey,
+        &response_message,
+        &server_signature,
+    )
+    .context("server identity signature verification failed")?;
+    let server_public_key: [u8; 32] = server_ed25519_pubkey
+        .try_into()
+        .map_err(|_| anyhow!("invalid server Ed25519 public key length"))?;
+    let expected_server_device_id = format!(
+        "lv-{}",
+        &lanvault_core::public_key_fingerprint(&server_public_key)[..12]
+    );
+    if body.device_id != expected_server_device_id {
+        bail!("server device id does not match its signing key");
+    }
+    let session_key = kex
+        .agree(&peer_pub_bytes, &identity_message)
         .context("X25519 session key agreement failed")?;
+    let clipboard_key = decrypt_aead(
+        &session_key,
+        &clipboard_envelope,
+        b"lanvault.clipboard.key.v1",
+    )
+    .context("failed to decrypt clipboard group key")?;
+    let channel_key = SymmetricKey::from_slice(&clipboard_key)
+        .context("server returned an invalid clipboard group key")?;
 
     let default_vault_id =
         fetch_remote_default_vault_id(&endpoint_base_url, body.session_cookie.as_deref()).await;
@@ -706,7 +959,13 @@ pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String>
         channel_key,
         default_vault_id,
     };
-    save_persisted_peer(&state.client_db, &session)?;
+    save_persisted_peer(
+        &state.client_db,
+        &session,
+        &state
+            .client_identity
+            .derive_local_storage_key("client-state"),
+    )?;
     *state.active_peer.write().await = Some(session.clone());
 
     let mut life = state.lifecycle.lock().await;
@@ -719,18 +978,22 @@ pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String>
 /// 3. 开启或暂停后台自愈重连状态机（`2s -> 5s -> 15s -> 30s`）。
 pub async fn enable_auto_reconnect(enabled: bool) -> Result<()> {
     let state = runtime_state()?;
-    let life = state.lifecycle.lock().await;
-    if life.role_mode == RoleMode::ServerOnly {
+    let role_mode = state.lifecycle.lock().await.role_mode;
+    if role_mode == RoleMode::ServerOnly {
         bail!(
             "auto-reconnect is unavailable in `server_only` mode; switch role_mode to `client_only` or `dual` first"
         );
     }
     state.reconnect.set_enabled(enabled);
+    state.client_db.set_setting(
+        SETTING_AUTO_RECONNECT,
+        if enabled { "1" } else { "0" },
+    )?;
     Ok(())
 }
 
 /// 内部复用入口：支持 Android JNI 透传指定监听端口，同时被 `start_local_server` 复用。
-pub(crate) async fn start_local_server_with_port(
+pub async fn start_local_server_with_port(
     vault_path: String,
     quota_gb: u64,
     web_password: String,
@@ -742,11 +1005,15 @@ pub(crate) async fn start_local_server_with_port(
     if quota_gb == 0 {
         bail!("quota_gb must be greater than 0");
     }
-    if web_password.len() < 6 {
-        bail!("web_password must be at least 6 characters");
+    if web_password.len() < 8 {
+        bail!("web_password must be at least 8 characters");
     }
 
     let state = runtime_state()?;
+    let root = PathBuf::from(vault_path.trim());
+    let port = requested_port.filter(|&p| p > 0).unwrap_or(DEFAULT_SERVER_PORT);
+    let quota_bytes = quota_gb.saturating_mul(1024 * 1024 * 1024);
+    let password_hash = blake3_hash(web_password.trim().as_bytes());
     let mut life = state.lifecycle.lock().await;
 
     if life.role_mode == RoleMode::ClientOnly {
@@ -757,17 +1024,25 @@ pub(crate) async fn start_local_server_with_port(
 
     if let Some(existing) = life.server_handle.as_ref() {
         if !existing.task.is_finished() {
+            if existing.port != port
+                || existing.vault_path != root
+                || existing.quota_bytes != quota_bytes
+                || existing.password_hash != password_hash
+            {
+                bail!(
+                    "a local server is already running on port {} with vault {}",
+                    existing.port,
+                    existing.vault_path.display()
+                );
+            }
             return Ok(existing.port);
         }
         life.server_handle = None;
     }
 
-    let root = PathBuf::from(vault_path.trim());
     let db_path = root.join("index.db");
-    let quota_bytes = quota_gb.saturating_mul(1024 * 1024 * 1024);
-    let port = requested_port.filter(|&p| p > 0).unwrap_or(DEFAULT_SERVER_PORT);
-
     let config = ServerConfig {
+        bind_addr: "0.0.0.0".to_string(),
         port,
         vault_root: root.clone(),
         default_quota_bytes: quota_bytes,
@@ -775,6 +1050,7 @@ pub(crate) async fn start_local_server_with_port(
         device_name: current_hostname(),
         ..ServerConfig::default()
     };
+    let reusable_config = config.clone();
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let (bound_tx, bound_rx) = oneshot::channel::<SocketAddr>();
@@ -834,10 +1110,13 @@ pub(crate) async fn start_local_server_with_port(
     };
 
     let actual_port = bound_addr.port();
+    life.last_server_config = Some(reusable_config);
     life.server_handle = Some(LocalServerHandle {
         port: actual_port,
         vault_path: root,
         db_path,
+        quota_bytes,
+        password_hash,
         stop_tx,
         task,
     });
@@ -888,6 +1167,42 @@ pub fn subscribe_sync_progress(sink: StreamSink<SyncProgressEvent>) -> Result<()
 
 /// 7. 手动触发指定同步规则的全量元数据 Diff 扫描与增量上传（独立使用 `client_state.db`，`client_only` 模式下完全可用）。
 pub async fn trigger_incremental_scan(rule_id: String) -> Result<()> {
+    let state = runtime_state()?;
+    if rule_id.trim().is_empty() {
+        bail!("rule_id must not be empty");
+    }
+    {
+        let mut in_flight = state.sync_inflight.lock().await;
+        if !in_flight.insert(rule_id.clone()) {
+            bail!("sync rule `{rule_id}` is already running");
+        }
+    }
+    let result = trigger_incremental_scan_inner(rule_id.clone()).await;
+    state.sync_inflight.lock().await.remove(&rule_id);
+    if let Err(err) = &result {
+        let previous = state
+            .latest_progress
+            .lock()
+            .expect("latest_progress mutex poisoned")
+            .clone();
+        emit_progress(
+            &state,
+            SyncProgressEvent {
+                rule_id,
+                current_file: String::new(),
+                bytes_processed: previous.bytes_processed,
+                total_bytes: previous.total_bytes,
+                chunks_uploaded: previous.chunks_uploaded,
+                chunks_deduplicated: previous.chunks_deduplicated,
+                throughput_bps: 0,
+                status: format!("failed: {err}"),
+            },
+        );
+    }
+    result
+}
+
+async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
     if rule_id.trim().is_empty() {
         bail!("rule_id must not be empty");
     }
@@ -908,7 +1223,34 @@ pub async fn trigger_incremental_scan(rule_id: String) -> Result<()> {
         .filter(|r| r.enabled)
         .ok_or_else(|| anyhow!("sync rule `{rule_id}` not found or disabled"))?;
 
-    let diff = reconcile_directory(&state.client_db, &rule_id, Path::new(&rule.local_dir))?;
+    let peer = state
+        .active_peer
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| anyhow!("no paired peer session active for incremental upload"))?;
+    let resolved_vault_id = if rule.target_vault_id == "default"
+        || rule.target_vault_id == "vault-primary"
+    {
+        match peer.default_vault_id.clone() {
+            Some(vault_id) => vault_id,
+            None => fetch_remote_default_vault_id(
+                &peer.endpoint_base_url,
+                peer.session_cookie.as_deref(),
+            )
+            .await
+            .ok_or_else(|| anyhow!("remote peer has no available vault"))?,
+        }
+    } else {
+        rule.target_vault_id.clone()
+    };
+
+    let diff = reconcile_directory(
+        &state.client_db,
+        &rule_id,
+        &resolved_vault_id,
+        Path::new(&rule.local_dir),
+    )?;
     let total_bytes: u64 = diff.changed_files().map(|f| f.size).sum();
 
     emit_progress(
@@ -933,20 +1275,16 @@ pub async fn trigger_incremental_scan(rule_id: String) -> Result<()> {
         return Ok(());
     }
 
-    let peer = state
-        .active_peer
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| anyhow!("no paired peer session active for incremental upload"))?;
-
     let policy = state.policy.read().await.clone();
+    let environment = state.environment.read().await.clone();
     let engine = SyncEngine::new(
         peer.endpoint_base_url.clone(),
         peer.session_cookie.clone(),
         state.client_device_id.clone(),
-        state.vault_master_key.clone(),
+        state.vault_master_key.read().await.clone(),
         policy,
+        environment,
+        Some(Arc::clone(&state.rate_limiter)),
     )?;
 
     let mut engine_rx = engine.subscribe_progress();
@@ -970,22 +1308,6 @@ pub async fn trigger_incremental_scan(rule_id: String) -> Result<()> {
             let _ = progress_tx.send(ffi_ev);
         }
     });
-
-    let resolved_vault_id = if rule.target_vault_id == "default"
-        || rule.target_vault_id == "vault-primary"
-    {
-        match peer.default_vault_id.clone() {
-            Some(vid) => vid,
-            None => fetch_remote_default_vault_id(
-                &peer.endpoint_base_url,
-                peer.session_cookie.as_deref(),
-            )
-            .await
-            .ok_or_else(|| anyhow!("remote peer has no available vault"))?,
-        }
-    } else {
-        rule.target_vault_id.clone()
-    };
 
     let sync_result = engine
         .sync_diff(&state.client_db, &rule_id, &resolved_vault_id, &diff)
@@ -1043,12 +1365,95 @@ pub async fn update_power_network_policy(
         state.client_db.upsert_sync_rule(&rule)?;
     }
 
+    state.rate_limiter.update_max_kbps(max_kbps).await;
     *state.policy.write().await = new_policy;
 
     info!(
         wifi_only,
         require_charging, max_kbps, "power/network sync policy updated"
     );
+    Ok(())
+}
+
+pub async fn update_device_environment(
+    on_wifi: bool,
+    current_ssid: Option<String>,
+    is_charging: bool,
+) -> Result<()> {
+    let state = runtime_state()?;
+    *state.environment.write().await = DeviceEnvironment {
+        on_wifi,
+        current_ssid,
+        is_charging,
+    };
+    state.reconnect.notify_network_restored();
+    Ok(())
+}
+
+fn derive_key_backup_key(passphrase: &str, salt: &[u8]) -> Result<SymmetricKey> {
+    let mut key = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(passphrase.as_bytes(), salt, &mut key)
+        .map_err(|err| anyhow!("failed to derive key-backup encryption key: {err}"))?;
+    Ok(SymmetricKey::from_bytes(key))
+}
+
+pub async fn export_vault_key_backup(passphrase: String) -> Result<String> {
+    if passphrase.len() < 12 {
+        bail!("key-backup passphrase must be at least 12 characters");
+    }
+    let state = runtime_state()?;
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    let backup_key = derive_key_backup_key(&passphrase, &salt)?;
+    let vault_key = state.vault_master_key.read().await.clone();
+    let ciphertext = encrypt_aead(
+        &backup_key,
+        vault_key.as_bytes(),
+        b"lanvault.key-backup.v1",
+    )?;
+    Ok(serde_json::to_string(&VaultKeyBackup {
+        version: 1,
+        salt_hex: hex::encode(salt),
+        ciphertext_hex: hex::encode(ciphertext),
+    })?)
+}
+
+pub async fn import_vault_key_backup(passphrase: String, backup_json: String) -> Result<()> {
+    let backup: VaultKeyBackup =
+        serde_json::from_str(&backup_json).context("invalid vault key backup")?;
+    if backup.version != 1 {
+        bail!("unsupported vault key backup version");
+    }
+    let salt = hex::decode(backup.salt_hex).context("invalid key-backup salt")?;
+    let ciphertext =
+        hex::decode(backup.ciphertext_hex).context("invalid key-backup ciphertext")?;
+    let backup_key = derive_key_backup_key(&passphrase, &salt)?;
+    let plaintext = decrypt_aead(
+        &backup_key,
+        &ciphertext,
+        b"lanvault.key-backup.v1",
+    )
+    .context("key-backup passphrase is incorrect or backup is corrupted")?;
+    let key = SymmetricKey::from_slice(&plaintext)
+        .context("vault key backup contains an invalid key")?;
+    let state = runtime_state()?;
+    if !state.sync_inflight.lock().await.is_empty() {
+        bail!("cannot replace the vault key while sync jobs are running");
+    }
+    let protection_key = state
+        .client_identity
+        .derive_local_storage_key("client-state");
+    state.client_db.set_setting(
+        SETTING_VAULT_MASTER_KEY_HEX,
+        &encrypt_setting(
+            key.as_bytes(),
+            &protection_key,
+            b"lanvault.local.vault-master-key.v1",
+        )?,
+    )?;
+    state.client_db.clear_local_file_states()?;
+    *state.vault_master_key.write().await = key;
     Ok(())
 }
 
@@ -1088,6 +1493,7 @@ pub async fn set_role_mode(mode: String) -> anyhow::Result<String> {
     let target_mode = parse_role_mode(&mode)?;
     let state = runtime_state()?;
     let mut life = state.lifecycle.lock().await;
+    let previous_mode = life.role_mode;
 
     state
         .client_db
@@ -1108,6 +1514,35 @@ pub async fn set_role_mode(mode: String) -> anyhow::Result<String> {
         RoleMode::Dual => {
             state.reconnect.set_enabled(true);
             start_client_background_tasks(&state, &mut life, active_peer);
+        }
+    }
+    let restart_config = if target_mode != RoleMode::ClientOnly
+        && life
+            .server_handle
+            .as_ref()
+            .is_none_or(|handle| handle.task.is_finished())
+    {
+        life.last_server_config.clone()
+    } else {
+        None
+    };
+    drop(life);
+
+    if let Some(config) = restart_config {
+        let quota_gb = config.default_quota_bytes / (1024 * 1024 * 1024);
+        if let Err(err) = start_local_server_with_port(
+            config.vault_root.to_string_lossy().into_owned(),
+            quota_gb,
+            config.web_password,
+            Some(config.port),
+        )
+        .await
+        {
+            state
+                .client_db
+                .set_setting(SETTING_ROLE_MODE, previous_mode.as_str())?;
+            state.lifecycle.lock().await.role_mode = previous_mode;
+            return Err(err);
         }
     }
 
@@ -1196,7 +1631,7 @@ pub async fn set_debug_mode(enabled: bool) -> Result<bool> {
     lanvault_core::set_debug_mode(enabled);
     state
         .client_db
-        .set_setting("debug_mode", if enabled { "1" } else { "0" })?;
+        .set_setting(SETTING_DEBUG_MODE, if enabled { "1" } else { "0" })?;
     Ok(lanvault_core::is_debug_enabled())
 }
 
@@ -1235,14 +1670,32 @@ pub async fn report_client_log(
 #[cfg(target_os = "android")]
 pub(crate) fn load_or_generate_jni_web_password() -> Result<String> {
     const KEY: &str = "jni_generated_web_password";
+    const AAD: &[u8] = b"lanvault.local.jni-web-password.v1";
     let state = runtime_state()?;
-    if let Some(existing) = state.client_db.get_setting(KEY)? {
-        if existing.len() >= 12 {
-            return Ok(existing);
+    let protection_key = state
+        .client_identity
+        .derive_local_storage_key("client-state");
+    if let Some(raw) = state.client_db.get_setting(KEY)? {
+        if raw.trim_start().starts_with('{') {
+            let decrypted = decrypt_setting(&raw, &protection_key, AAD)?;
+            let existing = String::from_utf8(decrypted)
+                .context("stored JNI web password is not valid UTF-8")?;
+            if existing.len() >= 12 {
+                return Ok(existing);
+            }
+        } else if raw.len() >= 12 {
+            state.client_db.set_setting(
+                KEY,
+                &encrypt_setting(raw.as_bytes(), &protection_key, AAD)?,
+            )?;
+            return Ok(raw);
         }
     }
     let key = SymmetricKey::generate();
     let generated = hex::encode(&key.as_bytes()[..12]);
-    state.client_db.set_setting(KEY, &generated)?;
+    state.client_db.set_setting(
+        KEY,
+        &encrypt_setting(generated.as_bytes(), &protection_key, AAD)?,
+    )?;
     Ok(generated)
 }

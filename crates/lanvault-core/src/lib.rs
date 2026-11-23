@@ -30,6 +30,9 @@ pub use discovery::{
     DiscoveredPeerInfo, DiscoveryAnnouncement, DiscoveryBrowser, MdnsRegistrar, MDNS_SERVICE_TYPE,
     UDP_FALLBACK_PORT,
 };
+pub use protocol::{
+    pairing_identity_message, pairing_response_message, CLIPBOARD_AAD,
+};
 pub use debug_telemetry::{
     clear_debug_logs, configure_debug_log_file, get_debug_logs, install_rust_panic_hook,
     is_debug_enabled, record_debug, record_event_always, record_frontend_log, set_debug_mode,

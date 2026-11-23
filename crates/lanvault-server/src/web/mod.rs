@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Component, Path as StdPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
@@ -19,18 +19,23 @@ use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
 use axum::http::header::{HeaderName, HeaderValue, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
+use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use std::fs::{self, File};
 use std::io::Write;
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashSet;
 use futures_util::{SinkExt, StreamExt};
 use lanvault_core::crypto::constant_time_eq;
 use lanvault_core::{
-    blake3_hash, public_key_fingerprint, ClipboardKind, Database, LanVaultError, PoolMode,
+    blake3_hash, encrypt_aead, pairing_identity_message, pairing_response_message,
+    public_key_fingerprint, verify_ed25519, ClipboardKind, Database, DeviceIdentity, LanVaultError,
+    PoolMode,
     RetentionTier, SessionKeyExchange, SnapshotRecord, SymmetricKey, TrustedPeer, VolumeRole,
+    CHUNK_MAX_SIZE, CLIPBOARD_AAD,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, Notify};
@@ -39,7 +44,7 @@ use tracing::{info, warn};
 
 use crate::auth::{
     build_clear_session_cookie, build_session_cookie, AuthManager, AuthOutcome, LoginOutcome,
-    SESSION_COOKIE_NAME,
+    SessionInfo, SESSION_COOKIE_NAME, SESSION_TTL_SECS,
 };
 use crate::scrub::{BitRotAlertEvent, BitRotScrubber, ScrubReport};
 use crate::vault::{unix_timestamp_secs, ExtraVolumeSpec, VaultStore};
@@ -87,6 +92,7 @@ pub enum WsServerEvent {
         kind: ClipboardKind,
         content: String,
         filename: Option<String>,
+        encrypted: bool,
         timestamp: i64,
     },
 }
@@ -94,6 +100,8 @@ pub enum WsServerEvent {
 /// Shared runtime state injected into all Axum handlers.
 pub struct AppState {
     pub device_id: String,
+    pub identity: Arc<DeviceIdentity>,
+    pub clipboard_key: SymmetricKey,
     pub os_name: String,
     pub keep_alive_level: String,
     pub lan_ip: String,
@@ -101,22 +109,47 @@ pub struct AppState {
     pub mdns_active: AtomicBool,
     pub started_at: Instant,
     pub throughput_bps: AtomicU64,
+    pub(crate) transfer_bytes: AtomicU64,
+    pub(crate) throughput_sample: std::sync::Mutex<(Instant, u64)>,
     pub active_chunk_writes: AtomicU64,
     pub accepting_tasks: AtomicBool,
-    pub pairing_pin: String,
+    pub pairing_pin: StdMutex<String>,
     pub online_peers: DashSet<String>,
-    pub peer_session_keys: DashMap<String, SymmetricKey>,
     pub db: Arc<Database>,
     pub vault_store: Arc<VaultStore>,
     pub scrubber: Arc<BitRotScrubber>,
     pub auth: Arc<AuthManager>,
     pub ws_tx: broadcast::Sender<WsServerEvent>,
     pub restart_notify: Arc<Notify>,
+    pub(crate) telemetry_cache: RwLock<Option<(Instant, SystemStatusResponse)>>,
 }
 
 impl AppState {
+    fn current_throughput_bps(&self) -> u64 {
+        let total = self.transfer_bytes.load(Ordering::Relaxed);
+        let Ok(mut sample) = self.throughput_sample.lock() else {
+            return self.throughput_bps.load(Ordering::Relaxed);
+        };
+        let elapsed = sample.0.elapsed();
+        if elapsed.as_secs_f64() < 1.0 {
+            return self.throughput_bps.load(Ordering::Relaxed);
+        }
+        let delta = total.saturating_sub(sample.1);
+        let throughput = (delta as f64 / elapsed.as_secs_f64()) as u64;
+        self.throughput_bps.store(throughput, Ordering::Relaxed);
+        *sample = (Instant::now(), total);
+        throughput
+    }
+
     /// Builds a snapshot of current system telemetry matching `GET /api/system/status`.
     pub fn build_system_status(&self) -> Result<SystemStatusResponse, LanVaultError> {
+        if let Ok(cache) = self.telemetry_cache.read() {
+            if let Some((cached_at, status)) = cache.as_ref() {
+                if cached_at.elapsed() < Duration::from_secs(1) {
+                    return Ok(status.clone());
+                }
+            }
+        }
         let corrupted_chunks = self.db.count_corrupted_chunks()?;
         let vaults = self.db.list_vaults()?;
         let mut vault_used_bytes = 0u64;
@@ -140,19 +173,23 @@ impl AppState {
             "healthy"
         };
 
-        Ok(SystemStatusResponse {
+        let status = SystemStatusResponse {
             os: self.os_name.clone(),
             keep_alive_level: self.keep_alive_level.clone(),
             lan_ip: self.lan_ip.clone(),
             port: self.port,
             mdns_active: self.mdns_active.load(Ordering::Relaxed),
             uptime_secs: self.started_at.elapsed().as_secs(),
-            throughput_bps: self.throughput_bps.load(Ordering::Relaxed),
+            throughput_bps: self.current_throughput_bps(),
             bit_rot_health: bit_rot_health.to_string(),
             corrupted_chunks,
             vault_used_bytes,
             vault_quota_bytes,
-        })
+        };
+        if let Ok(mut cache) = self.telemetry_cache.write() {
+            *cache = Some((Instant::now(), status.clone()));
+        }
+        Ok(status)
     }
 
     /// Executes the graceful restart drain sequence:
@@ -188,8 +225,7 @@ impl AppState {
 
 /// Builds the Axum 0.8 router with all REST endpoints, `/ws`, and optional embedded Web UI.
 pub fn build_router(state: Arc<AppState>) -> Router {
-    let api_router = Router::new()
-        .route("/api/auth/login", post(handle_login))
+    let protected_router = Router::new()
         .route("/api/auth/logout", post(handle_logout))
         .route("/api/system/status", get(handle_system_status))
         .route("/api/system/restart", post(handle_system_restart))
@@ -200,7 +236,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/vaults/{vault_id}/snapshots",
-            post(handle_create_snapshot),
+            post(handle_create_snapshot).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route("/api/snapshots", get(handle_list_snapshots))
         .route(
@@ -209,7 +245,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/scrub/trigger", post(handle_scrub_trigger))
         .route("/api/peers", get(handle_list_peers))
-        .route("/api/peers/pair", post(handle_pair_peer))
         .route("/api/peers/{device_id}", delete(handle_delete_peer))
         .route(
             "/api/clipboard",
@@ -217,8 +252,20 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/debug/config", get(handle_get_debug_config).post(handle_set_debug_config))
         .route("/api/debug/logs", get(handle_get_debug_logs).delete(handle_clear_debug_logs))
-        .route("/api/debug/logs/client", post(handle_report_client_log))
+        .route(
+            "/api/debug/logs/client",
+            post(handle_report_client_log).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
         .route("/ws", get(handle_ws_upgrade))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_auth_middleware,
+        ));
+
+    let api_router = Router::new()
+        .route("/api/auth/login", post(handle_login))
+        .route("/api/peers/pair", post(handle_pair_peer))
+        .merge(protected_router)
         .layer(CookieManagerLayer::new())
         .with_state(state);
 
@@ -251,18 +298,86 @@ fn require_accepting_tasks(state: &AppState) -> Result<(), Response> {
 }
 
 #[allow(clippy::result_large_err)]
-fn require_auth(state: &AppState, cookies: &Cookies) -> Result<String, Response> {
+fn require_auth(state: &AppState, cookies: &Cookies) -> Result<SessionInfo, Response> {
     let token = cookies
         .get(SESSION_COOKIE_NAME)
         .map(|c| c.value().to_string());
     match token {
-        Some(t) if state.auth.validate_session(&t) => Ok(t),
+        Some(t) => {
+            let token_hash = hex::encode(blake3_hash(t.as_bytes()));
+            match state
+                .db
+                .is_session_revoked(&token_hash, unix_timestamp_secs())
+            {
+                Ok(true) => return Err(unauthorized_response()),
+                Ok(false) => {}
+                Err(err) => return Err(map_domain_error(err)),
+            }
+            let session = state
+                .auth
+                .validate_session(&t)
+                .ok_or_else(unauthorized_response)?;
+            if let Some(device_id) = session.device_id.as_deref() {
+                match state.db.get_trusted_peer(device_id) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return Err(unauthorized_response()),
+                    Err(err) => return Err(map_domain_error(err)),
+                }
+            }
+            Ok(session)
+        }
         _ => Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "unauthorized" })),
         )
             .into_response()),
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn require_admin(session: &SessionInfo) -> Result<(), Response> {
+    if session.is_admin {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "admin_session_required" })),
+        )
+            .into_response())
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn require_session_device(session: &SessionInfo, device_id: &str) -> Result<(), Response> {
+    if session.is_admin || session.device_id.as_deref() == Some(device_id) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "peer_identity_mismatch" })),
+        )
+            .into_response())
+    }
+}
+
+async fn require_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    cookies: Cookies,
+    request: Request,
+    next: Next,
+) -> Response {
+    match require_auth(&state, &cookies) {
+        Ok(_) => next.run(request).await,
+        Err(response) => response,
+    }
+}
+
+fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({ "error": "unauthorized" })),
+    )
+        .into_response()
 }
 
 fn map_domain_error(err: LanVaultError) -> Response {
@@ -275,7 +390,18 @@ fn map_domain_error(err: LanVaultError) -> Response {
         LanVaultError::CorruptedChunk { .. } => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    (status, Json(serde_json::json!({ "error": err.to_string() }))).into_response()
+    let public_error = match status {
+        StatusCode::BAD_REQUEST
+        | StatusCode::NOT_FOUND
+        | StatusCode::INSUFFICIENT_STORAGE
+        | StatusCode::UNAUTHORIZED
+        | StatusCode::TOO_MANY_REQUESTS => err.to_string(),
+        _ => {
+            warn!(error = %err, "internal request failure");
+            "internal_server_error".to_string()
+        }
+    };
+    (status, Json(serde_json::json!({ "error": public_error }))).into_response()
 }
 
 fn validate_snapshot_id(raw: &str) -> Result<(), LanVaultError> {
@@ -352,6 +478,20 @@ fn validate_relative_snapshot_path(raw: &str) -> Result<PathBuf, LanVaultError> 
     Ok(clean)
 }
 
+fn manifest_root_hash(files: &[SnapshotManifestFile]) -> Result<[u8; 32], LanVaultError> {
+    let mut tree_input = Vec::new();
+    for file in files {
+        tree_input.extend_from_slice(file.rel_path.as_bytes());
+        tree_input.push(0);
+        tree_input.extend_from_slice(&file.size.to_le_bytes());
+        tree_input.extend_from_slice(&file.mtime_ns.to_le_bytes());
+        for hash in &file.chunk_hashes_hex {
+            tree_input.extend_from_slice(&decode_hex_32(hash, "chunk_hashes_hex")?);
+        }
+    }
+    Ok(blake3_hash(&tree_input))
+}
+
 // =============================================================================
 // Request / Response DTOs (aligned with ARCHITECTURE_CONTRACTS.md §3.1)
 // =============================================================================
@@ -411,6 +551,14 @@ struct CreateVaultRequest {
 #[derive(Debug, Deserialize)]
 struct SnapshotQuery {
     vault_id: Option<String>,
+    #[serde(default)]
+    offset: usize,
+    #[serde(default = "default_snapshot_limit")]
+    limit: usize,
+}
+
+fn default_snapshot_limit() -> usize {
+    200
 }
 
 #[derive(Debug, Deserialize)]
@@ -423,6 +571,7 @@ struct SnapshotFileQuery {
 struct SnapshotDto {
     snapshot_id: String,
     vault_id: String,
+    rule_id: String,
     device_id: String,
     retention_tier: String,
     file_count: u64,
@@ -443,6 +592,8 @@ pub struct SnapshotManifestFile {
 pub struct SnapshotManifest {
     pub snapshot_id: String,
     pub vault_id: String,
+    #[serde(default)]
+    pub rule_id: String,
     pub device_id: String,
     pub root_tree_hash_hex: String,
     pub e2ee_enabled: bool,
@@ -453,16 +604,13 @@ pub struct SnapshotManifest {
 #[derive(Debug, Deserialize)]
 struct CreateSnapshotRequest {
     snapshot_id: Option<String>,
+    #[serde(default)]
+    rule_id: String,
     device_id: String,
     root_tree_hash_hex: Option<String>,
     #[serde(default)]
     retention_tier: Option<RetentionTier>,
     files: Vec<SnapshotManifestFile>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WsConnectQuery {
-    device_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,6 +623,7 @@ struct PairPinRequest {
     pin: String,
     client_ed25519_pubkey_hex: String,
     client_x25519_pubkey_hex: String,
+    client_ed25519_signature_hex: String,
     device_name: String,
     os_type: String,
 }
@@ -482,7 +631,10 @@ struct PairPinRequest {
 #[derive(Debug, Serialize)]
 struct PairPinResponse {
     device_id: String,
+    server_ed25519_pubkey_hex: String,
     server_x25519_pubkey_hex: String,
+    server_ed25519_signature_hex: String,
+    clipboard_key_envelope_hex: String,
     session_cookie: Option<String>,
 }
 
@@ -504,6 +656,11 @@ struct ClipboardRequest {
     kind: ClipboardKind,
     content: String,
     filename: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ClipboardEnvelope {
+    wire_hex: String,
 }
 
 // =============================================================================
@@ -575,11 +732,25 @@ async fn handle_login(
 }
 
 async fn handle_logout(State(state): State<Arc<AppState>>, cookies: Cookies) -> Response {
-    let token = match require_auth(&state, &cookies) {
-        Ok(t) => t,
+    let token = cookies
+        .get(SESSION_COOKIE_NAME)
+        .map(|cookie| cookie.value().to_string())
+        .ok_or_else(unauthorized_response);
+    let token = match token {
+        Ok(token) => token,
         Err(resp) => return resp,
     };
+    if state.auth.validate_session(&token).is_none() {
+        return unauthorized_response();
+    }
     state.auth.revoke_session(&token);
+    let token_hash = hex::encode(blake3_hash(token.as_bytes()));
+    if let Err(err) = state.db.revoke_session(
+        &token_hash,
+        unix_timestamp_secs().saturating_add(SESSION_TTL_SECS as i64),
+    ) {
+        return map_domain_error(err);
+    }
     cookies.add(build_clear_session_cookie());
     (
         StatusCode::OK,
@@ -589,9 +760,10 @@ async fn handle_logout(State(state): State<Arc<AppState>>, cookies: Cookies) -> 
 }
 
 async fn handle_system_status(State(state): State<Arc<AppState>>, cookies: Cookies) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
-    }
+    let _session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
     match state.build_system_status() {
         Ok(status) => (StatusCode::OK, Json(status)).into_response(),
         Err(err) => map_domain_error(err),
@@ -599,7 +771,11 @@ async fn handle_system_status(State(state): State<Arc<AppState>>, cookies: Cooki
 }
 
 async fn handle_system_restart(State(state): State<Arc<AppState>>, cookies: Cookies) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
+    let session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_admin(&session) {
         return resp;
     }
     if !state.accepting_tasks.swap(false, Ordering::SeqCst) {
@@ -624,9 +800,10 @@ async fn handle_system_restart(State(state): State<Arc<AppState>>, cookies: Cook
 }
 
 async fn handle_list_vaults(State(state): State<Arc<AppState>>, cookies: Cookies) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
-    }
+    let session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
     let vaults = match state.db.list_vaults() {
         Ok(v) => v,
         Err(err) => return map_domain_error(err),
@@ -634,9 +811,13 @@ async fn handle_list_vaults(State(state): State<Arc<AppState>>, cookies: Cookies
 
     let mut result = Vec::with_capacity(vaults.len());
     for v in vaults {
-        let volumes = match state.db.list_vault_volumes(&v.vault_id) {
-            Ok(vols) => vols,
-            Err(err) => return map_domain_error(err),
+        let volumes = if session.is_admin {
+            match state.db.list_vault_volumes(&v.vault_id) {
+                Ok(vols) => vols,
+                Err(err) => return map_domain_error(err),
+            }
+        } else {
+            Vec::new()
         };
         result.push(VaultDto {
             vault_id: v.vault_id,
@@ -673,8 +854,17 @@ async fn handle_create_vault(
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    if let Err(resp) = require_auth(&state, &cookies) {
+    let session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_admin(&session) {
         return resp;
+    }
+    if !req.e2ee_enabled {
+        return map_domain_error(LanVaultError::InvalidInput(
+            "vaults must keep end-to-end encryption enabled".to_string(),
+        ));
     }
     match state.vault_store.create_vault(
         req.name,
@@ -720,14 +910,24 @@ async fn handle_put_chunk(
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
-    }
+    let _session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
 
     let expected_hash = match decode_hex_32(&hash_hex, "hash_hex") {
         Ok(h) => h,
         Err(err) => return map_domain_error(err),
     };
+    if headers
+        .get("x-lanvault-encoding")
+        .and_then(|value| value.to_str().ok())
+        != Some("xchacha20poly1305+zstd")
+    {
+        return map_domain_error(LanVaultError::InvalidInput(
+            "chunk encoding must be xchacha20poly1305+zstd".to_string(),
+        ));
+    }
 
     let raw_size: u64 = match headers.get("x-lanvault-raw-size") {
         Some(val) => match val.to_str().ok().and_then(|s| s.parse::<u64>().ok()) {
@@ -740,6 +940,11 @@ async fn handle_put_chunk(
         },
         None => body.len() as u64,
     };
+    if raw_size > CHUNK_MAX_SIZE as u64 {
+        return map_domain_error(LanVaultError::InvalidInput(format!(
+            "X-LanVault-Raw-Size exceeds maximum chunk size of {CHUNK_MAX_SIZE} bytes"
+        )));
+    }
 
     let _write_guard = ActiveChunkWriteGuard::new(Arc::clone(&state));
     if let Err(resp) = require_accepting_tasks(&state) {
@@ -757,6 +962,9 @@ async fn handle_put_chunk(
 
     match join_res {
         Ok(Ok(is_new)) => {
+            state
+                .transfer_bytes
+                .fetch_add(stored_size, Ordering::Relaxed);
             let status = if is_new {
                 StatusCode::CREATED
             } else {
@@ -791,16 +999,24 @@ async fn handle_list_snapshots(
     cookies: Cookies,
     Query(query): Query<SnapshotQuery>,
 ) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
-    }
+    let session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
     match state.db.list_snapshots(query.vault_id.as_deref()) {
         Ok(snaps) => {
             let dtos: Vec<SnapshotDto> = snaps
                 .into_iter()
+                .filter(|snapshot| {
+                    session.is_admin
+                        || session.device_id.as_deref() == Some(snapshot.device_id.as_str())
+                })
+                .skip(query.offset)
+                .take(query.limit.clamp(1, 1000))
                 .map(|s| SnapshotDto {
                     snapshot_id: s.snapshot_id,
                     vault_id: s.vault_id,
+                    rule_id: s.rule_id,
                     device_id: s.device_id,
                     retention_tier: s.retention_tier.as_str().to_string(),
                     file_count: s.file_count,
@@ -827,9 +1043,10 @@ async fn handle_create_snapshot(
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
-    }
+    let session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
 
     let snapshot_id = match req.snapshot_id {
         Some(id) => {
@@ -846,6 +1063,14 @@ async fn handle_create_snapshot(
             "device_id must not be empty".to_string(),
         ));
     }
+    if req.rule_id.trim().is_empty() {
+        return map_domain_error(LanVaultError::InvalidInput(
+            "rule_id must not be empty".to_string(),
+        ));
+    }
+    if let Err(resp) = require_session_device(&session, &req.device_id) {
+        return resp;
+    }
 
     let explicit_root_hash = match req.root_tree_hash_hex.as_deref() {
         Some(hex_str) => match decode_hex_32(hex_str, "root_tree_hash_hex") {
@@ -857,11 +1082,17 @@ async fn handle_create_snapshot(
 
     let mut normalized_files = Vec::with_capacity(req.files.len());
     let mut unique_hashes: HashSet<[u8; 32]> = HashSet::new();
+    let mut unique_paths = HashSet::new();
     for file in req.files {
         let clean_path = match validate_relative_snapshot_path(&file.rel_path) {
             Ok(p) => normalize_rel_path(&p),
             Err(err) => return map_domain_error(err),
         };
+        if !unique_paths.insert(clean_path.clone()) {
+            return map_domain_error(LanVaultError::InvalidInput(format!(
+                "duplicate snapshot path: {clean_path}"
+            )));
+        }
         let mut normalized_hashes = Vec::with_capacity(file.chunk_hashes_hex.len());
         for h_hex in &file.chunk_hashes_hex {
             let decoded = match decode_hex_32(h_hex, "chunk_hashes_hex") {
@@ -878,13 +1109,17 @@ async fn handle_create_snapshot(
             chunk_hashes_hex: normalized_hashes,
         });
     }
+    normalized_files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
 
     let retention_tier = req.retention_tier.unwrap_or(RetentionTier::Daily);
+    let rule_id = req.rule_id;
     let device_id = req.device_id;
     let db = Arc::clone(&state.db);
+    let vault_store = Arc::clone(&state.vault_store);
     let vid = vault_id.clone();
 
     let join_res = tokio::task::spawn_blocking(move || -> lanvault_core::Result<SnapshotRecord> {
+        vault_store.with_write_lock(|| {
         let vault = db
             .get_vault(&vid)?
             .ok_or_else(|| LanVaultError::NotFound(format!("vault {vid}")))?;
@@ -893,20 +1128,14 @@ async fn handle_create_snapshot(
         }
 
         for hash in &unique_hashes {
-            if db.get_chunk(&vid, hash)?.is_none() {
+            if !vault_store.has_verified_chunk(&vid, hash)? {
                 return Err(LanVaultError::NotFound(format!(
                     "chunk {} in vault {vid}",
                     hex::encode(hash)
                 )));
             }
         }
-
-        let volumes = db.list_vault_volumes(&vid)?;
-        let primary = volumes
-            .iter()
-            .find(|v| v.is_online && v.role == VolumeRole::Primary)
-            .or_else(|| volumes.iter().find(|v| v.is_online))
-            .ok_or_else(|| LanVaultError::NotFound(format!("online volume for vault {vid}")))?;
+        let manifest_roots = vault_store.manifest_backup_roots(&vid)?;
 
         let created_at = unix_timestamp_secs();
         let file_count = normalized_files.len() as u64;
@@ -914,17 +1143,48 @@ async fn handle_create_snapshot(
             .iter()
             .fold(0u64, |acc, f| acc.saturating_add(f.size));
 
+        let canonical_root = manifest_root_hash(&normalized_files)?;
         let root_tree_hash = match explicit_root_hash {
-            Some(h) => h,
-            None => {
-                let canonical_bytes = serde_json::to_vec(&normalized_files)?;
-                blake3_hash(&canonical_bytes)
+            Some(hash) if hash == canonical_root => hash,
+            Some(_) => {
+                return Err(LanVaultError::InvalidInput(
+                    "root_tree_hash_hex does not match the canonical manifest".to_string(),
+                ))
             }
+            None => canonical_root,
         };
+
+        let record = SnapshotRecord {
+            snapshot_id: snapshot_id.clone(),
+            vault_id: vid.clone(),
+            rule_id: rule_id.clone(),
+            device_id: device_id.clone(),
+            root_tree_hash,
+            retention_tier,
+            file_count,
+            total_bytes,
+            created_at,
+        };
+        if let Some(existing) = db.get_snapshot(&snapshot_id)? {
+            if existing.vault_id == record.vault_id
+                && existing.rule_id == record.rule_id
+                && existing.device_id == record.device_id
+                && existing.root_tree_hash == record.root_tree_hash
+                && existing.retention_tier == record.retention_tier
+                && existing.file_count == record.file_count
+                && existing.total_bytes == record.total_bytes
+            {
+                return Ok(existing);
+            }
+            return Err(LanVaultError::InvalidInput(format!(
+                "snapshot_id {snapshot_id} already exists with different contents"
+            )));
+        }
 
         let manifest = SnapshotManifest {
             snapshot_id: snapshot_id.clone(),
             vault_id: vid.clone(),
+            rule_id: rule_id.clone(),
             device_id: device_id.clone(),
             root_tree_hash_hex: hex::encode(root_tree_hash),
             e2ee_enabled: vault.e2ee_enabled,
@@ -932,39 +1192,42 @@ async fn handle_create_snapshot(
             files: normalized_files,
         };
 
-        let root_dir = StdPath::new(&primary.mount_path);
-        let manifests_dir = root_dir.join("manifests");
-        let staging_dir = root_dir.join("staging");
-        fs::create_dir_all(&manifests_dir)?;
-        fs::create_dir_all(&staging_dir)?;
-
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-        let tmp_path = staging_dir.join(format!("manifest.{}.tmp", uuid::Uuid::new_v4()));
-        let final_path = manifests_dir.join(format!("{snapshot_id}.json"));
-        {
-            let mut file = File::create(&tmp_path)?;
-            file.write_all(&manifest_bytes)?;
-            file.sync_all()?;
+        let mut manifest_paths = Vec::with_capacity(manifest_roots.len());
+        let write_manifests = (|| -> lanvault_core::Result<()> {
+            for root_dir in &manifest_roots {
+                let manifests_dir = root_dir.join("manifests");
+                let staging_dir = root_dir.join("staging");
+                fs::create_dir_all(&manifests_dir)?;
+                fs::create_dir_all(&staging_dir)?;
+                let tmp_path = staging_dir.join(format!("manifest.{}.tmp", uuid::Uuid::new_v4()));
+                let final_path = manifests_dir.join(format!("{snapshot_id}.json"));
+                {
+                    let mut file = File::create(&tmp_path)?;
+                    file.write_all(&manifest_bytes)?;
+                    file.sync_all()?;
+                }
+                fs::rename(&tmp_path, &final_path)?;
+                manifest_paths.push(final_path);
+            }
+            Ok(())
+        })();
+        if let Err(err) = write_manifests {
+            for path in &manifest_paths {
+                let _ = fs::remove_file(path);
+            }
+            return Err(err);
         }
-        fs::rename(&tmp_path, &final_path)?;
-
-        let record = SnapshotRecord {
-            snapshot_id,
-            vault_id: vid,
-            device_id,
-            root_tree_hash,
-            retention_tier,
-            file_count,
-            total_bytes,
-            created_at,
-        };
-
-        if let Err(err) = db.insert_snapshot(&record) {
-            let _ = fs::remove_file(&final_path);
+        let hashes: Vec<[u8; 32]> = unique_hashes.into_iter().collect();
+        if let Err(err) = db.insert_snapshot_with_chunks(&record, &hashes) {
+            for path in &manifest_paths {
+                let _ = fs::remove_file(path);
+            }
             return Err(err);
         }
 
         Ok(record)
+        })
     })
     .await;
 
@@ -974,6 +1237,7 @@ async fn handle_create_snapshot(
             Json(SnapshotDto {
                 snapshot_id: s.snapshot_id,
                 vault_id: s.vault_id,
+                rule_id: s.rule_id,
                 device_id: s.device_id,
                 retention_tier: s.retention_tier.as_str().to_string(),
                 file_count: s.file_count,
@@ -1000,9 +1264,10 @@ async fn handle_snapshot_file_download(
     Path(snapshot_id): Path<String>,
     Query(query): Query<SnapshotFileQuery>,
 ) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
-    }
+    let session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
 
     if let Err(err) = validate_snapshot_id(&snapshot_id) {
         return map_domain_error(err);
@@ -1022,6 +1287,7 @@ async fn handle_snapshot_file_download(
         .unwrap_or_else(|| "download.bin".to_string());
 
     let db = Arc::clone(&state.db);
+    let vault_store = Arc::clone(&state.vault_store);
     let vault_id = query.vault_id;
     let snap_id = snapshot_id.clone();
 
@@ -1037,29 +1303,37 @@ async fn handle_snapshot_file_download(
                 "snapshot {snap_id} in vault {vault_id}"
             )));
         }
+        if !session.is_admin && session.device_id.as_deref() != Some(snap.device_id.as_str()) {
+            return Err(LanVaultError::NotFound(format!(
+                "snapshot {snap_id} in vault {vault_id}"
+            )));
+        }
 
         let vault = db
             .get_vault(&vault_id)?
             .ok_or_else(|| LanVaultError::NotFound(format!("vault {vault_id}")))?;
 
-        let volumes = db.list_vault_volumes(&vault_id)?;
-        let primary = volumes
-            .iter()
-            .find(|v| v.is_online && v.role == VolumeRole::Primary)
-            .or_else(|| volumes.iter().find(|v| v.is_online))
-            .ok_or_else(|| LanVaultError::NotFound(format!("online volume for vault {vault_id}")))?;
-
-        let manifest_path = StdPath::new(&primary.mount_path)
-            .join("manifests")
-            .join(format!("{snap_id}.json"));
-        let manifest_bytes = fs::read(&manifest_path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                LanVaultError::NotFound(format!("snapshot manifest for {snap_id}"))
-            } else {
-                LanVaultError::Io(e)
+        let mut valid_manifest = None;
+        for root in vault_store.manifest_backup_roots(&vault_id)? {
+            let Ok(bytes) = fs::read(root.join("manifests").join(format!("{snap_id}.json"))) else {
+                continue;
+            };
+            let Ok(candidate) = serde_json::from_slice::<SnapshotManifest>(&bytes) else {
+                continue;
+            };
+            if candidate.snapshot_id == snap.snapshot_id
+                && candidate.vault_id == snap.vault_id
+                && candidate.device_id == snap.device_id
+                && candidate.rule_id == snap.rule_id
+                && manifest_root_hash(&candidate.files).ok() == Some(snap.root_tree_hash)
+            {
+                valid_manifest = Some(candidate);
+                break;
             }
+        }
+        let manifest = valid_manifest.ok_or_else(|| {
+            LanVaultError::NotFound(format!("valid snapshot manifest for {snap_id}"))
         })?;
-        let manifest: SnapshotManifest = serde_json::from_slice(&manifest_bytes)?;
 
         let file_entry = manifest
             .files
@@ -1082,7 +1356,8 @@ async fn handle_snapshot_file_download(
 
     match join_res {
         Ok(Ok((chunk_hashes, e2ee_enabled))) => {
-            let disposition = format!("attachment; filename=\"{filename}\"");
+            let disposition =
+                format!("attachment; filename=\"{filename}.lanvault-chunks\"");
             let stream_store = Arc::clone(&state.vault_store);
             let stream_vault_id = vault_id.clone();
             let chunk_stream = futures_util::stream::try_unfold(
@@ -1111,6 +1386,10 @@ async fn handle_snapshot_file_download(
             if let Ok(val) = HeaderValue::from_str(&disposition) {
                 resp.headers_mut().insert(CONTENT_DISPOSITION, val);
             }
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-lanvault-encoded"),
+                HeaderValue::from_static("true"),
+            );
             if e2ee_enabled {
                 resp.headers_mut().insert(
                     HeaderName::from_static("x-lanvault-e2ee"),
@@ -1139,7 +1418,11 @@ async fn handle_scrub_trigger(
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    if let Err(resp) = require_auth(&state, &cookies) {
+    let session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_admin(&session) {
         return resp;
     }
 
@@ -1191,7 +1474,11 @@ async fn handle_scrub_trigger(
 }
 
 async fn handle_list_peers(State(state): State<Arc<AppState>>, cookies: Cookies) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
+    let session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_admin(&session) {
         return resp;
     }
     let peers = match state.db.list_trusted_peers() {
@@ -1216,16 +1503,21 @@ async fn handle_list_peers(State(state): State<Arc<AppState>>, cookies: Cookies)
         })
         .collect();
 
+    let pairing_pin = state
+        .pairing_pin
+        .lock()
+        .expect("pairing PIN lock poisoned")
+        .clone();
     let pairing_qr_uri = format!(
         "lanvault://pair?id={}&ip={}&port={}&pin={}",
-        state.device_id, state.lan_ip, state.port, state.pairing_pin
+        state.device_id, state.lan_ip, state.port, pairing_pin
     );
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "peers": peer_dtos,
-            "pairing_pin": state.pairing_pin,
+            "pairing_pin": pairing_pin,
             "pairing_qr_uri": pairing_qr_uri,
         })),
     )
@@ -1242,7 +1534,17 @@ async fn handle_pair_peer(
         return resp;
     }
 
-    let pin_matched = constant_time_eq(req.pin.as_bytes(), state.pairing_pin.as_bytes());
+    let pin_matched = {
+        let mut pairing_pin = state
+            .pairing_pin
+            .lock()
+            .expect("pairing PIN lock poisoned");
+        let matched = constant_time_eq(req.pin.as_bytes(), pairing_pin.as_bytes());
+        if matched {
+            *pairing_pin = crate::generate_six_digit_pin();
+        }
+        matched
+    };
     match state.auth.check_and_record_pair_attempt(addr.ip(), pin_matched) {
         AuthOutcome::Allowed => {}
         AuthOutcome::Rejected { remaining_attempts } => {
@@ -1287,10 +1589,32 @@ async fn handle_pair_peer(
             "device_name and os_type must not be empty".to_string(),
         ));
     }
+    let identity_message = pairing_identity_message(
+        &req.pin,
+        &client_ed25519_pubkey,
+        &client_x25519_pubkey,
+        req.device_name.trim(),
+        req.os_type.trim(),
+    );
+    let signature_bytes = match hex::decode(&req.client_ed25519_signature_hex) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return map_domain_error(LanVaultError::InvalidInput(format!(
+                "invalid client identity signature hex: {err}"
+            )))
+        }
+    };
+    if let Err(err) = verify_ed25519(
+        &client_ed25519_pubkey,
+        &identity_message,
+        &signature_bytes,
+    ) {
+        return map_domain_error(err);
+    }
 
     let server_kex = SessionKeyExchange::new();
     let server_x25519_pub = server_kex.public_key_bytes();
-    let session_key = match server_kex.agree(&client_x25519_pubkey, b"lanvault.pair.v1") {
+    let session_key = match server_kex.agree(&client_x25519_pubkey, &identity_message) {
         Ok(key) => key,
         Err(err) => return map_domain_error(err),
     };
@@ -1306,24 +1630,43 @@ async fn handle_pair_peer(
         last_port: Some(addr.port()),
         auto_connect: true,
         paired_at: unix_timestamp_secs(),
+        revoked_at: None,
     };
 
     if let Err(err) = state.db.upsert_trusted_peer(&peer) {
         return map_domain_error(err);
     }
 
-    state
-        .peer_session_keys
-        .insert(peer_device_id.clone(), session_key);
-    state.online_peers.insert(peer_device_id);
-    let session_token = state.auth.issue_session();
+    let session_token = state.auth.issue_peer_session(peer_device_id);
     cookies.add(build_session_cookie(session_token.clone()));
+    let server_public_key = state.identity.public_key_bytes();
+    let clipboard_key_envelope = match encrypt_aead(
+        &session_key,
+        state.clipboard_key.as_bytes(),
+        b"lanvault.clipboard.key.v1",
+    ) {
+        Ok(envelope) => envelope,
+        Err(err) => return map_domain_error(err),
+    };
+    let response_message = pairing_response_message(
+        &req.pin,
+        &client_ed25519_pubkey,
+        &client_x25519_pubkey,
+        &server_public_key,
+        &server_x25519_pub,
+        &state.device_id,
+        &clipboard_key_envelope,
+    );
+    let response_signature = state.identity.sign(&response_message);
 
     (
         StatusCode::OK,
         Json(PairPinResponse {
             device_id: state.device_id.clone(),
+            server_ed25519_pubkey_hex: hex::encode(server_public_key),
             server_x25519_pubkey_hex: hex::encode(server_x25519_pub),
+            server_ed25519_signature_hex: hex::encode(response_signature),
+            clipboard_key_envelope_hex: hex::encode(clipboard_key_envelope),
             session_cookie: Some(session_token),
         }),
     )
@@ -1338,13 +1681,17 @@ async fn handle_delete_peer(
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    if let Err(resp) = require_auth(&state, &cookies) {
+    let session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    if let Err(resp) = require_admin(&session) {
         return resp;
     }
     match state.db.delete_trusted_peer(&device_id) {
         Ok(true) => {
             state.online_peers.remove(&device_id);
-            state.peer_session_keys.remove(&device_id);
+            state.auth.revoke_device_sessions(&device_id);
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1367,9 +1714,10 @@ async fn handle_clipboard_push(
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
-    }
+    let session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
     if req.content.is_empty() {
         return map_domain_error(LanVaultError::InvalidInput(
             "clipboard content must not be empty".to_string(),
@@ -1377,17 +1725,61 @@ async fn handle_clipboard_push(
     }
 
     let timestamp = unix_timestamp_secs();
+    let content = if session.is_admin {
+        let wire = match encrypt_aead(
+            &state.clipboard_key,
+            req.content.as_bytes(),
+            CLIPBOARD_AAD,
+        ) {
+            Ok(wire) => wire,
+            Err(err) => return map_domain_error(err),
+        };
+        match serde_json::to_string(&ClipboardEnvelope {
+            wire_hex: hex::encode(wire),
+        }) {
+            Ok(content) => content,
+            Err(err) => return map_domain_error(err.into()),
+        }
+    } else {
+        if serde_json::from_str::<ClipboardEnvelope>(&req.content).is_err() {
+            return map_domain_error(LanVaultError::InvalidInput(
+                "peer clipboard content must contain an encrypted envelope".to_string(),
+            ));
+        }
+        req.content
+    };
+    if let Some(target_id) = req.target_device_id.as_deref() {
+        if session.device_id.as_deref() == Some(target_id)
+            || !state.online_peers.contains(target_id)
+        {
+            return map_domain_error(LanVaultError::InvalidInput(
+                "clipboard target is not an online peer".to_string(),
+            ));
+        }
+    }
     let delivered_to = match &req.target_device_id {
         Some(target_id) => usize::from(state.online_peers.contains(target_id)),
-        None => state.online_peers.len(),
+        None => state
+            .online_peers
+            .len()
+            .saturating_sub(usize::from(
+                session
+                    .device_id
+                    .as_ref()
+                    .is_some_and(|device_id| state.online_peers.contains(device_id)),
+            )),
     };
 
     let _ = state.ws_tx.send(WsServerEvent::ClipboardReceived {
-        from_device_id: state.device_id.clone(),
+        from_device_id: session
+            .device_id
+            .clone()
+            .unwrap_or_else(|| state.device_id.clone()),
         target_device_id: req.target_device_id,
         kind: req.kind,
-        content: req.content,
+        content,
         filename: req.filename,
+        encrypted: true,
         timestamp,
     });
 
@@ -1408,20 +1800,27 @@ async fn handle_clipboard_push(
 async fn handle_ws_upgrade(
     State(state): State<Arc<AppState>>,
     cookies: Cookies,
-    Query(query): Query<WsConnectQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
-    }
-    let connected_device_id = query.device_id.filter(|id| !id.trim().is_empty());
-    ws.on_upgrade(move |socket| serve_ws_connection(socket, state, connected_device_id))
+    let session = match require_auth(&state, &cookies) {
+        Ok(session) => session,
+        Err(resp) => return resp,
+    };
+    let token = cookies
+        .get(SESSION_COOKIE_NAME)
+        .map(|cookie| cookie.value().to_string())
+        .unwrap_or_default();
+    let connected_device_id = session.device_id;
+    ws.on_upgrade(move |socket| {
+        serve_ws_connection(socket, state, connected_device_id, token)
+    })
 }
 
 async fn serve_ws_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     connected_device_id: Option<String>,
+    session_token: String,
 ) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Message>(WS_OUTBOUND_QUEUE_CAPACITY);
@@ -1438,6 +1837,9 @@ async fn serve_ws_connection(
     let mut telemetry_tick = tokio::time::interval(Duration::from_secs(1));
     let mut ping_tick = tokio::time::interval(Duration::from_secs(WS_PING_INTERVAL_SECS));
     let mut last_pong = Instant::now();
+    if let Some(device_id) = connected_device_id.as_ref() {
+        state.online_peers.insert(device_id.clone());
+    }
 
     loop {
         tokio::select! {
@@ -1460,6 +1862,9 @@ async fn serve_ws_connection(
                 }
             }
             _ = ping_tick.tick() => {
+                if state.auth.validate_session(&session_token).is_none() {
+                    break;
+                }
                 if last_pong.elapsed() > Duration::from_secs(WS_PONG_TIMEOUT_SECS) {
                     warn!("closing zombie WebSocket client: Pong timeout");
                     break;
@@ -1477,6 +1882,16 @@ async fn serve_ws_connection(
                         } = ev
                         {
                             if connected_device_id.as_deref() != Some(target_id.as_str()) {
+                                continue;
+                            }
+                        }
+                        if let WsServerEvent::ClipboardReceived {
+                            ref from_device_id,
+                            target_device_id: None,
+                            ..
+                        } = ev
+                        {
+                            if connected_device_id.as_deref() == Some(from_device_id.as_str()) {
                                 continue;
                             }
                         }
@@ -1514,6 +1929,9 @@ async fn serve_ws_connection(
         }
     }
 
+    if let Some(device_id) = connected_device_id.as_ref() {
+        state.online_peers.remove(device_id);
+    }
     drop(out_tx);
     if tokio::time::timeout(Duration::from_secs(1), &mut writer_task)
         .await

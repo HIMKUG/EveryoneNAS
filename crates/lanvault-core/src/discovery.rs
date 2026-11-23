@@ -45,8 +45,8 @@ pub struct DiscoveredPeerInfo {
 
 /// Active mDNS registration handle. Call `shutdown()` on graceful exit.
 pub struct MdnsRegistrar {
-    daemon: ServiceDaemon,
-    fullname: String,
+    daemon: Option<ServiceDaemon>,
+    fullname: Option<String>,
     udp_beacon_task: Option<JoinHandle<()>>,
 }
 
@@ -54,8 +54,18 @@ impl MdnsRegistrar {
     /// Registers this node on `_lanvault._tcp.local.` with TXT keys `id`, `os`, `name`, `fp`
     /// and starts a periodic `255.255.255.255` UDP broadcast fallback beacon.
     pub fn register(announcement: DiscoveryAnnouncement) -> Result<Self> {
-        let daemon = ServiceDaemon::new()
-            .map_err(|e| LanVaultError::Discovery(format!("mDNS daemon start failed: {e}")))?;
+        let udp_beacon_task = Some(spawn_udp_beacon_sender(announcement.clone()));
+        let daemon = match ServiceDaemon::new() {
+            Ok(daemon) => daemon,
+            Err(err) => {
+                tracing::warn!("mDNS registration unavailable; UDP beacon remains active: {err}");
+                return Ok(Self {
+                    daemon: None,
+                    fullname: None,
+                    udp_beacon_task,
+                });
+            }
+        };
 
         let hostname = format!("lanvault-{}.local.", sanitize_label(&announcement.id));
         let properties = [
@@ -77,15 +87,19 @@ impl MdnsRegistrar {
         .enable_addr_auto();
 
         let fullname = service_info.get_fullname().to_string();
-        daemon
-            .register(service_info)
-            .map_err(|e| LanVaultError::Discovery(format!("mDNS register failed: {e}")))?;
-
-        let udp_beacon_task = Some(spawn_udp_beacon_sender(announcement));
+        if let Err(err) = daemon.register(service_info) {
+            tracing::warn!("mDNS registration failed; UDP beacon remains active: {err}");
+            let _ = daemon.shutdown();
+            return Ok(Self {
+                daemon: None,
+                fullname: None,
+                udp_beacon_task,
+            });
+        }
 
         Ok(Self {
-            daemon,
-            fullname,
+            daemon: Some(daemon),
+            fullname: Some(fullname),
             udp_beacon_task,
         })
     }
@@ -95,17 +109,19 @@ impl MdnsRegistrar {
         if let Some(handle) = self.udp_beacon_task.take() {
             handle.abort();
         }
-        let _ = self.daemon.unregister(&self.fullname);
-        self.daemon
-            .shutdown()
-            .map_err(|e| LanVaultError::Discovery(format!("mDNS shutdown failed: {e}")))?;
+        if let (Some(daemon), Some(fullname)) = (self.daemon, self.fullname) {
+            let _ = daemon.unregister(&fullname);
+            daemon
+                .shutdown()
+                .map_err(|e| LanVaultError::Discovery(format!("mDNS shutdown failed: {e}")))?;
+        }
         Ok(())
     }
 }
 
 /// Active dual-channel browser (mDNS + UDP broadcast listener).
 pub struct DiscoveryBrowser {
-    daemon: ServiceDaemon,
+    daemon: Option<ServiceDaemon>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -113,15 +129,15 @@ impl DiscoveryBrowser {
     /// Starts browsing `_lanvault._tcp.local.` and listening on UDP `UDP_FALLBACK_PORT`,
     /// forwarding discovered peers into `tx`. Own `local_device_id` is filtered out.
     pub fn start(local_device_id: String, tx: mpsc::Sender<DiscoveredPeerInfo>) -> Result<Self> {
-        let daemon = ServiceDaemon::new()
-            .map_err(|e| LanVaultError::Discovery(format!("mDNS daemon start failed: {e}")))?;
-        let receiver = daemon
-            .browse(MDNS_SERVICE_TYPE)
-            .map_err(|e| LanVaultError::Discovery(format!("mDNS browse failed: {e}")))?;
-
-        let mdns_tx = tx.clone();
-        let mdns_local_id = local_device_id.clone();
-        let mdns_task = tokio::spawn(async move {
+        let daemon = ServiceDaemon::new().ok();
+        let receiver = daemon.as_ref().and_then(|daemon| {
+            daemon.browse(MDNS_SERVICE_TYPE).ok()
+        });
+        let mut tasks = Vec::new();
+        if let Some(receiver) = receiver {
+            let mdns_tx = tx.clone();
+            let mdns_local_id = local_device_id.clone();
+            tasks.push(tokio::spawn(async move {
             while let Ok(event) = receiver.recv_async().await {
                 if let ServiceEvent::ServiceResolved(info) = event {
                     let Some(id) = info.get_property_val_str("id") else {
@@ -156,13 +172,17 @@ impl DiscoveryBrowser {
                     }
                 }
             }
-        });
+            }));
+        } else {
+            tracing::warn!("mDNS discovery unavailable; continuing with UDP fallback");
+        }
 
         let udp_task = spawn_udp_beacon_listener(local_device_id, tx);
+        tasks.push(udp_task);
 
         Ok(Self {
             daemon,
-            tasks: vec![mdns_task, udp_task],
+            tasks,
         })
     }
 
@@ -171,9 +191,11 @@ impl DiscoveryBrowser {
         for task in self.tasks {
             task.abort();
         }
-        self.daemon
-            .shutdown()
-            .map_err(|e| LanVaultError::Discovery(format!("mDNS browser shutdown failed: {e}")))?;
+        if let Some(daemon) = self.daemon {
+            daemon
+                .shutdown()
+                .map_err(|e| LanVaultError::Discovery(format!("mDNS browser shutdown failed: {e}")))?;
+        }
         Ok(())
     }
 }
