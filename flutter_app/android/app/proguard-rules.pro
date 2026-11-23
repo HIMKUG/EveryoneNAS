@@ -92,3 +92,10 @@
 -keepclasseswithmembernames,includedescriptorclasses class * {
     native <methods>;
 }
+
+# ---------------------------------------------------------------------------
+# 7. Room / WorkManager（R8 Full Mode 下需显式保留 RoomDatabase 子类无参构造）
+# ---------------------------------------------------------------------------
+-keep class * extends androidx.room.RoomDatabase {
+    <init>();
+}
