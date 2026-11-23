@@ -35,7 +35,7 @@ use lanvault_core::{
     blake3_hash, decrypt_aead, encrypt_aead, pairing_identity_message, pairing_response_message,
     parse_role_mode, verify_ed25519, Database, DeviceIdentity, DiscoveredPeerInfo,
     DiscoveryBrowser, PoolMode, RoleMode, SessionKeyExchange, SymmetricKey, SyncRuleRecord,
-    TrustedPeer, VolumeRole,
+    TransferHistoryRecord, TrustedPeer, VolumeRole,
 };
 use lanvault_server::scrub::{BitRotAlertEvent, BitRotScrubber};
 use lanvault_server::vault::{ExtraVolumeSpec, VaultStore};
@@ -1701,7 +1701,10 @@ pub async fn push_clipboard_text(target_device_id: Option<String>, text: String)
         .map(str::to_string)
         .unwrap_or_else(|| peer.device_id.clone());
     let resp = client.push_text(target_device_id, &text).await?;
-    let now_ts = unix_timestamp_secs() as i64;
+    let now_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let preview: String = text.chars().take(120).collect();
     let _ = state.client_db.insert_transfer_record(
         "sent",
@@ -2121,7 +2124,8 @@ pub async fn list_paired_peers() -> Result<Vec<PairedPeerDto>> {
 /// 21. 读取当前持久化的省电与网络流控策略。
 pub async fn get_power_network_policy() -> Result<PowerNetworkPolicy> {
     let state = runtime_state()?;
-    Ok(state.policy.read().await.clone())
+    let policy = state.policy.read().await.clone();
+    Ok(policy)
 }
 
 /// 22. 读取当前是否开启断线自动重连。
@@ -3158,7 +3162,10 @@ pub async fn push_clipboard_file(
         .and_then(|n| n.to_str())
         .unwrap_or(&trimmed_path)
         .to_string();
-    let now_ts = unix_timestamp_secs() as i64;
+    let now_ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let _ = state.client_db.insert_transfer_record(
         "sent",
         "file",

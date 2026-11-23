@@ -1414,8 +1414,10 @@ PRAGMA mmap_size = 268435456;";
         let mut hashes = Vec::new();
         for item in rows {
             let bytes = item?;
-            let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-                LanVaultError::Corrupted("invalid 32-byte chunk hash in snapshot_chunks".into())
+            let arr: [u8; 32] = bytes.try_into().map_err(|invalid: Vec<u8>| {
+                LanVaultError::CorruptedChunk {
+                    hash: format!("snapshot_chunks:{snapshot_id}:len={}", invalid.len()),
+                }
             })?;
             hashes.push(arr);
         }

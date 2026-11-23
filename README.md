@@ -13,10 +13,10 @@
 [![Rust](https://img.shields.io/badge/Rust-1.100%20stable-CE422B?logo=rust&logoColor=white&style=flat-square)](https://www.rust-lang.org/)
 [![Flutter](https://img.shields.io/badge/Flutter-3.24%2B-02569B?logo=flutter&logoColor=white&style=flat-square)](https://flutter.dev/)
 [![Axum](https://img.shields.io/badge/Axum-0.8-6C7BFF?style=flat-square)](https://github.com/tokio-rs/axum)
-[![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-3DA639?style=flat-square)](#-许可证)
-[![Clippy](https://img.shields.io/badge/clippy-0%20warning-3DA639?style=flat-square)](#-质量与验证)
-[![Tests](https://img.shields.io/badge/tests-12%20passing-3DA639?style=flat-square)](#-质量与验证)
-[![Binary](https://img.shields.io/badge/server-4.8%20MB-6C7BFF?style=flat-square)](#-性能设计)
+[![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-3DA639?style=flat-square)](#许可证)
+[![Clippy](https://img.shields.io/badge/clippy-0%20warning-3DA639?style=flat-square)](#质量与验证)
+[![Tests](https://img.shields.io/badge/tests-12%20passing-3DA639?style=flat-square)](#质量与验证)
+[![Binary](https://img.shields.io/badge/server-4.8%20MB-6C7BFF?style=flat-square)](#性能设计)
 
 </div>
 
@@ -36,25 +36,25 @@
 
 ## 目录
 
-- [为什么是 EveryoneNAS](#-为什么是-everyonenas)
-- [核心能力一览](#-核心能力一览)
-- [系统架构](#-系统架构)
-- [安全设计](#-安全设计)
-- [数据管线：从字节到块](#-数据管线从字节到块)
-- [存储引擎](#-存储引擎)
-- [Web 管理台](#-web-管理台)
-- [跨端客户端](#-跨端客户端)
-- [REST / WebSocket API](#-rest--websocket-api)
-- [Flutter ↔ Rust FFI 契约](#-flutter--rust-ffi-契约)
-- [Android 四级保活](#-android-四级保活)
-- [性能设计](#-性能设计)
-- [构建与运行](#-构建与运行)
-- [项目结构](#-项目结构)
-- [质量与验证](#-质量与验证)
-- [已知限制](#-已知限制)
-- [路线图](#-路线图)
-- [许可证](#-许可证)
-- [商业价值](#-商业价值)
+- [为什么是 EveryoneNAS](#为什么是-everyonenas)
+- [核心能力一览](#核心能力一览)
+- [系统架构](#系统架构)
+- [安全设计](#安全设计)
+- [数据管线：从字节到块](#数据管线从字节到块)
+- [存储引擎](#存储引擎)
+- [Web 管理台](#web-管理台)
+- [跨端客户端](#跨端客户端)
+- [REST / WebSocket API](#rest--websocket-api)
+- [Flutter ↔ Rust FFI 契约](#flutter--rust-ffi-契约)
+- [Android 四级保活](#android-四级保活)
+- [性能设计](#性能设计)
+- [构建与运行](#构建与运行)
+- [项目结构](#项目结构)
+- [质量与验证](#质量与验证)
+- [已知限制](#已知限制)
+- [路线图](#路线图)
+- [商业价值](#商业价值)
+- [许可证](#许可证)
 
 ---
 
@@ -77,6 +77,11 @@ EveryoneNAS 走的是第四条路：**用你已有的设备做存储，用零知
 ---
 
 ## 核心能力一览
+
+<div align="center">
+<img src="docs/promo/06-three-forms.png" alt="一个内核，三种形态：桌面窗口、手机、浏览器" width="640" />
+<br /><sub>同一套加密与同步内核，同时装进 Windows 服务、Android 应用与浏览器管理台</sub>
+</div>
 
 <table>
 <tr>
@@ -403,7 +408,7 @@ EveryoneNAS 假定：**局域网是不可信的**。同网段的任何设备都�
 ## Web 管理台
 
 <div align="center">
-<img src="docs/promo/07-web-console.png" alt="新拟态深色管理台：状态胶囊、存储环、增长柱状、快照时间线" />
+<img src="docs/promo/07-web-console.png" alt="新拟态深色管理台：状态胶囊、存储环、增长柱状、快照时间线" width="720" />
 </div>
 
 `web-ui/` 是一个**零构建步骤**的静态站点：没有 npm、没有打包器、没有 node_modules。Rust 的 `static-serve` 在编译期把全部 HTML/CSS/JS 压缩并嵌入二进制，服务端不需要附带任何静态文件目录。
@@ -442,10 +447,6 @@ WebSocket `/ws` 每 15 秒 ping、30 秒无 pong 则断开重连，出站队列�
 
 ## 跨端客户端
 
-<div align="center">
-<img src="docs/promo/06-three-forms.png" alt="同一内核，三种形态：桌面窗口、手机、浏览器" />
-</div>
-
 ### Flutter 应用
 
 五个功能页，按运行模式动态裁剪：
@@ -475,7 +476,7 @@ WebSocket `/ws` 每 15 秒 ping、30 秒无 pong 则断开重连，出站队列�
 
 ## REST / WebSocket API
 
-所有需鉴权接口校验 `lv_session` Cookie。共 **17 条路由、22 个操作**。
+所有需鉴权接口校验 `lv_session` Cookie。共 **18 条路由**。
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
@@ -616,7 +617,7 @@ R8 Full Mode 下用 `proguard-rules.pro` 严格保留全部 JNI 方法、AIDL �
 | 工具 | 版本 | 用途 |
 | :--- | :--- | :--- |
 | Rust | `stable`（已验证 1.100.0） | 全部 Rust crate |
-| Flutter | `3.24+` | 桌面 / Android UI |
+| Flutter | `3.24+`（已在 3.50.0 验证） | 桌面 / Android UI |
 | Android NDK | `28.2.13676358`（已验证） | Android `.so` 交叉编译 |
 | JDK | `17`（已验证 17.0.21） | Gradle / AGP 9 |
 | Android Gradle Plugin | `9.3.1`（已验证） | Android 构建 |
@@ -848,7 +849,7 @@ EveryoneNAS/
 ## 商业价值
 
 <div align="center">
-<img src="docs/promo/08-hardware-reborn.png" alt="闲置的笔记本、路由器、电视盒子转变为 NAS 节点" />
+<img src="docs/promo/08-hardware-reborn.png" alt="闲置的笔记本、路由器、电视盒子转变为 NAS 节点" width="720" />
 </div>
 
 ### 1. 零边际成本的存储业务
@@ -897,7 +898,7 @@ EveryoneNAS 的能力边界天然切分成清晰的商业分层：
 
 <div align="center">
 
-<img src="docs/promo/09-closing.png" alt="" />
+<img src="docs/promo/09-closing.png" alt="一条光纤弧线在画面下三分之一掠过，交汇处停着一枚水晶" width="720" />
 
 **EveryoneNAS** — 你的数据，留在你自己的网线里。
 

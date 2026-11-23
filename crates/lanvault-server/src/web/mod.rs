@@ -50,7 +50,7 @@ use crate::scrub::{BitRotAlertEvent, BitRotScrubber, ScrubReport};
 use crate::vault::{unix_timestamp_secs, ExtraVolumeSpec, VaultStore};
 
 #[cfg(feature = "embed-web-ui")]
-static_serve::embed_assets!("../../web-ui");
+static_serve::embed_assets!("web-ui");
 
 const WS_PING_INTERVAL_SECS: u64 = 15;
 const WS_PONG_TIMEOUT_SECS: u64 = 30;
