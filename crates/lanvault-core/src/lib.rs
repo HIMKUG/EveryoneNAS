@@ -10,6 +10,7 @@ pub mod debug_telemetry;
 pub mod discovery;
 pub mod error;
 pub mod protocol;
+pub mod woff2;
 
 pub use chunker::{
     blake3_hash, blake3_hash_reader, chunk_bytes, chunk_stream, compress_zstd, decompress_zstd,
@@ -40,6 +41,36 @@ pub use debug_telemetry::{
 };
 pub use error::{LanVaultError, Result};
 pub use protocol::ClipboardKind;
+pub use woff2::decode_woff2_to_sfnt;
+
+/// Strips Windows `\\?\` or `\\?\UNC\` extended-length path prefixes consistently across crates.
+pub fn strip_windows_verbatim(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| trimmed.strip_prefix(r"\\?\unc\"))
+    {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Computes the canonical snapshot tree hash from `(rel_path, blake3_hex)` pairs sorted by `rel_path`.
+pub fn compute_canonical_tree_hash(entries: &[(&str, &str)]) -> [u8; 32] {
+    let mut sorted = entries.to_vec();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    let mut hasher = blake3::Hasher::new();
+    for (rel_path, file_hash_hex) in sorted {
+        hasher.update(&(rel_path.len() as u64).to_le_bytes());
+        hasher.update(rel_path.as_bytes());
+        hasher.update(&(file_hash_hex.len() as u64).to_le_bytes());
+        hasher.update(file_hash_hex.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
 
 /// 统一软件三态运行模式：`client_only`（仅客户端）、`server_only`（仅服务端）、`dual`（双端模式）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

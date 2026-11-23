@@ -404,6 +404,8 @@ PRAGMA mmap_size = 268435456;";
             CREATE INDEX IF NOT EXISTS idx_local_file_state_rule ON local_file_state(rule_id);
             CREATE INDEX IF NOT EXISTS idx_snapshot_chunks_vault_hash
                 ON snapshot_chunks(vault_id, chunk_hash);
+            CREATE INDEX IF NOT EXISTS idx_revoked_sessions_expires
+                ON revoked_sessions(expires_at);
             "#,
         )?;
         ensure_column(
@@ -417,6 +419,12 @@ PRAGMA mmap_size = 268435456;";
             "snapshots",
             "rule_id",
             "rule_id TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "chunks",
+            "created_at",
+            "created_at INTEGER NOT NULL DEFAULT 0",
         )?;
         ensure_column(
             &conn,
@@ -624,6 +632,22 @@ PRAGMA mmap_size = 268435456;";
         Ok(rows)
     }
 
+    /// Lists every `vault_volumes` row across all vaults in one query (avoids N+1 lookups).
+    pub fn list_all_volumes(&self) -> Result<Vec<VaultVolumeRecord>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT volume_id, vault_id, mount_path, volume_guid, role, is_online
+            FROM vault_volumes
+            ORDER BY vault_id ASC, role ASC, volume_id ASC
+            "#,
+        )?;
+        let rows = stmt
+            .query_map([], row_to_vault_volume)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn update_vault_used_bytes(&self, vault_id: &str, delta_bytes: i64) -> Result<()> {
         let conn = self.lock_conn();
         conn.execute(
@@ -685,6 +709,7 @@ PRAGMA mmap_size = 268435456;";
             )
             .optional()?;
 
+        let now = unix_timestamp_secs();
         if existing.is_some() {
             conn.execute(
                 "UPDATE chunks
@@ -701,14 +726,15 @@ PRAGMA mmap_size = 268435456;";
         } else {
             conn.execute(
                 r#"
-                INSERT INTO chunks (vault_id, hash_blake3, raw_size, stored_size, ref_count, scrub_status)
-                VALUES (?1, ?2, ?3, ?4, 0, 'ok')
+                INSERT INTO chunks (vault_id, hash_blake3, raw_size, stored_size, ref_count, scrub_status, created_at)
+                VALUES (?1, ?2, ?3, ?4, 0, 'ok', ?5)
                 "#,
                 params![
                     vault_id,
                     hash_blake3.as_slice(),
                     raw_size as i64,
-                    stored_size as i64
+                    stored_size as i64,
+                    now
                 ],
             )?;
             Ok(true)
@@ -723,15 +749,17 @@ PRAGMA mmap_size = 268435456;";
         stored_size: u64,
     ) -> Result<bool> {
         let conn = self.lock_conn();
+        let now = unix_timestamp_secs();
         let affected = conn.execute(
             "INSERT OR IGNORE INTO chunks
-                (vault_id, hash_blake3, raw_size, stored_size, ref_count, scrub_status)
-             VALUES (?1, ?2, ?3, ?4, 0, 'ok')",
+                (vault_id, hash_blake3, raw_size, stored_size, ref_count, scrub_status, created_at)
+             VALUES (?1, ?2, ?3, ?4, 0, 'ok', ?5)",
             params![
                 vault_id,
                 hash_blake3.as_slice(),
                 raw_size as i64,
-                stored_size as i64
+                stored_size as i64,
+                now
             ],
         )?;
         Ok(affected == 1)
@@ -828,6 +856,27 @@ PRAGMA mmap_size = 268435456;";
         )?;
         let rows = stmt
             .query_map(params![vault_id], row_to_chunk)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Lists orphan chunks (`ref_count <= 0`) created at or before `max_created_at`,
+    /// protecting in-flight uploads from premature GC before `create_snapshot` commits.
+    pub fn list_orphan_chunks_before(
+        &self,
+        vault_id: &str,
+        max_created_at: i64,
+    ) -> Result<Vec<ChunkRecord>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT vault_id, hash_blake3, raw_size, stored_size, ref_count, last_scrub_at, scrub_status
+            FROM chunks
+            WHERE vault_id = ?1 AND ref_count <= 0 AND created_at <= ?2
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![vault_id, max_created_at], row_to_chunk)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -1001,6 +1050,50 @@ PRAGMA mmap_size = 268435456;";
                 )?;
                 let rows = stmt
                     .query_map([], row_to_snapshot)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }
+        }
+    }
+
+    pub fn list_snapshots_paginated(
+        &self,
+        vault_id: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SnapshotRecord>> {
+        let conn = self.lock_conn();
+        let limit_i64 = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let offset_i64 = i64::try_from(offset).unwrap_or(i64::MAX);
+        match vault_id {
+            Some(vid) => {
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
+                           retention_tier, file_count, total_bytes, created_at
+                    FROM snapshots
+                    WHERE vault_id = ?1
+                    ORDER BY created_at DESC
+                    LIMIT ?2 OFFSET ?3
+                    "#,
+                )?;
+                let rows = stmt
+                    .query_map(params![vid, limit_i64, offset_i64], row_to_snapshot)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }
+            None => {
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
+                           retention_tier, file_count, total_bytes, created_at
+                    FROM snapshots
+                    ORDER BY created_at DESC
+                    LIMIT ?1 OFFSET ?2
+                    "#,
+                )?;
+                let rows = stmt
+                    .query_map(params![limit_i64, offset_i64], row_to_snapshot)?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 Ok(rows)
             }
@@ -1542,8 +1635,8 @@ fn row_to_vault(row: &rusqlite::Row<'_>) -> rusqlite::Result<VaultRecord> {
         vault_id: row.get(0)?,
         name: row.get(1)?,
         pool_mode,
-        quota_bytes: quota_bytes as u64,
-        used_bytes: used_bytes as u64,
+        quota_bytes: quota_bytes.max(0) as u64,
+        used_bytes: used_bytes.max(0) as u64,
         e2ee_enabled: e2ee != 0,
         created_at: row.get(6)?,
     })
@@ -1594,8 +1687,8 @@ fn row_to_chunk(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChunkRecord> {
     Ok(ChunkRecord {
         vault_id: row.get(0)?,
         hash_blake3,
-        raw_size: raw_size as u64,
-        stored_size: stored_size as u64,
+        raw_size: raw_size.max(0) as u64,
+        stored_size: stored_size.max(0) as u64,
         ref_count: row.get(4)?,
         last_scrub_at: row.get(5)?,
         scrub_status,
@@ -1631,8 +1724,8 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<SnapshotRecord> 
         device_id: row.get(3)?,
         root_tree_hash,
         retention_tier,
-        file_count: file_count as u64,
-        total_bytes: total_bytes as u64,
+        file_count: file_count.max(0) as u64,
+        total_bytes: total_bytes.max(0) as u64,
         created_at: row.get(8)?,
     })
 }
@@ -1660,7 +1753,7 @@ fn row_to_local_file_state(row: &rusqlite::Row<'_>) -> rusqlite::Result<LocalFil
         rule_id: row.get(0)?,
         target_vault_id: row.get(1)?,
         rel_path: row.get(2)?,
-        size: size as u64,
+        size: size.max(0) as u64,
         mtime_ns: row.get(4)?,
         file_id: row.get(5)?,
         chunk_hashes: row.get(6)?,

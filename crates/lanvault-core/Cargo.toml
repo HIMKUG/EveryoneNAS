@@ -19,6 +19,7 @@ zeroize = { workspace = true }
 rand = { workspace = true }
 fastcdc = { workspace = true }
 zstd = { workspace = true }
+brotli-decompressor = { workspace = true }
 mdns-sd = { workspace = true }
 hex = { workspace = true }
 uuid = { workspace = true }

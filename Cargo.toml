@@ -32,6 +32,7 @@ zeroize = { version = "1", features = ["derive"] }
 rand = "0.8"
 fastcdc = "3.2"
 zstd = "0.13"
+brotli-decompressor = "6.3"
 mdns-sd = "0.18"
 axum = { version = "0.8", features = ["ws"] }
 tower-cookies = "0.11"
