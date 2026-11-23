@@ -65,7 +65,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
       setState(() => _history = records);
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '加载传输记录失败：$err');
+      NeuToast.error(context, '加载传输记录失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -98,7 +98,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '获取已配对设备失败：$err');
+      NeuToast.error(context, '获取已配对设备失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -113,7 +113,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '打开文件选择器失败：$err');
+      NeuToast.error(context, '打开文件选择器失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -182,7 +182,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _sending = false);
-      NeuToast.error(context, '发送文件失败：$err');
+      NeuToast.error(context, '发送文件失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -232,7 +232,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _sending = false);
-      NeuToast.error(context, '同步剪贴板失败：$err');
+      NeuToast.error(context, '同步剪贴板失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 

@@ -96,7 +96,7 @@ class _VaultScreenState extends State<VaultScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _loading = false);
-      NeuToast.error(context, '读取存储池状态失败：$err');
+      NeuToast.error(context, '读取存储池状态失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -120,7 +120,7 @@ class _VaultScreenState extends State<VaultScreen> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '打开文件夹选择器失败：$err');
+      NeuToast.error(context, '打开文件夹选择器失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -135,7 +135,7 @@ class _VaultScreenState extends State<VaultScreen> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '请求存储权限失败：$err');
+      NeuToast.error(context, '请求存储权限失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -150,7 +150,7 @@ class _VaultScreenState extends State<VaultScreen> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '请求通知权限失败：$err');
+      NeuToast.error(context, '请求通知权限失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -190,7 +190,7 @@ class _VaultScreenState extends State<VaultScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _starting = false);
-      NeuToast.error(context, '启动本地服务端失败：$err');
+      NeuToast.error(context, '启动本地服务端失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -213,7 +213,7 @@ class _VaultScreenState extends State<VaultScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _stopping = false);
-      NeuToast.error(context, '停止本地服务端失败：$err');
+      NeuToast.error(context, '停止本地服务端失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -740,7 +740,7 @@ class _CreateVaultDialogState extends State<_CreateVaultDialog> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '打开目录选择器失败：$err');
+      NeuToast.error(context, '打开目录选择器失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -779,7 +779,7 @@ class _CreateVaultDialogState extends State<_CreateVaultDialog> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _submitting = false);
-      NeuToast.error(context, '创建存储池失败：$err');
+      NeuToast.error(context, '创建存储池失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 

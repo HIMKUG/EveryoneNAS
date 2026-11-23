@@ -1649,6 +1649,52 @@ class LanVaultBridge {
 
   /// 断线自动重连开关状态源。
   final ValueNotifier<bool> autoReconnectNotifier = ValueNotifier<bool>(true);
+  final ValueNotifier<int> serverStateVersion = ValueNotifier<int>(0);
+
+  void _notifyStateChanged() {
+    serverStateVersion.value++;
+  }
+
+  /// 将底层 Rust/FFI 异常转换为通俗易懂的中文交互提示。
+  static String formatUserError(Object error) {
+    var msg = error.toString().trim();
+    for (final prefix in const <String>[
+      'Bad state: ',
+      'StateError: ',
+      'Exception: ',
+    ]) {
+      if (msg.startsWith(prefix)) {
+        msg = msg.substring(prefix.length).trim();
+      }
+    }
+    final colonIdx = msg.indexOf(' failed: ');
+    if (msg.startsWith('FFI ') && colonIdx > 0) {
+      msg = msg.substring(colonIdx + ' failed: '.length).trim();
+    }
+    final lower = msg.toLowerCase();
+    if (lower.contains('cannot start local server in client_only mode')) {
+      return '当前处于“仅客户端”模式，请先切换为“双端模式”或“仅服务端”后再启动存储服务';
+    }
+    if (lower.contains('local server database is not initialized')) {
+      return '本机存储服务尚未初始化，请先在下方设置管理密码并启动存储服务';
+    }
+    if (lower.contains('vault name must not be empty')) {
+      return '请输入存储池名称';
+    }
+    if (lower.contains('invalid password') || lower.contains('locked_out')) {
+      return '管理密码不正确或验证次数过多，请稍后再试';
+    }
+    if (lower.contains('connection refused') || lower.contains('timed out')) {
+      return '无法连接目标设备，请确认两台设备在同一局域网且服务端已启动';
+    }
+    if (lower.contains('no paired peer session')) {
+      return '当前尚未连接已配对设备，请先在“设备”页完成配对';
+    }
+    if (lower.contains('address already in use')) {
+      return '端口 7842 已被占用，请检查是否已有后台实例正在运行';
+    }
+    return msg.isEmpty ? '操作未完成，请稍后重试' : msg;
+  }
 
   RoleMode get currentRoleMode => roleModeNotifier.value;
 
@@ -1662,6 +1708,7 @@ class LanVaultBridge {
     roleModeNotifier.dispose();
     pairedPeersNotifier.dispose();
     autoReconnectNotifier.dispose();
+    serverStateVersion.dispose();
   }
 
   Future<({bool onWifi, String? currentSsid, bool isCharging})>
@@ -1737,6 +1784,7 @@ class LanVaultBridge {
     }
 
     roleModeNotifier.value = applied;
+    _notifyStateChanged();
     return applied;
   }
 
@@ -1873,7 +1921,9 @@ class LanVaultBridge {
         port: boundPort,
         elevated: false,
       );
-      return boundPort;
+      _notifyStateChanged();
+      _notifyStateChanged();
+    return boundPort;
     }
 
     final boundPort = await _ffi.startLocalServer(
@@ -1924,11 +1974,13 @@ class LanVaultBridge {
     );
   }
 
-  Future<bool> deleteSyncRule(String ruleId) {
+  Future<bool> deleteSyncRule(String ruleId) async {
     if (ruleId.trim().isEmpty) {
       throw ArgumentError.value(ruleId, 'ruleId', '规则 ID 不能为空');
     }
-    return _ffi.deleteSyncRule(ruleId.trim());
+    final res = await _ffi.deleteSyncRule(ruleId.trim());
+    _notifyStateChanged();
+    return res;
   }
 
   Future<String> exportVaultKeyBackup(String passphrase) {
@@ -1994,7 +2046,7 @@ class LanVaultBridge {
     required int quotaGb,
     required bool e2eeEnabled,
     String? extraMountPath,
-  }) {
+  }) async {
     if (name.trim().isEmpty) {
       throw ArgumentError.value(name, 'name', '存储池名称不能为空');
     }
@@ -2004,7 +2056,7 @@ class LanVaultBridge {
     if (quotaGb <= 0) {
       throw RangeError.value(quotaGb, 'quotaGb', '存储配额必须大于 0 GB');
     }
-    return _ffi.createVault(
+    final created = await _ffi.createVault(
       name: name.trim(),
       mountPath: mountPath.trim(),
       poolMode: poolMode.trim(),
@@ -2015,6 +2067,7 @@ class LanVaultBridge {
               ? extraMountPath.trim()
               : null,
     );
+    return created;
   }
 
   Future<List<SnapshotSummaryModel>> listSnapshots({String? vaultId}) =>
@@ -2030,6 +2083,7 @@ class LanVaultBridge {
     final revoked = await _ffi.revokePairedPeer(deviceId.trim());
     if (revoked) {
       unawaited(refreshPairedPeers());
+      _notifyStateChanged();
     }
     return revoked;
   }
@@ -2104,11 +2158,13 @@ class LanVaultBridge {
       final stopped = await _keepAliveChannel.stopKeepAliveServer();
       if (stopped) {
         _lastServerConfig = null;
+        _notifyStateChanged();
       }
       return stopped;
     }
     await _ffi.prepareGracefulRestart();
     _lastServerConfig = null;
+    _notifyStateChanged();
     return true;
   }
 

@@ -73,11 +73,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void initState() {
     super.initState();
+    widget.bridge.serverStateVersion.addListener(_loadSettings);
     _loadSettings();
   }
 
   @override
   void dispose() {
+    widget.bridge.serverStateVersion.removeListener(_loadSettings);
     _maxKbpsController.dispose();
     _keyPassphraseController.dispose();
     super.dispose();
@@ -135,7 +137,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _loading = false);
-      NeuToast.error(context, '读取设置失败：$err');
+      NeuToast.error(context, '读取设置失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -159,7 +161,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _scanningWifi = false);
-      NeuToast.error(context, '扫描网络失败：$err');
+      NeuToast.error(context, '扫描网络失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -175,7 +177,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '请求定位权限失败：$err');
+      NeuToast.error(context, '请求定位权限失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -190,7 +192,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '请求通知权限失败：$err');
+      NeuToast.error(context, '请求通知权限失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -228,7 +230,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _switchingMode = false);
-      NeuToast.error(context, '切换运行模式失败：$err');
+      NeuToast.error(context, '切换运行模式失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -239,7 +241,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       NeuToast.success(context, enabled ? '已开启断线自动重连' : '已关闭断线自动重连');
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '更新自动重连失败：$err');
+      NeuToast.error(context, '更新自动重连失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -264,7 +266,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _savingPolicy = false);
-      NeuToast.error(context, '保存策略失败：$err');
+      NeuToast.error(context, '保存策略失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -279,7 +281,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       );
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '切换自动巡检失败：$err');
+      NeuToast.error(context, '切换自动巡检失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -299,7 +301,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _scrubbing = false);
-      NeuToast.error(context, '完整性校验失败：$err');
+      NeuToast.error(context, '完整性校验失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -320,7 +322,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _exportingKey = false);
-      NeuToast.error(context, '导出密钥备份失败：$err');
+      NeuToast.error(context, '导出密钥备份失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -338,7 +340,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _restarting = false);
-      NeuToast.error(context, '重启服务失败：$err');
+      NeuToast.error(context, '重启服务失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -363,7 +365,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       );
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '切换 Debug 模式失败：$err');
+      NeuToast.error(context, '切换 Debug 模式失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -381,7 +383,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _loadingLogs = false);
-      NeuToast.error(context, '刷新日志失败：$err');
+      NeuToast.error(context, '刷新日志失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -393,7 +395,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       NeuToast.info(context, '已清空内存与磁盘 Debug 日志');
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '清空日志失败：$err');
+      NeuToast.error(context, '清空日志失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -418,7 +420,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _runningDiagnostics = false);
-      NeuToast.error(context, '自检失败：$err');
+      NeuToast.error(context, '自检失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -441,7 +443,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         await Process.run('explorer.exe', <String>['/select,"$path"']);
       } catch (err) {
         if (!mounted) return;
-        NeuToast.error(context, '打开日志目录失败：$err');
+        NeuToast.error(context, '打开日志目录失败：${LanVaultBridge.formatUserError(err)}');
       }
     }
   }

@@ -2459,11 +2459,60 @@ struct LocalServerPeersResponse {
     pairing_qr_uri: String,
 }
 
+fn is_usable_lan_ipv4(ip: Ipv4Addr) -> bool {
+    if ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    let octets = ip.octets();
+    // Exclude CGNAT / Tailscale (100.64.0.0/10) and Clash/Mihomo Fake-IP TUN (198.18.0.0/15)
+    if octets[0] == 100 && (octets[1] & 0b1100_0000) == 64 {
+        return false;
+    }
+    if octets[0] == 198 && (octets[1] == 18 || octets[1] == 19) {
+        return false;
+    }
+    true
+}
+
+fn is_rfc1918_ipv4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 192 && o[1] == 168
+        || o[0] == 10
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+}
+
 fn detect_lan_ipv4() -> String {
-    if let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
-        if sock.connect((Ipv4Addr::new(192, 168, 1, 1), 80)).is_ok() {
-            if let Ok(SocketAddr::V4(v4)) = sock.local_addr() {
-                return v4.ip().to_string();
+    // 1. Try local LAN gateway probes without hitting TUN/proxy default routes
+    for target in [
+        Ipv4Addr::new(192, 168, 1, 1),
+        Ipv4Addr::new(192, 168, 0, 1),
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(172, 16, 0, 1),
+    ] {
+        if let Ok(sock) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
+            if sock.connect((target, 80)).is_ok() {
+                if let Ok(SocketAddr::V4(v4)) = sock.local_addr() {
+                    let ip = *v4.ip();
+                    if is_usable_lan_ipv4(ip) && is_rfc1918_ipv4(ip) {
+                        return ip.to_string();
+                    }
+                }
+            }
+        }
+    }
+    // 2. Fallback: parse OS interface list on Windows/Unix to skip virtual TUN adapters
+    #[cfg(target_os = "windows")]
+    if let Ok(out) = std::process::Command::new("ipconfig").output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if line.contains("IPv4") {
+                if let Some(raw_ip) = line.rsplit(':').next() {
+                    if let Ok(ip) = raw_ip.trim().parse::<Ipv4Addr>() {
+                        if is_usable_lan_ipv4(ip) && is_rfc1918_ipv4(ip) {
+                            return ip.to_string();
+                        }
+                    }
+                }
             }
         }
     }

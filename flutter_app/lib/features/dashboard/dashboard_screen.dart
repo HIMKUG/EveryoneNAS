@@ -16,10 +16,14 @@ class DashboardScreen extends StatefulWidget {
     super.key,
     required this.bridge,
     this.onOpenSnapshots,
+    this.onOpenVault,
+    this.onOpenPairing,
   });
 
   final LanVaultBridge bridge;
   final VoidCallback? onOpenSnapshots;
+  final VoidCallback? onOpenVault;
+  final VoidCallback? onOpenPairing;
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
@@ -49,6 +53,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   void initState() {
     super.initState();
     widget.bridge.roleModeNotifier.addListener(_handleRoleModeChanged);
+    widget.bridge.serverStateVersion.addListener(_handleRoleModeChanged);
     _refreshAll();
     _subscribeTelemetry();
   }
@@ -58,7 +63,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.bridge != widget.bridge) {
       oldWidget.bridge.roleModeNotifier.removeListener(_handleRoleModeChanged);
+      oldWidget.bridge.serverStateVersion.removeListener(_handleRoleModeChanged);
       widget.bridge.roleModeNotifier.addListener(_handleRoleModeChanged);
+      widget.bridge.serverStateVersion.addListener(_handleRoleModeChanged);
       _syncSub?.cancel();
       _subscribeTelemetry();
       _refreshAll();
@@ -68,6 +75,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   void dispose() {
     widget.bridge.roleModeNotifier.removeListener(_handleRoleModeChanged);
+    widget.bridge.serverStateVersion.removeListener(_handleRoleModeChanged);
     _syncSub?.cancel();
     super.dispose();
   }
@@ -104,7 +112,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _loading = false);
-      NeuToast.error(context, '加载系统总览失败：$err');
+      NeuToast.error(context, '加载系统总览失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -122,14 +130,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
               now.difference(_lastSyncErrorToastAt!) >=
                   _syncErrorToastCooldown) {
             _lastSyncErrorToastAt = now;
-            NeuToast.error(context, '同步状态更新中断：$err');
+            NeuToast.error(context, '同步状态更新中断：${LanVaultBridge.formatUserError(err)}');
           }
         },
       );
     } catch (err) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
-          NeuToast.error(context, '未连接到本地引擎：$err');
+          NeuToast.error(context, '未连接到本地引擎：${LanVaultBridge.formatUserError(err)}');
         }
       });
     }
@@ -151,7 +159,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _restarting = false);
-      NeuToast.error(context, '重启失败：$err');
+      NeuToast.error(context, '重启失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -170,7 +178,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _stopping = false);
-      NeuToast.error(context, '停止服务端失败：$err');
+      NeuToast.error(context, '停止服务端失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -185,7 +193,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '请求电池优化豁免失败：$err');
+      NeuToast.error(context, '请求电池优化豁免失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -377,6 +385,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final (healthTitle, healthSub, healthColor, healthBg, healthIcon) =
         _resolveHealthVisual(overview);
     return NeuCard(
+      onTap: (overview != null && !overview.serverRunning)
+          ? widget.onOpenVault
+          : widget.onOpenSnapshots,
       backgroundColor: healthBg,
       borderColor: healthColor.withValues(alpha: 0.22),
       padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
@@ -577,6 +588,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   ) {
     final healthCard = _buildHealthCard(context, overview);
     final devicesCard = NeuCard(
+      onTap: widget.onOpenPairing,
       padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
       child: Row(
         children: <Widget>[
@@ -621,6 +633,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
 
     final spaceCard = NeuCard(
+      onTap: widget.onOpenVault,
       padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
       child: Row(
         children: <Widget>[

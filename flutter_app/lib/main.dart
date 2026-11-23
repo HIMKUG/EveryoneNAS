@@ -244,6 +244,8 @@ class _LanVaultShellState extends State<LanVaultShell> {
       DashboardScreen(
         bridge: bridge,
         onOpenSnapshots: () => setState(() => _selectedTab = _ShellTab.snapshots),
+        onOpenVault: () => setState(() => _selectedTab = _ShellTab.storage),
+        onOpenPairing: () => setState(() => _selectedTab = _ShellTab.devices),
       ),
       PairingScreen(bridge: bridge),
       BackupScreen(bridge: bridge),
@@ -294,14 +296,14 @@ class _LanVaultShellState extends State<LanVaultShell> {
                       child: TweenAnimationBuilder<double>(
                         key: ValueKey<_ShellTab>(_selectedTab),
                         tween: Tween<double>(begin: 0.0, end: 1.0),
-                        duration: NeuMotion.resolveState(context),
-                        curve: NeuMotion.resolveStateCurve(context),
+                        duration: const Duration(milliseconds: 160),
+                        curve: Curves.linearToEaseOut,
                         builder: (context, t, child) {
                           final reduced = NeuMotion.isReduced(context);
                           return Opacity(
-                            opacity: t,
+                            opacity: 0.92 + 0.08 * t,
                             child: Transform.translate(
-                              offset: Offset(0, reduced ? 0 : (1 - t) * 10),
+                              offset: Offset(0, reduced ? 0 : (1 - t) * 5),
                               child: child,
                             ),
                           );
@@ -334,14 +336,14 @@ class _LanVaultShellState extends State<LanVaultShell> {
                       child: TweenAnimationBuilder<double>(
                         key: ValueKey<_ShellTab>(_selectedTab),
                         tween: Tween<double>(begin: 0.0, end: 1.0),
-                        duration: NeuMotion.resolveState(context),
-                        curve: NeuMotion.resolveStateCurve(context),
+                        duration: const Duration(milliseconds: 160),
+                        curve: Curves.linearToEaseOut,
                         builder: (context, t, child) {
                           final reduced = NeuMotion.isReduced(context);
                           return Opacity(
-                            opacity: t,
+                            opacity: 0.92 + 0.08 * t,
                             child: Transform.translate(
-                              offset: Offset(0, reduced ? 0 : (1 - t) * 10),
+                              offset: Offset(0, reduced ? 0 : (1 - t) * 5),
                               child: child,
                             ),
                           );
@@ -489,14 +491,49 @@ class _DesktopNavRail extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 22),
-          for (final item in destinations) ...<Widget>[
-            _NavRailButton(
-              item: item,
-              selected: item.tab == selectedTab,
-              onTap: () => onSelected(item.tab),
-            ),
-            const SizedBox(height: 6),
-          ],
+          Builder(
+            builder: (context) {
+              const itemHeight = 44.0;
+              const gap = 6.0;
+              final selectedIdx = destinations
+                  .indexWhere((d) => d.tab == selectedTab)
+                  .clamp(0, destinations.length - 1);
+              return Stack(
+                children: <Widget>[
+                  AnimatedPositioned(
+                    duration: NeuMotion.resolveState(context),
+                    curve: NeuMotion.resolveStateCurve(context),
+                    top: selectedIdx * (itemHeight + gap),
+                    left: 0,
+                    right: 0,
+                    height: itemHeight,
+                    child: DecoratedBox(
+                      decoration: BoxDecoration(
+                        gradient: NeuTokens.primaryGradient,
+                        borderRadius:
+                            const BorderRadius.all(Radius.circular(12)),
+                        boxShadow: NeuTokens.primaryButtonShadows,
+                      ),
+                    ),
+                  ),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: <Widget>[
+                      for (var i = 0; i < destinations.length; i++) ...<Widget>[
+                        _NavRailButton(
+                          item: destinations[i],
+                          selected: destinations[i].tab == selectedTab,
+                          onTap: () => onSelected(destinations[i].tab),
+                        ),
+                        if (i < destinations.length - 1)
+                          const SizedBox(height: gap),
+                      ],
+                    ],
+                  ),
+                ],
+              );
+            },
+          ),
           const Spacer(),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -616,23 +653,13 @@ class _NavRailButtonState extends State<_NavRailButton> {
                 child: AnimatedContainer(
                   duration: stateDuration,
                   curve: stateCurve,
-                  constraints: const BoxConstraints(minHeight: 42),
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 14,
-                    vertical: 10,
-                  ),
+                  height: 44,
+                  padding: const EdgeInsets.symmetric(horizontal: 14),
                   decoration: BoxDecoration(
-                    color: widget.selected
-                        ? null
-                        : (_hovered
-                            ? NeuTokens.insetSurface
-                            : Colors.transparent),
-                    gradient:
-                        widget.selected ? NeuTokens.primaryGradient : null,
+                    color: (!widget.selected && _hovered)
+                        ? NeuTokens.insetSurface
+                        : Colors.transparent,
                     borderRadius: const BorderRadius.all(Radius.circular(12)),
-                    boxShadow: widget.selected
-                        ? NeuTokens.primaryButtonShadows
-                        : null,
                   ),
                   child: Row(
                     children: <Widget>[

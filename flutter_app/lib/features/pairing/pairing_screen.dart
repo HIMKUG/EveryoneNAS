@@ -51,7 +51,7 @@ class _PairingScreenState extends State<PairingScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _loadingPaired = false);
-      NeuToast.error(context, '读取已配对设备失败：$err');
+      NeuToast.error(context, '读取已配对设备失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -81,7 +81,7 @@ class _PairingScreenState extends State<PairingScreen> {
           _scanSub = null;
           if (!mounted) return;
           setState(() => _scanning = false);
-          NeuToast.error(context, '扫描失败：$err');
+          NeuToast.error(context, '扫描失败：${LanVaultBridge.formatUserError(err)}');
         },
         onDone: () {
           _scanSub = null;
@@ -92,7 +92,7 @@ class _PairingScreenState extends State<PairingScreen> {
       );
     } catch (err) {
       setState(() => _scanning = false);
-      NeuToast.error(context, '启动扫描失败：$err');
+      NeuToast.error(context, '启动扫描失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -107,12 +107,12 @@ class _PairingScreenState extends State<PairingScreen> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '解绑失败：$err');
+      NeuToast.error(context, '解绑失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
   Future<void> _openPairDialog({String? initialIp, int? initialPort}) async {
-    final paired = await showDialog<bool>(
+    final paired = await showNeuDialog<bool>(
       context: context,
       builder: (dialogContext) => _PairNewDeviceDialog(
         bridge: widget.bridge,
@@ -545,7 +545,7 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _loadingInfo = false);
-      NeuToast.error(context, '读取本机配对信息失败：$err');
+      NeuToast.error(context, '读取本机配对信息失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -576,7 +576,7 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _pairing = false);
-      NeuToast.error(context, '配对失败：$err');
+      NeuToast.error(context, '配对失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 

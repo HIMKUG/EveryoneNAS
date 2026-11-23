@@ -652,20 +652,28 @@ class _NeuCardState extends State<NeuCard> {
           onTapCancel: () => setState(() => _pressed = false),
           onTap: widget.onTap,
           child: TweenAnimationBuilder<double>(
-            tween: Tween<double>(end: targetScale),
+            tween: Tween<double>(end: targetOffsetY),
             duration: pressDuration,
             curve: pressCurve,
-            builder: (context, scale, child) {
+            builder: (context, dy, inner) {
               return Transform.translate(
-                offset: Offset(0, targetOffsetY),
-                child: Transform.scale(
-                  scale: scale,
-                  alignment: Alignment.center,
-                  child: child,
-                ),
+                offset: Offset(0, dy),
+                child: inner,
               );
             },
-            child: box,
+            child: TweenAnimationBuilder<double>(
+              tween: Tween<double>(end: targetScale),
+              duration: pressDuration,
+              curve: pressCurve,
+              builder: (context, scale, inner) {
+                return Transform.scale(
+                  scale: scale,
+                  alignment: Alignment.center,
+                  child: inner,
+                );
+              },
+              child: box,
+            ),
           ),
         ),
       );
@@ -682,7 +690,7 @@ class _NeuCardState extends State<NeuCard> {
   }
 }
 
-/// 120Hz 顺滑展开/收起容器（`AnimatedSize` + 柔和缩放渐显）。
+/// 120Hz 双向顺滑展开/收起容器（展开与收起均有连续高度与透明度过渡）。
 class NeuAnimatedExpand extends StatelessWidget {
   const NeuAnimatedExpand({
     super.key,
@@ -697,32 +705,27 @@ class NeuAnimatedExpand extends StatelessWidget {
   Widget build(BuildContext context) {
     final duration = NeuMotion.resolveState(context);
     final curve = NeuMotion.resolveStateCurve(context);
-    return AnimatedSize(
-      duration: duration,
-      curve: curve,
-      alignment: Alignment.topCenter,
-      child: expanded
-          ? TweenAnimationBuilder<double>(
-              tween: Tween<double>(begin: 0.0, end: 1.0),
-              duration: duration,
-              curve: curve,
-              builder: (context, t, inner) {
-                return Opacity(
-                  opacity: t,
-                  child: Transform.translate(
-                    offset: Offset(0, (1 - t) * -6),
-                    child: inner,
-                  ),
-                );
-              },
-              child: child,
-            )
-          : const SizedBox.shrink(),
+    return ClipRect(
+      child: AnimatedAlign(
+        alignment: Alignment.topCenter,
+        heightFactor: expanded ? 1.0 : 0.0,
+        duration: duration,
+        curve: curve,
+        child: AnimatedOpacity(
+          opacity: expanded ? 1.0 : 0.0,
+          duration: Duration(milliseconds: (duration.inMilliseconds * 0.85).round()),
+          curve: curve,
+          child: IgnorePointer(
+            ignoring: !expanded,
+            child: child,
+          ),
+        ),
+      ),
     );
   }
 }
 
-/// 轻拟态内容切换器（`scale(0.96) + fade`，严禁 `scale(0)`）。
+/// 轻拟态内容切换器（顶部对齐、快速退场消除双重文字重影，保留丝滑上浮渐显）。
 class NeuMotionSwitcher extends StatelessWidget {
   const NeuMotionSwitcher({
     super.key,
@@ -733,22 +736,35 @@ class NeuMotionSwitcher extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final duration = NeuMotion.resolveState(context);
-    final curve = NeuMotion.resolveStateCurve(context);
     final reduced = NeuMotion.isReduced(context);
     return AnimatedSwitcher(
-      duration: duration,
-      switchInCurve: curve,
-      switchOutCurve: Curves.easeInToLinear,
+      duration: reduced
+          ? const Duration(milliseconds: 100)
+          : const Duration(milliseconds: 180),
+      reverseDuration: const Duration(milliseconds: 50),
+      switchInCurve: Curves.linearToEaseOut,
+      switchOutCurve: Curves.easeIn,
+      layoutBuilder: (currentChild, previousChildren) {
+        return Stack(
+          alignment: Alignment.topLeft,
+          children: <Widget>[
+            ...previousChildren,
+            if (currentChild != null) currentChild,
+          ],
+        );
+      },
       transitionBuilder: (widget, animation) {
         if (reduced) {
           return FadeTransition(opacity: animation, child: widget);
         }
-        final scale = Tween<double>(begin: 0.965, end: 1.0).animate(animation);
+        final slide = Tween<Offset>(
+          begin: const Offset(0, 0.015),
+          end: Offset.zero,
+        ).animate(animation);
         return FadeTransition(
           opacity: animation,
-          child: ScaleTransition(
-            scale: scale,
+          child: SlideTransition(
+            position: slide,
             child: widget,
           ),
         );
@@ -756,6 +772,37 @@ class NeuMotionSwitcher extends StatelessWidget {
       child: child,
     );
   }
+}
+
+/// 统一轻拟态弹窗容器（220ms `scale(0.95 -> 1.0) + fade` 物理入场动效）。
+Future<T?> showNeuDialog<T>({
+  required BuildContext context,
+  required WidgetBuilder builder,
+  bool barrierDismissible = true,
+}) {
+  return showGeneralDialog<T>(
+    context: context,
+    barrierDismissible: barrierDismissible,
+    barrierLabel: '关闭弹窗',
+    barrierColor: const Color(0x520F172A),
+    transitionDuration: const Duration(milliseconds: 220),
+    pageBuilder: (dialogContext, _, __) => builder(dialogContext),
+    transitionBuilder: (dialogContext, animation, secondaryAnimation, child) {
+      final curved = CurvedAnimation(
+        parent: animation,
+        curve: Curves.linearToEaseOut,
+        reverseCurve: Curves.easeIn,
+      );
+      final scale = Tween<double>(begin: 0.94, end: 1.0).animate(curved);
+      return FadeTransition(
+        opacity: curved,
+        child: ScaleTransition(
+          scale: scale,
+          child: child,
+        ),
+      );
+    },
+  );
 }
 
 enum NeuButtonTone { neutral, primary, danger, healthy }
@@ -845,8 +892,15 @@ class _NeuButtonState extends State<NeuButton> {
   }
 
   Gradient? _resolveGradient() {
-    if (!_enabled || widget.tone != NeuButtonTone.primary || _pressed) {
+    if (!_enabled || widget.tone != NeuButtonTone.primary) {
       return null;
+    }
+    if (_pressed) {
+      return const LinearGradient(
+        begin: Alignment.centerLeft,
+        end: Alignment.centerRight,
+        colors: <Color>[NeuTokens.accentPressed, NeuTokens.accent],
+      );
     }
     return NeuTokens.primaryGradient;
   }
@@ -877,18 +931,30 @@ class _NeuButtonState extends State<NeuButton> {
       mainAxisSize: widget.expanded ? MainAxisSize.max : MainAxisSize.min,
       mainAxisAlignment: MainAxisAlignment.center,
       children: <Widget>[
-        if (widget.loading) ...<Widget>[
+        if (widget.loading || widget.icon != null) ...<Widget>[
           SizedBox(
-            width: 16,
-            height: 16,
-            child: CircularProgressIndicator(
-              strokeWidth: 2,
-              valueColor: AlwaysStoppedAnimation<Color>(fg),
+            width: 18,
+            height: 18,
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 150),
+              child: widget.loading
+                  ? SizedBox(
+                      key: const ValueKey<String>('loading'),
+                      width: 15,
+                      height: 15,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        valueColor: AlwaysStoppedAnimation<Color>(fg),
+                      ),
+                    )
+                  : Icon(
+                      widget.icon,
+                      key: ValueKey<IconData?>(widget.icon),
+                      size: 17,
+                      color: fg,
+                    ),
             ),
           ),
-          const SizedBox(width: NeuSpace.sm),
-        ] else if (widget.icon != null) ...<Widget>[
-          Icon(widget.icon, size: 17, color: fg),
           const SizedBox(width: 6),
         ],
         Flexible(
@@ -1330,19 +1396,24 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
                                     padding: const EdgeInsets.symmetric(
                                       horizontal: 8,
                                     ),
-                                    child: Text(
-                                      segment.label,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .labelLarge
-                                          ?.copyWith(
-                                            fontSize: 13.5,
-                                            color: segment.value == widget.value
-                                                ? Colors.white
-                                                : NeuTokens.textSecondary,
-                                          ),
+                                    child: AnimatedDefaultTextStyle(
+                                      duration: duration,
+                                      curve: curve,
+                                      style: (Theme.of(context)
+                                                  .textTheme
+                                                  .labelLarge ??
+                                              const TextStyle(fontSize: 13.5))
+                                          .copyWith(
+                                        fontSize: 13.5,
+                                        color: segment.value == widget.value
+                                            ? Colors.white
+                                            : NeuTokens.textSecondary,
+                                      ),
+                                      child: Text(
+                                        segment.label,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
                                     ),
                                   ),
                                 ),

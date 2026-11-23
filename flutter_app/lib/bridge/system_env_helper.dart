@@ -126,14 +126,44 @@ abstract final class SystemEnvHelper {
     if (!Platform.isWindows) return null;
     final escapedDesc = description.replaceAll("'", "''");
     final script = '''
-Add-Type -AssemblyName System.Windows.Forms
-\$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-\$dialog.Description = '$escapedDesc'
-\$dialog.ShowNewFolderButton = \$true
-if (\$dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-  Write-Output \$dialog.SelectedPath
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class WinFolderPicker {
+  [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")] class FileOpenDialogRCW {}
+  [ComImport, Guid("42f85136-db7e-439c-85f1-e4075d135fc8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IFileDialog {
+    [PreserveSig] int Show(IntPtr parent);
+    void SetFileTypes(); void SetFileTypeIndex(); void GetFileTypeIndex(); void Advise(); void Unadvise();
+    void SetOptions(uint fos);
+    void GetOptions(out uint fos);
+    void SetDefaultFolder(); void SetFolder(); void GetFolder(); void GetCurrentSelection(); void SetFileName(); void GetFileName();
+    void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
+    void SetOkButtonLabel(); void SetFileNameLabel();
+    void GetResult(out IShellItem ppsi);
+  }
+  [ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+  interface IShellItem {
+    void BindToHandler(); void GetParent();
+    void GetDisplayName(uint sigdnName, [MarshalAs(UnmanagedType.LPWStr)] out string ppszName);
+  }
+  public static string Pick(string title) {
+    var dlg = (IFileDialog)new FileOpenDialogRCW();
+    uint opts; dlg.GetOptions(out opts);
+    dlg.SetOptions(opts | 0x20 | 0x40);
+    dlg.SetTitle(title);
+    if (dlg.Show(IntPtr.Zero) == 0) {
+      IShellItem item; dlg.GetResult(out item);
+      string path; item.GetDisplayName(0x80058000, out path);
+      return path;
+    }
+    return null;
+  }
 }
+"@
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+\$picked = [WinFolderPicker]::Pick('$escapedDesc')
+if (\$picked) { Write-Output \$picked }
 ''';
     final result = await Process.run(
       'powershell',

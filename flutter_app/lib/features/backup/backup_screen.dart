@@ -35,6 +35,7 @@ class _BackupScreenState extends State<BackupScreen> {
   bool _syncPaused = false;
   bool _togglingGlobalPause = false;
 
+  final ScrollController _scrollController = ScrollController();
   final TextEditingController _primaryDirController = TextEditingController();
   final TextEditingController _fallbackDirController = TextEditingController();
   late final Listenable _targetControllersListenable;
@@ -53,6 +54,7 @@ class _BackupScreenState extends State<BackupScreen> {
   @override
   void dispose() {
     _syncSub?.cancel();
+    _scrollController.dispose();
     _primaryDirController.dispose();
     _fallbackDirController.dispose();
     super.dispose();
@@ -67,13 +69,13 @@ class _BackupScreenState extends State<BackupScreen> {
         },
         onError: (Object err) {
           if (!mounted) return;
-          NeuToast.error(context, '同步进度监听异常：$err');
+          NeuToast.error(context, '同步进度监听异常：${LanVaultBridge.formatUserError(err)}');
         },
       );
     } catch (err) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
-          NeuToast.error(context, '连接同步事件流失败：$err');
+          NeuToast.error(context, '连接同步事件流失败：${LanVaultBridge.formatUserError(err)}');
         }
       });
     }
@@ -101,12 +103,12 @@ class _BackupScreenState extends State<BackupScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _loading = false);
-      NeuToast.error(context, '加载备份配置失败：$err');
+      NeuToast.error(context, '加载备份配置失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
   Future<void> _openCreateTaskDialog() async {
-    final created = await showDialog<bool>(
+    final created = await showNeuDialog<bool>(
       context: context,
       builder: (dialogContext) => _CreateBackupTaskDialog(
         bridge: widget.bridge,
@@ -132,7 +134,7 @@ class _BackupScreenState extends State<BackupScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _togglingGlobalPause = false);
-      NeuToast.error(context, '切换全局暂停失败：$err');
+      NeuToast.error(context, '切换全局暂停失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -152,7 +154,7 @@ class _BackupScreenState extends State<BackupScreen> {
       NeuToast.success(context, '已更新调度策略');
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '更新调度策略失败：$err');
+      NeuToast.error(context, '更新调度策略失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -179,7 +181,7 @@ class _BackupScreenState extends State<BackupScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _togglingRuleIds.remove(folder.ruleId));
-      NeuToast.error(context, '切换任务状态失败：$err');
+      NeuToast.error(context, '切换任务状态失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -197,7 +199,7 @@ class _BackupScreenState extends State<BackupScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _scanningRuleIds.remove(folder.ruleId));
-      NeuToast.error(context, '触发扫描失败：$err');
+      NeuToast.error(context, '触发扫描失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -213,7 +215,7 @@ class _BackupScreenState extends State<BackupScreen> {
       );
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '移除失败：$err');
+      NeuToast.error(context, '移除失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -246,7 +248,7 @@ class _BackupScreenState extends State<BackupScreen> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '打开文件夹选择器失败：$err');
+      NeuToast.error(context, '打开文件夹选择器失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -285,7 +287,7 @@ class _BackupScreenState extends State<BackupScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _savingTargets = false);
-      NeuToast.error(context, '保存失败：$err');
+      NeuToast.error(context, '保存失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -309,6 +311,7 @@ class _BackupScreenState extends State<BackupScreen> {
     final dedupPct = ((sync?.dedupRatio ?? 0.0) * 100).round();
 
     final list = ListView(
+      controller: _scrollController,
       padding: EdgeInsets.fromLTRB(
         isWide ? NeuSpace.lg : NeuSpace.md,
         isWide ? NeuSpace.lg : NeuSpace.md,
@@ -774,8 +777,21 @@ class _BackupScreenState extends State<BackupScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
               InkWell(
-                onTap: () =>
-                    setState(() => _storageExpanded = !_storageExpanded),
+                onTap: () {
+                  final next = !_storageExpanded;
+                  setState(() => _storageExpanded = next);
+                  if (next) {
+                    WidgetsBinding.instance.addPostFrameCallback((_) {
+                      if (_scrollController.hasClients) {
+                        _scrollController.animateTo(
+                          _scrollController.position.maxScrollExtent,
+                          duration: const Duration(milliseconds: 280),
+                          curve: Curves.linearToEaseOut,
+                        );
+                      }
+                    });
+                  }
+                },
                 borderRadius: const BorderRadius.all(Radius.circular(10)),
                 child: Padding(
                   padding: const EdgeInsets.symmetric(vertical: 4),
@@ -936,7 +952,7 @@ class _CreateBackupTaskDialogState extends State<_CreateBackupTaskDialog> {
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '打开文件夹选择器失败：$err');
+      NeuToast.error(context, '打开文件夹选择器失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -972,7 +988,7 @@ class _CreateBackupTaskDialogState extends State<_CreateBackupTaskDialog> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _submitting = false);
-      NeuToast.error(context, '新建任务失败：$err');
+      NeuToast.error(context, '新建任务失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -981,7 +997,7 @@ class _CreateBackupTaskDialogState extends State<_CreateBackupTaskDialog> {
     final textTheme = Theme.of(context).textTheme;
     final dirHint = Platform.isAndroid
         ? '/storage/emulated/0/DCIM'
-        : r'C:\Users\YourName\Documents';
+        : Platform.environment['USERPROFILE'] != null ? '${Platform.environment['USERPROFILE']}\\Documents' : r'C:\Users\Documents';
 
     return Dialog(
       child: ConstrainedBox(

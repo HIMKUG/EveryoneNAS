@@ -88,7 +88,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _loading = false);
-      NeuToast.error(context, '加载快照列表失败：$err');
+      NeuToast.error(context, '加载快照列表失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
@@ -115,12 +115,12 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _scrubbing = false);
-      NeuToast.error(context, '执行完整性校验失败：$err');
+      NeuToast.error(context, '执行完整性校验失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
   void _openSnapshotDetail(SnapshotSummaryModel snapshot) {
-    showDialog<void>(
+    showNeuDialog<void>(
       context: context,
       builder: (dialogContext) {
         final textTheme = Theme.of(dialogContext).textTheme;
@@ -221,7 +221,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _restoring = false);
-      NeuToast.error(context, '恢复快照失败：$err');
+      NeuToast.error(context, '恢复快照失败：${LanVaultBridge.formatUserError(err)}');
     }
   }
 
