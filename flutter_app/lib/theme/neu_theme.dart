@@ -47,6 +47,7 @@ abstract final class NeuMotion {
 /// 同心圆角 Token 与嵌套计算公式。
 abstract final class NeuRadius {
   static const double card = 18.0;
+  static const double group = 14.0;
   static const double segmentedTrack = 12.0;
   static const double control = 12.0;
   static const double pill = 999.0;
@@ -102,7 +103,13 @@ abstract final class NeuTokens {
   /// 健康绿 `#10B981` + 浅绿底 `#ECFDF5`。
   static const Color healthy = Color(0xFF10B981);
   static const Color healthyAlt = Color(0xFF059669);
+  static const Color healthyButton = Color(0xFF047857);
   static const Color healthySoft = Color(0xFFECFDF5);
+
+  /// 未就绪 / 禁用态深色按钮配色（高对比暗炭黑）。
+  static const Color disabledDarkSurface = Color(0xFF1E293B);
+  static const Color disabledDarkBorder = Color(0xFF334155);
+  static const Color disabledDarkForeground = Color(0xFFCBD5E1);
 
   /// 文件夹暖金 `#F59E0B` + 浅金底 `#FEF3C7`。
   static const Color folderGold = Color(0xFFF59E0B);
@@ -128,6 +135,9 @@ abstract final class NeuTokens {
     end: Alignment.centerRight,
     colors: <Color>[accent, accentLight],
   );
+
+  static const String appFontFamily = 'SourceHanSansSC';
+  static const double breakpointWide = 840.0;
 
   static const double minTouchTarget = 42.0;
   static const double minMobileTouchTarget = 46.0;
@@ -276,6 +286,7 @@ ThemeData buildLanVaultTheme() {
 
   return ThemeData(
     useMaterial3: true,
+    fontFamily: NeuTokens.appFontFamily,
     colorScheme: colorScheme,
     scaffoldBackgroundColor: NeuTokens.canvas,
     canvasColor: NeuTokens.canvas,
@@ -471,10 +482,10 @@ class _StorageDonutPainter extends CustomPainter {
       startAngle: -math.pi / 2,
       endAngle: math.pi * 1.5,
       colors: <Color>[
-        Color(0xFF38BDF8),
-        Color(0xFF2563EB),
-        Color(0xFF6366F1),
-        Color(0xFF38BDF8),
+        NeuTokens.chartSky,
+        NeuTokens.accent,
+        NeuTokens.chartIndigo,
+        NeuTokens.chartSky,
       ],
       stops: <double>[0.0, 0.45, 0.8, 1.0],
     );
@@ -591,8 +602,29 @@ class NeuCard extends StatefulWidget {
 }
 
 class _NeuCardState extends State<NeuCard> {
+  final FocusNode _focusNode = FocusNode(debugLabel: 'NeuCard');
   bool _hovered = false;
   bool _pressed = false;
+  bool _focused = false;
+
+  @override
+  void dispose() {
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
+    if (widget.onTap == null || event is! KeyDownEvent) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey == LogicalKeyboardKey.enter ||
+        event.logicalKey == LogicalKeyboardKey.numpadEnter ||
+        event.logicalKey == LogicalKeyboardKey.space) {
+      widget.onTap!();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -610,8 +642,8 @@ class _NeuCardState extends State<NeuCard> {
     final resolvedBorder = widget.borderColor ??
         (widget.inset
             ? const Color(0xFFE0E8F4)
-            : (_hovered && interactive
-                ? NeuTokens.accent.withValues(alpha: 0.35)
+            : ((_hovered || _focused) && interactive
+                ? NeuTokens.accent.withValues(alpha: _focused ? 0.55 : 0.35)
                 : NeuTokens.hairlineBorder));
     final resolvedShadows = widget.inset
         ? null
@@ -626,7 +658,7 @@ class _NeuCardState extends State<NeuCard> {
         borderRadius: BorderRadius.all(Radius.circular(resolvedRadius)),
         border: Border.all(
           color: resolvedBorder,
-          width: 1,
+          width: _focused && interactive ? 1.5 : 1,
         ),
         boxShadow: resolvedShadows,
       ),
@@ -638,41 +670,50 @@ class _NeuCardState extends State<NeuCard> {
           (_pressed && !reduced) ? NeuMotion.cardPressedScale : 1.0;
       final targetOffsetY =
           (_hovered && !_pressed && !reduced) ? -1.5 : (_pressed && !reduced ? 1.0 : 0.0);
-      box = MouseRegion(
-        cursor: SystemMouseCursors.click,
-        onEnter: (_) => setState(() => _hovered = true),
-        onExit: (_) => setState(() {
-          _hovered = false;
-          _pressed = false;
-        }),
-        child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onTapDown: (_) => setState(() => _pressed = true),
-          onTapUp: (_) => setState(() => _pressed = false),
-          onTapCancel: () => setState(() => _pressed = false),
-          onTap: widget.onTap,
-          child: TweenAnimationBuilder<double>(
-            tween: Tween<double>(end: targetOffsetY),
-            duration: pressDuration,
-            curve: pressCurve,
-            builder: (context, dy, inner) {
-              return Transform.translate(
-                offset: Offset(0, dy),
-                child: inner,
-              );
-            },
+      box = Focus(
+        focusNode: _focusNode,
+        onFocusChange: (value) {
+          if (_focused != value) {
+            setState(() => _focused = value);
+          }
+        },
+        onKeyEvent: _handleKey,
+        child: MouseRegion(
+          cursor: SystemMouseCursors.click,
+          onEnter: (_) => setState(() => _hovered = true),
+          onExit: (_) => setState(() {
+            _hovered = false;
+            _pressed = false;
+          }),
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTapDown: (_) => setState(() => _pressed = true),
+            onTapUp: (_) => setState(() => _pressed = false),
+            onTapCancel: () => setState(() => _pressed = false),
+            onTap: widget.onTap,
             child: TweenAnimationBuilder<double>(
-              tween: Tween<double>(end: targetScale),
+              tween: Tween<double>(end: targetOffsetY),
               duration: pressDuration,
               curve: pressCurve,
-              builder: (context, scale, inner) {
-                return Transform.scale(
-                  scale: scale,
-                  alignment: Alignment.center,
+              builder: (context, dy, inner) {
+                return Transform.translate(
+                  offset: Offset(0, dy),
                   child: inner,
                 );
               },
-              child: box,
+              child: TweenAnimationBuilder<double>(
+                tween: Tween<double>(end: targetScale),
+                duration: pressDuration,
+                curve: pressCurve,
+                builder: (context, scale, inner) {
+                  return Transform.scale(
+                    scale: scale,
+                    alignment: Alignment.center,
+                    child: inner,
+                  );
+                },
+                child: box,
+              ),
             ),
           ),
         ),
@@ -780,19 +821,24 @@ Future<T?> showNeuDialog<T>({
   required WidgetBuilder builder,
   bool barrierDismissible = true,
 }) {
+  final reduced = NeuMotion.isReduced(context);
   return showGeneralDialog<T>(
     context: context,
     barrierDismissible: barrierDismissible,
     barrierLabel: '关闭弹窗',
     barrierColor: const Color(0x520F172A),
-    transitionDuration: const Duration(milliseconds: 220),
+    transitionDuration:
+        reduced ? NeuMotion.reducedDuration : NeuMotion.pressDuration,
     pageBuilder: (dialogContext, _, __) => builder(dialogContext),
     transitionBuilder: (dialogContext, animation, secondaryAnimation, child) {
       final curved = CurvedAnimation(
         parent: animation,
-        curve: Curves.linearToEaseOut,
+        curve: reduced ? NeuMotion.reducedCurve : NeuMotion.pressCurve,
         reverseCurve: Curves.easeIn,
       );
+      if (reduced) {
+        return FadeTransition(opacity: curved, child: child);
+      }
       final scale = Tween<double>(begin: 0.94, end: 1.0).animate(curved);
       return FadeTransition(
         opacity: curved,
@@ -817,6 +863,7 @@ class NeuButton extends StatefulWidget {
     this.tone = NeuButtonTone.neutral,
     this.loading = false,
     this.expanded = false,
+    this.disabledLook = false,
     this.radius = NeuRadius.control,
     this.semanticLabel,
   });
@@ -827,6 +874,8 @@ class NeuButton extends StatefulWidget {
   final NeuButtonTone tone;
   final bool loading;
   final bool expanded;
+  /// 为 true 时渲染为深炭黑色"未就绪/禁用态"，但若仍传入 [onPressed] 则保留点击以弹出提示。
+  final bool disabledLook;
   final double radius;
   final String? semanticLabel;
 
@@ -840,6 +889,7 @@ class _NeuButtonState extends State<NeuButton> {
   bool _pressed = false;
 
   bool get _enabled => widget.onPressed != null && !widget.loading;
+  bool get _looksDisabled => !_enabled || widget.disabledLook;
 
   @override
   void dispose() {
@@ -871,6 +921,7 @@ class _NeuButtonState extends State<NeuButton> {
   }
 
   Color _resolveForeground() {
+    if (widget.disabledLook) return NeuTokens.disabledDarkForeground;
     if (!_enabled) return NeuTokens.textSecondary;
     return switch (widget.tone) {
       NeuButtonTone.neutral => NeuTokens.textPrimary,
@@ -881,18 +932,19 @@ class _NeuButtonState extends State<NeuButton> {
   }
 
   Color? _resolveBackground(NeuTheme neu) {
+    if (widget.disabledLook) return NeuTokens.disabledDarkSurface;
     if (!_enabled) return neu.insetColor;
     return switch (widget.tone) {
       NeuButtonTone.neutral =>
         _hovered && !_pressed ? NeuTokens.hoverSurface : neu.surfaceColor,
       NeuButtonTone.primary => _pressed ? NeuTokens.accentPressed : null,
       NeuButtonTone.danger => NeuTokens.danger,
-      NeuButtonTone.healthy => NeuTokens.healthy,
+      NeuButtonTone.healthy => NeuTokens.healthyButton,
     };
   }
 
   Gradient? _resolveGradient() {
-    if (!_enabled || widget.tone != NeuButtonTone.primary) {
+    if (_looksDisabled || widget.tone != NeuButtonTone.primary) {
       return null;
     }
     if (_pressed) {
@@ -906,7 +958,7 @@ class _NeuButtonState extends State<NeuButton> {
   }
 
   List<BoxShadow>? _resolveShadows(NeuTheme neu) {
-    if (!_enabled) return null;
+    if (_looksDisabled) return null;
     if (_pressed) return neu.pressedShadows;
     if (widget.tone == NeuButtonTone.primary) {
       return NeuTokens.primaryButtonShadows;
@@ -982,14 +1034,16 @@ class _NeuButtonState extends State<NeuButton> {
         color: gradient == null ? bg : null,
         gradient: gradient,
         borderRadius: BorderRadius.all(Radius.circular(widget.radius)),
-        border: widget.tone == NeuButtonTone.neutral || !_enabled
-            ? Border.all(
-                color: _hovered && _enabled
-                    ? NeuTokens.controlOutline
-                    : NeuTokens.hairlineBorder,
-                width: 1.0,
-              )
-            : null,
+        border: widget.disabledLook
+            ? Border.all(color: NeuTokens.disabledDarkBorder, width: 1.0)
+            : (widget.tone == NeuButtonTone.neutral || !_enabled
+                ? Border.all(
+                    color: _hovered && _enabled
+                        ? NeuTokens.controlOutline
+                        : NeuTokens.hairlineBorder,
+                    width: 1.0,
+                  )
+                : null),
         boxShadow: _resolveShadows(neu),
       ),
       child: content,
@@ -998,16 +1052,18 @@ class _NeuButtonState extends State<NeuButton> {
     return RepaintBoundary(
       child: Semantics(
         button: true,
-        enabled: _enabled,
+        enabled: !_looksDisabled,
         label: widget.semanticLabel ?? widget.label,
         child: Focus(
           focusNode: _focusNode,
           canRequestFocus: _enabled,
           onKeyEvent: _handleKey,
           child: MouseRegion(
-            cursor: _enabled
+            cursor: !_looksDisabled
                 ? SystemMouseCursors.click
-                : SystemMouseCursors.forbidden,
+                : (_enabled
+                    ? SystemMouseCursors.basic
+                    : SystemMouseCursors.forbidden),
             onEnter: (_) => _setHovered(true),
             onExit: (_) {
               _setHovered(false);
@@ -1015,9 +1071,12 @@ class _NeuButtonState extends State<NeuButton> {
             },
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTapDown: _enabled ? (_) => _setPressed(true) : null,
-              onTapUp: _enabled ? (_) => _setPressed(false) : null,
-              onTapCancel: _enabled ? () => _setPressed(false) : null,
+              onTapDown:
+                  _enabled && !widget.disabledLook ? (_) => _setPressed(true) : null,
+              onTapUp:
+                  _enabled && !widget.disabledLook ? (_) => _setPressed(false) : null,
+              onTapCancel:
+                  _enabled && !widget.disabledLook ? () => _setPressed(false) : null,
               onTap: _enabled ? widget.onPressed : null,
               child: TweenAnimationBuilder<double>(
                 tween: Tween<double>(end: targetScale),
@@ -1829,6 +1888,256 @@ class NeuDropdown<T> extends StatelessWidget {
               ],
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 统一轻拟态圆角图标徽章。
+class NeuIconBadge extends StatelessWidget {
+  const NeuIconBadge({
+    super.key,
+    required this.icon,
+    this.color = NeuTokens.accent,
+    this.backgroundColor = NeuTokens.accentSoft,
+    this.size = 40,
+    this.iconSize = 20,
+    this.radius = NeuRadius.control,
+  });
+
+  final IconData icon;
+  final Color color;
+  final Color backgroundColor;
+  final double size;
+  final double iconSize;
+  final double radius;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        color: backgroundColor,
+        borderRadius: BorderRadius.all(Radius.circular(radius)),
+      ),
+      child: Icon(icon, size: iconSize, color: color),
+    );
+  }
+}
+
+/// 统一轻拟态弹窗外壳（标题 + 可选副标题 + 关闭按钮 + 内容区 + 底部操作区）。
+class NeuDialog extends StatelessWidget {
+  const NeuDialog({
+    super.key,
+    required this.title,
+    required this.child,
+    this.subtitle,
+    this.maxWidth = 460,
+    this.actions = const <Widget>[],
+  });
+
+  final String title;
+  final String? subtitle;
+  final Widget child;
+  final double maxWidth;
+  final List<Widget> actions;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    final viewHeight = MediaQuery.sizeOf(context).height;
+
+    return Center(
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: maxWidth,
+          maxHeight: viewHeight * 0.88,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+          child: Material(
+            color: Colors.transparent,
+            child: NeuCard(
+              padding: const EdgeInsets.all(20),
+              child: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: <Widget>[
+                              Text(
+                                title,
+                                style: textTheme.titleMedium?.copyWith(
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                              if (subtitle != null && subtitle!.isNotEmpty) ...[
+                                const SizedBox(height: 2),
+                                Text(subtitle!, style: textTheme.bodySmall),
+                              ],
+                            ],
+                          ),
+                        ),
+                        IconButton(
+                          onPressed: () => Navigator.of(context).pop(),
+                          tooltip: '关闭',
+                          icon: const Icon(
+                            Icons.close_rounded,
+                            size: 18,
+                            color: NeuTokens.textSecondary,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    child,
+                    if (actions.isNotEmpty) ...<Widget>[
+                      const SizedBox(height: 18),
+                      Wrap(
+                        alignment: WrapAlignment.end,
+                        spacing: 10,
+                        runSpacing: 8,
+                        children: actions,
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 统一键值对展示行（桌面端水平对齐，窄屏自动折行不挤压）。
+class NeuKeyValueRow extends StatelessWidget {
+  const NeuKeyValueRow({
+    super.key,
+    required this.label,
+    required this.value,
+    this.leadingIcon,
+    this.leadingColor = NeuTokens.healthy,
+    this.valueColor,
+  });
+
+  final String label;
+  final String value;
+  final IconData? leadingIcon;
+  final Color leadingColor;
+  final Color? valueColor;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final narrow = constraints.maxWidth < 340;
+          final labelWidget = Row(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              if (leadingIcon != null) ...<Widget>[
+                Icon(leadingIcon, size: 17, color: leadingColor),
+                const SizedBox(width: 8),
+              ],
+              Flexible(
+                child: Text(
+                  label,
+                  style: textTheme.bodyMedium?.copyWith(
+                    fontWeight: FontWeight.w500,
+                  ),
+                ),
+              ),
+            ],
+          );
+          final valueWidget = Text(
+            value,
+            style: textTheme.bodySmall?.copyWith(
+              color: valueColor ?? NeuTokens.textSecondary,
+            ),
+            textAlign: narrow ? TextAlign.left : TextAlign.right,
+          );
+
+          if (narrow) {
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                labelWidget,
+                const SizedBox(height: 4),
+                valueWidget,
+              ],
+            );
+          }
+          return Row(
+            children: <Widget>[
+              Expanded(child: labelWidget),
+              const SizedBox(width: 12),
+              Flexible(child: valueWidget),
+            ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// 统一轻拟态空状态提示块。
+class NeuEmptyState extends StatelessWidget {
+  const NeuEmptyState({
+    super.key,
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    this.action,
+  });
+
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final Widget? action;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+    return NeuCard(
+      inset: true,
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          NeuIconBadge(
+            icon: icon,
+            size: 46,
+            iconSize: 22,
+            radius: NeuRadius.pill,
+          ),
+          const SizedBox(height: 12),
+          Text(
+            title,
+            style: textTheme.titleSmall,
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            subtitle,
+            style: textTheme.bodySmall,
+            textAlign: TextAlign.center,
+          ),
+          if (action != null) ...<Widget>[
+            const SizedBox(height: 14),
+            action!,
+          ],
         ],
       ),
     );

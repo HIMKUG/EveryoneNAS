@@ -184,15 +184,17 @@ bool FlutterWindow::OnCreate() {
         const std::string& method = call.method_name();
         if (method == "pickDirectory") {
           const auto title_utf8 = ExtractTitleArg(call);
-          const std::wstring title =
-              title_utf8 ? Utf8ToWide(*title_utf8) : L"选择文件夹";
+          const std::wstring title = title_utf8
+                                         ? Utf8ToWide(*title_utf8)
+                                         : L"\u9009\u62E9\u6587\u4EF6\u5939";
           ShowNativeItemDialog(GetHandle(), true, title, std::move(result));
           return;
         }
         if (method == "pickFile") {
           const auto title_utf8 = ExtractTitleArg(call);
-          const std::wstring title =
-              title_utf8 ? Utf8ToWide(*title_utf8) : L"选择文件";
+          const std::wstring title = title_utf8
+                                         ? Utf8ToWide(*title_utf8)
+                                         : L"\u9009\u62E9\u6587\u4EF6";
           ShowNativeItemDialog(GetHandle(), false, title, std::move(result));
           return;
         }

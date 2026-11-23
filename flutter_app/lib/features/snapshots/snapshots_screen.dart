@@ -123,63 +123,38 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
     showNeuDialog<void>(
       context: context,
       builder: (dialogContext) {
-        final textTheme = Theme.of(dialogContext).textTheme;
-        return Dialog(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 440),
-            child: Padding(
-              padding: const EdgeInsets.all(24),
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: <Widget>[
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: <Widget>[
-                      Text(
-                        '快照详情',
-                        style: textTheme.titleMedium?.copyWith(fontSize: 18),
-                      ),
-                      IconButton(
-                        icon: const Icon(Icons.close_rounded, size: 20),
-                        onPressed: () => Navigator.of(dialogContext).pop(),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 12),
-                  _DetailPair(label: '快照编号', value: snapshot.snapshotId),
-                  _DetailPair(label: '所属存储池', value: snapshot.vaultId),
-                  _DetailPair(label: '来源设备', value: snapshot.deviceId),
-                  _DetailPair(label: '保留层级', value: snapshot.retentionLabel),
-                  _DetailPair(label: '文件数量', value: '${snapshot.fileCount} 个文件'),
-                  _DetailPair(
-                    label: '总容量',
-                    value: SystemEnvHelper.formatBytes(snapshot.totalBytes),
-                  ),
-                  _DetailPair(label: '创建时间', value: snapshot.createdAt),
-                  const SizedBox(height: 18),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: <Widget>[
-                      NeuButton(
-                        label: '关闭',
-                        onPressed: () => Navigator.of(dialogContext).pop(),
-                      ),
-                      const SizedBox(width: NeuSpace.sm),
-                      NeuButton(
-                        label: '恢复此快照',
-                        icon: Icons.restore_rounded,
-                        tone: NeuButtonTone.primary,
-                        onPressed: () {
-                          Navigator.of(dialogContext).pop();
-                          _triggerRestore(snapshot);
-                        },
-                      ),
-                    ],
-                  ),
-                ],
-              ),
+        return NeuDialog(
+          title: '快照详情',
+          maxWidth: 440,
+          actions: <Widget>[
+            NeuButton(
+              label: '关闭',
+              onPressed: () => Navigator.of(dialogContext).pop(),
             ),
+            NeuButton(
+              label: '恢复此快照',
+              icon: Icons.restore_rounded,
+              tone: NeuButtonTone.primary,
+              onPressed: () {
+                Navigator.of(dialogContext).pop();
+                _triggerRestore(snapshot);
+              },
+            ),
+          ],
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: <Widget>[
+              NeuKeyValueRow(label: '快照编号', value: snapshot.snapshotId),
+              NeuKeyValueRow(label: '所属存储池', value: snapshot.vaultId),
+              NeuKeyValueRow(label: '来源设备', value: snapshot.deviceId),
+              NeuKeyValueRow(label: '保留层级', value: snapshot.retentionLabel),
+              NeuKeyValueRow(label: '文件数量', value: '${snapshot.fileCount} 个文件'),
+              NeuKeyValueRow(
+                label: '总容量',
+                value: SystemEnvHelper.formatBytes(snapshot.totalBytes),
+              ),
+              NeuKeyValueRow(label: '创建时间', value: snapshot.createdAt),
+            ],
           ),
         );
       },
@@ -237,7 +212,8 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
-    final isWide = MediaQuery.sizeOf(context).width >= 840;
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
 
     final vaultOptions = <NeuDropdownOption<String>>[
       const NeuDropdownOption<String>(
@@ -374,33 +350,10 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
     }
 
     if (_snapshots.isEmpty) {
-      return NeuCard(
-        padding: const EdgeInsets.all(28),
-        child: Column(
-          children: <Widget>[
-            Container(
-              width: 52,
-              height: 52,
-              decoration: const BoxDecoration(
-                color: NeuTokens.accentSoft,
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.history_rounded,
-                size: 26,
-                color: NeuTokens.accent,
-              ),
-            ),
-            const SizedBox(height: 12),
-            Text('暂无历史快照', style: textTheme.titleMedium),
-            const SizedBox(height: 4),
-            Text(
-              '完成首次增量备份后，系统将按 GFS（7日 / 4周 / 12月）策略自动生成历史版本时间线。',
-              textAlign: TextAlign.center,
-              style: textTheme.bodySmall,
-            ),
-          ],
-        ),
+      return const NeuEmptyState(
+        icon: Icons.history_rounded,
+        title: '暂无历史快照',
+        subtitle: '完成首次增量备份后，系统将按 GFS（7日 / 4周 / 12月）策略自动生成历史版本时间线。',
       );
     }
 
@@ -425,24 +378,62 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
               Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: <Widget>[
-                  Text(
-                    '可恢复的快照 (${_snapshots.length})',
-                    style: textTheme.titleMedium,
+                  Expanded(
+                    child: Text(
+                      '可恢复的快照 (${_snapshots.length})',
+                      style: textTheme.titleMedium,
+                    ),
                   ),
-                  Text(
-                    '已选：${selectedSnap.createdAt}',
-                    style: textTheme.labelMedium,
+                  const SizedBox(width: 8),
+                  Flexible(
+                    child: Text(
+                      '已选：${selectedSnap.createdAt}',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: textTheme.labelMedium,
+                    ),
                   ),
                 ],
               ),
               const SizedBox(height: 14),
               for (var i = 0; i < _snapshots.length; i++) ...<Widget>[
                 Builder(
+                  key: ValueKey<String>(_snapshots[i].snapshotId),
                   builder: (context) {
                     final snap = _snapshots[i];
                     final isSelected = snap.snapshotId == selectedSnap.snapshotId;
+                    final infoMeta = Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Row(
+                          children: <Widget>[
+                            Flexible(
+                              child: Text(
+                                snap.snapshotId,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: textTheme.titleSmall,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            NeuStatusBadge(
+                              label: snap.retentionLabel,
+                              tone: _tierTone(snap.retentionTier),
+                              showDot: false,
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 3),
+                        Text(
+                          '${snap.fileCount} 个文件 · ${SystemEnvHelper.formatBytes(snap.totalBytes)} · ${snap.createdAt}',
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: textTheme.bodySmall,
+                        ),
+                      ],
+                    );
+
                     return InkWell(
                       onTap: () =>
                           setState(() => _selectedSnapshotId = snap.snapshotId),
@@ -459,65 +450,52 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                           borderRadius:
                               const BorderRadius.all(Radius.circular(12)),
                         ),
-                        child: Row(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
                           children: <Widget>[
-                            Container(
-                              width: 40,
-                              height: 40,
-                              decoration: const BoxDecoration(
-                                color: NeuTokens.folderGoldSoft,
-                                borderRadius:
-                                    BorderRadius.all(Radius.circular(10)),
-                              ),
-                              child: const Icon(
-                                Icons.folder_rounded,
-                                size: 21,
-                                color: NeuTokens.folderGold,
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: <Widget>[
-                                  Row(
-                                    children: <Widget>[
-                                      Flexible(
-                                        child: Text(
-                                          snap.snapshotId,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: textTheme.titleSmall,
-                                        ),
-                                      ),
-                                      const SizedBox(width: 8),
-                                      NeuStatusBadge(
-                                        label: snap.retentionLabel,
-                                        tone: _tierTone(snap.retentionTier),
-                                        showDot: false,
-                                      ),
-                                    ],
+                            Row(
+                              children: <Widget>[
+                                const NeuIconBadge(
+                                  icon: Icons.folder_rounded,
+                                  color: NeuTokens.folderGold,
+                                  backgroundColor: NeuTokens.folderGoldSoft,
+                                  radius: 10,
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(child: infoMeta),
+                                if (isWide) ...<Widget>[
+                                  const SizedBox(width: 8),
+                                  NeuButton(
+                                    label: '浏览',
+                                    onPressed: () => _openSnapshotDetail(snap),
                                   ),
-                                  const SizedBox(height: 3),
-                                  Text(
-                                    '${snap.fileCount} 个文件 · ${SystemEnvHelper.formatBytes(snap.totalBytes)} · ${snap.createdAt}',
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: textTheme.bodySmall,
+                                  const SizedBox(width: 8),
+                                  NeuButton(
+                                    label: '恢复',
+                                    tone: NeuButtonTone.primary,
+                                    onPressed: () => _triggerRestore(snap),
+                                  ),
+                                ],
+                              ],
+                            ),
+                            if (!isWide) ...<Widget>[
+                              const SizedBox(height: 10),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.end,
+                                children: <Widget>[
+                                  NeuButton(
+                                    label: '浏览详情',
+                                    onPressed: () => _openSnapshotDetail(snap),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  NeuButton(
+                                    label: '恢复快照',
+                                    tone: NeuButtonTone.primary,
+                                    onPressed: () => _triggerRestore(snap),
                                   ),
                                 ],
                               ),
-                            ),
-                            const SizedBox(width: 8),
-                            NeuButton(
-                              label: '浏览',
-                              onPressed: () => _openSnapshotDetail(snap),
-                            ),
-                            const SizedBox(width: 8),
-                            NeuButton(
-                              label: '恢复',
-                              tone: NeuButtonTone.primary,
-                              onPressed: () => _triggerRestore(snap),
-                            ),
+                            ],
                           ],
                         ),
                       ),
@@ -561,11 +539,16 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                     final snap = _snapshots[i];
                     final isSelected =
                         snap.snapshotId == selectedSnap.snapshotId;
-                    return GestureDetector(
-                      onTap: () =>
-                          setState(() => _selectedSnapshotId = snap.snapshotId),
-                      child: MouseRegion(
-                        cursor: SystemMouseCursors.click,
+                    return Semantics(
+                      key: ValueKey<String>('h_node_${snap.snapshotId}'),
+                      button: true,
+                      selected: isSelected,
+                      label: '${snap.createdAt} ${snap.retentionLabel} 快照',
+                      child: InkWell(
+                        borderRadius: const BorderRadius.all(Radius.circular(10)),
+                        onTap: () => setState(
+                          () => _selectedSnapshotId = snap.snapshotId,
+                        ),
                         child: Column(
                           children: <Widget>[
                             AnimatedContainer(
@@ -653,11 +636,16 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
             builder: (context) {
               final snap = _snapshots[i];
               final isSelected = snap.snapshotId == selectedSnap.snapshotId;
-              return GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: () =>
-                    setState(() => _selectedSnapshotId = snap.snapshotId),
-                child: Row(
+              return Semantics(
+                key: ValueKey<String>('v_node_${snap.snapshotId}'),
+                button: true,
+                selected: isSelected,
+                label: '${snap.createdAt} ${snap.retentionLabel} 快照',
+                child: InkWell(
+                  borderRadius: const BorderRadius.all(Radius.circular(10)),
+                  onTap: () =>
+                      setState(() => _selectedSnapshotId = snap.snapshotId),
+                  child: Row(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: <Widget>[
                     Column(
@@ -715,6 +703,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                       ),
                     ),
                   ],
+                ),
                 ),
               );
             },
@@ -933,36 +922,6 @@ class _ScrubMetricTile extends StatelessWidget {
           ),
           const SizedBox(height: 2),
           Text(label, style: Theme.of(context).textTheme.bodySmall),
-        ],
-      ),
-    );
-  }
-}
-
-class _DetailPair extends StatelessWidget {
-  const _DetailPair({required this.label, required this.value});
-
-  final String label;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: <Widget>[
-          Text(label, style: textTheme.bodySmall),
-          const SizedBox(width: 12),
-          Flexible(
-            child: Text(
-              value,
-              textAlign: TextAlign.right,
-              overflow: TextOverflow.ellipsis,
-              style: textTheme.titleSmall,
-            ),
-          ),
         ],
       ),
     );

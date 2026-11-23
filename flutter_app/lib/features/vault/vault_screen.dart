@@ -50,15 +50,49 @@ class _VaultScreenState extends State<VaultScreen> {
   @override
   void initState() {
     super.initState();
+    widget.bridge.serverStateVersion.addListener(_onServerStateChanged);
+    widget.bridge.serverRunningNotifier.addListener(_onServerRunningChanged);
     _loadAll();
   }
 
   @override
+  void didUpdateWidget(covariant VaultScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.bridge != widget.bridge) {
+      oldWidget.bridge.serverStateVersion
+          .removeListener(_onServerStateChanged);
+      oldWidget.bridge.serverRunningNotifier
+          .removeListener(_onServerRunningChanged);
+      widget.bridge.serverStateVersion.addListener(_onServerStateChanged);
+      widget.bridge.serverRunningNotifier
+          .addListener(_onServerRunningChanged);
+      _loadAll();
+    }
+  }
+
+  @override
   void dispose() {
+    widget.bridge.serverStateVersion.removeListener(_onServerStateChanged);
+    widget.bridge.serverRunningNotifier
+        .removeListener(_onServerRunningChanged);
     _pathController.dispose();
     _quotaGbController.dispose();
     _passwordController.dispose();
     super.dispose();
+  }
+
+  void _onServerStateChanged() {
+    if (mounted) _loadAll();
+  }
+
+  void _onServerRunningChanged() {
+    if (!mounted) return;
+    if (!widget.bridge.serverRunningNotifier.value && _runningPort != null) {
+      setState(() => _runningPort = null);
+    } else if (widget.bridge.serverRunningNotifier.value &&
+        _runningPort == null) {
+      _loadAll();
+    }
   }
 
   Future<void> _loadAll() async {
@@ -101,9 +135,12 @@ class _VaultScreenState extends State<VaultScreen> {
   }
 
   Future<void> _openCreateVaultDialog() async {
-    final created = await showDialog<bool>(
+    final created = await showNeuDialog<bool>(
       context: context,
-      builder: (dialogContext) => _CreateVaultDialog(bridge: widget.bridge),
+      builder: (dialogContext) => _CreateVaultDialog(
+        bridge: widget.bridge,
+        existingVaults: _vaults,
+      ),
     );
     if (created == true && mounted) {
       await _loadAll();
@@ -229,7 +266,10 @@ class _VaultScreenState extends State<VaultScreen> {
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
-    final isWide = MediaQuery.sizeOf(context).width >= 840;
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
+    final isServerRunning =
+        _runningPort != null || widget.bridge.serverRunningNotifier.value;
 
     final totalVolumes = _vaults.fold<int>(
       0,
@@ -274,7 +314,18 @@ class _VaultScreenState extends State<VaultScreen> {
                 label: '新建存储池',
                 icon: Icons.add_rounded,
                 tone: NeuButtonTone.primary,
-                onPressed: _openCreateVaultDialog,
+                disabledLook: !isServerRunning,
+                onPressed: isServerRunning
+                    ? _openCreateVaultDialog
+                    : () {
+                        NeuToast.warning(
+                          context,
+                          '请先启动本地存储服务后再新建存储池',
+                        );
+                        if (!_configExpanded) {
+                          setState(() => _configExpanded = true);
+                        }
+                      },
               ),
             ],
           ),
@@ -287,44 +338,15 @@ class _VaultScreenState extends State<VaultScreen> {
               ),
             )
           else if (_vaults.isEmpty)
-            NeuCard(
-              padding: const EdgeInsets.all(24),
-              child: Row(
-                children: <Widget>[
-                  Container(
-                    width: 46,
-                    height: 46,
-                    decoration: const BoxDecoration(
-                      color: NeuTokens.accentSoft,
-                      borderRadius: BorderRadius.all(Radius.circular(14)),
-                    ),
-                    child: const Icon(
-                      Icons.layers_outlined,
-                      size: 24,
-                      color: NeuTokens.accent,
-                    ),
-                  ),
-                  const SizedBox(width: 14),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: <Widget>[
-                        Text('暂无已挂载存储池', style: textTheme.titleMedium),
-                        const SizedBox(height: 2),
-                        Text(
-                          '点击右上角“+ 新建存储池”或展开下方 Vault 服务配置以启动本地存储空间。',
-                          style: textTheme.bodySmall,
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
+            const NeuEmptyState(
+              icon: Icons.layers_outlined,
+              title: '暂无已挂载存储池',
+              subtitle: '请先展开下方 Vault 服务配置并启动本地存储服务，随后即可新建存储池。',
             )
           else
             _buildVaultPoolGrid(context, isWide),
           const SizedBox(height: NeuSpace.md),
-          _buildVaultServiceCard(context, totalVolumes),
+          _buildVaultServiceCard(context, totalVolumes, isWide),
           const SizedBox(height: NeuSpace.md),
           _buildPoolStatusCard(
             context,
@@ -382,6 +404,7 @@ class _VaultScreenState extends State<VaultScreen> {
     final percent = (vault.usageRatio * 100).round();
 
     return NeuCard(
+      key: ValueKey<String>(vault.vaultId),
       padding: const EdgeInsets.all(18),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -460,8 +483,38 @@ class _VaultScreenState extends State<VaultScreen> {
     );
   }
 
-  Widget _buildVaultServiceCard(BuildContext context, int totalVolumes) {
+  Widget _buildVaultServiceCard(
+    BuildContext context,
+    int totalVolumes,
+    bool isWide,
+  ) {
     final textTheme = Theme.of(context).textTheme;
+    final pathField = NeuInsetField(
+      controller: _pathController,
+      label: '仓库根目录路径',
+      hint: _defaultVaultPath(),
+      prefixIcon: Icons.folder_outlined,
+    );
+    final pickButton = NeuButton(
+      label: '选择文件夹',
+      icon: Icons.folder_open_outlined,
+      onPressed: _pickVaultDirectory,
+    );
+    final quotaField = NeuInsetField(
+      controller: _quotaGbController,
+      label: '容量配额（GB）',
+      hint: '100',
+      keyboardType: TextInputType.number,
+      prefixIcon: Icons.pie_chart_outline_rounded,
+    );
+    final passwordField = NeuInsetField(
+      controller: _passwordController,
+      label: '管理密码（至少 8 位）',
+      hint: '请输入管理密码',
+      obscureText: true,
+      prefixIcon: Icons.lock_outline_rounded,
+      onSubmitted: (_) => _startLocalVaultServer(),
+    );
 
     return NeuCard(
       padding: const EdgeInsets.all(18),
@@ -475,18 +528,10 @@ class _VaultScreenState extends State<VaultScreen> {
               padding: const EdgeInsets.symmetric(vertical: 2),
               child: Row(
                 children: <Widget>[
-                  Container(
-                    width: 44,
-                    height: 44,
-                    decoration: const BoxDecoration(
-                      color: NeuTokens.accentSoft,
-                      borderRadius: BorderRadius.all(Radius.circular(12)),
-                    ),
-                    child: const Icon(
-                      Icons.dns_rounded,
-                      size: 22,
-                      color: NeuTokens.accent,
-                    ),
+                  const NeuIconBadge(
+                    icon: Icons.dns_rounded,
+                    size: 44,
+                    iconSize: 22,
                   ),
                   const SizedBox(width: 14),
                   Expanded(
@@ -525,89 +570,73 @@ class _VaultScreenState extends State<VaultScreen> {
           NeuAnimatedExpand(
             expanded: _configExpanded,
             child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: <Widget>[
                 const SizedBox(height: 16),
-            const Divider(height: 1),
-            const SizedBox(height: 16),
-            Row(
-              crossAxisAlignment: CrossAxisAlignment.end,
-              children: <Widget>[
-                Expanded(
-                  child: NeuInsetField(
-                    controller: _pathController,
-                    label: '仓库根目录路径',
-                    hint: _defaultVaultPath(),
-                    prefixIcon: Icons.folder_outlined,
-                  ),
-                ),
-                const SizedBox(width: NeuSpace.sm),
-                NeuButton(
-                  label: '选择文件夹',
-                  icon: Icons.folder_open_outlined,
-                  onPressed: _pickVaultDirectory,
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Row(
-              children: <Widget>[
-                Expanded(
-                  child: NeuInsetField(
-                    controller: _quotaGbController,
-                    label: '容量配额（GB）',
-                    hint: '100',
-                    keyboardType: TextInputType.number,
-                    prefixIcon: Icons.pie_chart_outline_rounded,
-                  ),
-                ),
-                const SizedBox(width: NeuSpace.sm),
-                Expanded(
-                  child: NeuInsetField(
-                    controller: _passwordController,
-                    label: '管理密码（至少 8 位）',
-                    hint: '请输入管理密码',
-                    obscureText: true,
-                    prefixIcon: Icons.lock_outline_rounded,
-                    onSubmitted: (_) => _startLocalVaultServer(),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: NeuSpace.sm,
-              runSpacing: NeuSpace.sm,
-              children: <Widget>[
-                NeuButton(
-                  label: '启动存储服务',
-                  icon: Icons.rocket_launch_outlined,
-                  tone: NeuButtonTone.primary,
-                  loading: _starting,
-                  onPressed: _startLocalVaultServer,
-                ),
-                NeuButton(
-                  label: '停止服务端',
-                  icon: Icons.stop_circle_outlined,
-                  tone: NeuButtonTone.danger,
-                  loading: _stopping,
-                  onPressed:
-                      _runningPort == null ? null : _stopLocalVaultServer,
-                ),
-                if (Platform.isAndroid) ...<Widget>[
-                  NeuButton(
-                    label: '所有文件权限',
-                    icon: Icons.sd_storage_outlined,
-                    onPressed: _requestStoragePermission,
-                  ),
-                  NeuButton(
-                    label: '通知权限',
-                    icon: Icons.notifications_active_outlined,
-                    onPressed: _requestNotificationPermission,
-                  ),
+                const Divider(height: 1),
+                const SizedBox(height: 16),
+                if (isWide)
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: <Widget>[
+                      Expanded(child: pathField),
+                      const SizedBox(width: NeuSpace.sm),
+                      pickButton,
+                    ],
+                  )
+                else ...<Widget>[
+                  pathField,
+                  const SizedBox(height: NeuSpace.sm),
+                  pickButton,
                 ],
-              ],
-            ),
+                const SizedBox(height: 12),
+                if (isWide)
+                  Row(
+                    children: <Widget>[
+                      Expanded(child: quotaField),
+                      const SizedBox(width: NeuSpace.sm),
+                      Expanded(child: passwordField),
+                    ],
+                  )
+                else ...<Widget>[
+                  quotaField,
+                  const SizedBox(height: 12),
+                  passwordField,
+                ],
+                const SizedBox(height: 16),
+                Wrap(
+                  spacing: NeuSpace.sm,
+                  runSpacing: NeuSpace.sm,
+                  children: <Widget>[
+                    NeuButton(
+                      label: '启动存储服务',
+                      icon: Icons.rocket_launch_outlined,
+                      tone: NeuButtonTone.primary,
+                      loading: _starting,
+                      onPressed: _startLocalVaultServer,
+                    ),
+                    NeuButton(
+                      label: '停止服务端',
+                      icon: Icons.stop_circle_outlined,
+                      tone: NeuButtonTone.danger,
+                      loading: _stopping,
+                      onPressed:
+                          _runningPort == null ? null : _stopLocalVaultServer,
+                    ),
+                    if (Platform.isAndroid) ...<Widget>[
+                      NeuButton(
+                        label: '所有文件权限',
+                        icon: Icons.sd_storage_outlined,
+                        onPressed: _requestStoragePermission,
+                      ),
+                      NeuButton(
+                        label: '通知权限',
+                        icon: Icons.notifications_active_outlined,
+                        onPressed: _requestNotificationPermission,
+                      ),
+                    ],
+                  ],
+                ),
               ],
             ),
           ),
@@ -704,9 +733,13 @@ class _PoolStatusRow extends StatelessWidget {
 }
 
 class _CreateVaultDialog extends StatefulWidget {
-  const _CreateVaultDialog({required this.bridge});
+  const _CreateVaultDialog({
+    required this.bridge,
+    required this.existingVaults,
+  });
 
   final LanVaultBridge bridge;
+  final List<VaultSummaryModel> existingVaults;
 
   @override
   State<_CreateVaultDialog> createState() => _CreateVaultDialogState();
@@ -730,6 +763,42 @@ class _CreateVaultDialogState extends State<_CreateVaultDialog> {
     _extraMountController.dispose();
     _quotaController.dispose();
     super.dispose();
+  }
+
+  static String _normalizePathForCompare(String raw) {
+    var normalized = raw.trim().replaceAll('/', '\\');
+    if (Platform.isWindows) {
+      normalized = normalized.toLowerCase();
+      while (normalized.length > 3 && normalized.endsWith('\\')) {
+        normalized = normalized.substring(0, normalized.length - 1);
+      }
+      if (!normalized.endsWith('\\')) {
+        normalized = '$normalized\\';
+      }
+    } else {
+      normalized = raw.trim().replaceAll('\\', '/');
+      while (normalized.length > 1 && normalized.endsWith('/')) {
+        normalized = normalized.substring(0, normalized.length - 1);
+      }
+      if (!normalized.endsWith('/')) {
+        normalized = '$normalized/';
+      }
+    }
+    return normalized;
+  }
+
+  String? _findOverlappingExistingMount(String candidate) {
+    final candNorm = _normalizePathForCompare(candidate);
+    for (final vault in widget.existingVaults) {
+      for (final vol in vault.volumes) {
+        final existingNorm = _normalizePathForCompare(vol.mountPath);
+        if (candNorm.startsWith(existingNorm) ||
+            existingNorm.startsWith(candNorm)) {
+          return '${vault.name} (${vol.mountPath})';
+        }
+      }
+    }
+    return null;
   }
 
   Future<void> _pickPath(TextEditingController controller, String desc) async {
@@ -758,6 +827,34 @@ class _CreateVaultDialogState extends State<_CreateVaultDialog> {
       NeuToast.warning(context, '请选择主挂载路径');
       return;
     }
+    final primaryOverlap = _findOverlappingExistingMount(mountPath);
+    if (primaryOverlap != null) {
+      NeuToast.warning(
+        context,
+        '主挂载目录与已有存储卷 $primaryOverlap 重叠，请选择独立目录或新建子文件夹',
+      );
+      return;
+    }
+    if (_poolMode != 'single') {
+      if (extraPath.isEmpty) {
+        NeuToast.warning(context, '双盘镜像/多盘扩展模式需要选择第二块盘挂载目录');
+        return;
+      }
+      final p1 = _normalizePathForCompare(mountPath);
+      final p2 = _normalizePathForCompare(extraPath);
+      if (p1.startsWith(p2) || p2.startsWith(p1)) {
+        NeuToast.warning(context, '主挂载目录与第二挂载目录不能相互包含');
+        return;
+      }
+      final extraOverlap = _findOverlappingExistingMount(extraPath);
+      if (extraOverlap != null) {
+        NeuToast.warning(
+          context,
+          '第二挂载目录与已有存储卷 $extraOverlap 重叠，请换用其他目录',
+        );
+        return;
+      }
+    }
     if (quotaGb == null || quotaGb <= 0) {
       NeuToast.warning(context, '配额必须为大于 0 的整数（GB）');
       return;
@@ -783,120 +880,125 @@ class _CreateVaultDialogState extends State<_CreateVaultDialog> {
     }
   }
 
+  Widget _buildPathRow({
+    required bool isWide,
+    required TextEditingController controller,
+    required String label,
+    required String hint,
+    required IconData icon,
+    required String pickDescription,
+  }) {
+    final field = NeuInsetField(
+      controller: controller,
+      label: label,
+      hint: hint,
+      prefixIcon: icon,
+    );
+    final btn = NeuButton(
+      label: '浏览',
+      icon: Icons.folder_open_rounded,
+      onPressed: () => _pickPath(controller, pickDescription),
+    );
+    if (isWide) {
+      return Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: <Widget>[
+          Expanded(child: field),
+          const SizedBox(width: NeuSpace.sm),
+          btn,
+        ],
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        field,
+        const SizedBox(height: NeuSpace.sm),
+        btn,
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
 
-    return Dialog(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 480),
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: <Widget>[
-                  Text('新建存储池', style: textTheme.titleMedium?.copyWith(fontSize: 18)),
-                  IconButton(
-                    icon: const Icon(Icons.close_rounded, size: 20),
-                    onPressed: () => Navigator.of(context).pop(false),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              NeuInsetField(
-                controller: _nameController,
-                label: '存储池名称',
-                hint: '例如：主存储池 / 家庭相册库',
-                prefixIcon: Icons.label_outline_rounded,
-              ),
-              const SizedBox(height: 12),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: <Widget>[
-                  Expanded(
-                    child: NeuInsetField(
-                      controller: _mountController,
-                      label: '主挂载目录',
-                      hint: Platform.isAndroid
-                          ? '/storage/emulated/0/EveryoneNAS'
-                          : r'D:\EveryoneNAS_Pool',
-                      prefixIcon: Icons.folder_outlined,
-                    ),
-                  ),
-                  const SizedBox(width: NeuSpace.sm),
-                  NeuButton(
-                    label: '浏览',
-                    icon: Icons.folder_open_rounded,
-                    onPressed: () =>
-                        _pickPath(_mountController, '选择存储池主挂载目录'),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              NeuSegmentedControl<String>(
-                semanticLabel: '存储池模式',
-                value: _poolMode,
-                onChanged: (val) => setState(() => _poolMode = val),
-                segments: const <NeuSegment<String>>[
-                  NeuSegment<String>(value: 'single', label: '单盘'),
-                  NeuSegment<String>(value: 'mirror_raid1', label: '双盘镜像'),
-                  NeuSegment<String>(value: 'striped', label: '多盘扩展'),
-                ],
-              ),
-              if (_poolMode != 'single') ...<Widget>[
-                const SizedBox(height: 12),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: <Widget>[
-                    Expanded(
-                      child: NeuInsetField(
-                        controller: _extraMountController,
-                        label: '扩展/镜像挂载目录',
-                        hint: r'E:\EveryoneNAS_Mirror',
-                        prefixIcon: Icons.drive_file_move_outlined,
-                      ),
-                    ),
-                    const SizedBox(width: NeuSpace.sm),
-                    NeuButton(
-                      label: '浏览',
-                      icon: Icons.folder_open_rounded,
-                      onPressed: () =>
-                          _pickPath(_extraMountController, '选择第二存储卷挂载目录'),
-                    ),
-                  ],
-                ),
-              ],
-              const SizedBox(height: 12),
-              NeuInsetField(
-                controller: _quotaController,
-                label: '空间配额（GB）',
-                hint: '200',
-                keyboardType: TextInputType.number,
-                prefixIcon: Icons.pie_chart_outline_rounded,
-              ),
-              const SizedBox(height: 10),
-              NeuSwitch(
-                title: '启用端到端零知识加密 (E2EE)',
-                subtitle: '文件分块在本地加密后落盘，服务端仅存密文',
-                value: _e2eeEnabled,
-                onChanged: (v) => setState(() => _e2eeEnabled = v),
-              ),
-              const SizedBox(height: 16),
-              NeuButton(
-                label: '创建存储池',
-                icon: Icons.check_rounded,
-                tone: NeuButtonTone.primary,
-                loading: _submitting,
-                expanded: true,
-                onPressed: _submit,
-              ),
+    return NeuDialog(
+      title: '新建存储池',
+      maxWidth: 480,
+      actions: <Widget>[
+        NeuButton(
+          label: '取消',
+          onPressed: _submitting ? null : () => Navigator.of(context).pop(false),
+        ),
+        NeuButton(
+          label: '创建存储池',
+          icon: Icons.check_rounded,
+          tone: NeuButtonTone.primary,
+          loading: _submitting,
+          onPressed: _submit,
+        ),
+      ],
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          NeuInsetField(
+            controller: _nameController,
+            label: '存储池名称',
+            hint: '例如：主存储池 / 家庭相册库',
+            prefixIcon: Icons.label_outline_rounded,
+          ),
+          const SizedBox(height: 12),
+          _buildPathRow(
+            isWide: isWide,
+            controller: _mountController,
+            label: '主挂载目录',
+            hint: Platform.isAndroid
+                ? '/storage/emulated/0/EveryoneNAS_Pool'
+                : r'D:\EveryoneNAS_Pool',
+            icon: Icons.folder_outlined,
+            pickDescription: '选择存储池主挂载目录',
+          ),
+          const SizedBox(height: 12),
+          NeuSegmentedControl<String>(
+            semanticLabel: '存储池模式',
+            value: _poolMode,
+            onChanged: (val) => setState(() => _poolMode = val),
+            segments: const <NeuSegment<String>>[
+              NeuSegment<String>(value: 'single', label: '单盘'),
+              NeuSegment<String>(value: 'mirror_raid1', label: '双盘镜像'),
+              NeuSegment<String>(value: 'striped', label: '多盘扩展'),
             ],
           ),
-        ),
+          if (_poolMode != 'single') ...<Widget>[
+            const SizedBox(height: 12),
+            _buildPathRow(
+              isWide: isWide,
+              controller: _extraMountController,
+              label: '扩展/镜像挂载目录',
+              hint: r'E:\EveryoneNAS_Mirror',
+              icon: Icons.drive_file_move_outlined,
+              pickDescription: '选择第二存储卷挂载目录',
+            ),
+          ],
+          const SizedBox(height: 12),
+          NeuInsetField(
+            controller: _quotaController,
+            label: '空间配额（GB）',
+            hint: '200',
+            keyboardType: TextInputType.number,
+            prefixIcon: Icons.pie_chart_outline_rounded,
+          ),
+          const SizedBox(height: 10),
+          NeuSwitch(
+            title: '启用端到端零知识加密 (E2EE)',
+            subtitle: '文件分块在本地加密后落盘，服务端仅存密文',
+            value: _e2eeEnabled,
+            onChanged: (v) => setState(() => _e2eeEnabled = v),
+          ),
+        ],
       ),
     );
   }

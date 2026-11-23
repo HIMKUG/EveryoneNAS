@@ -306,7 +306,8 @@ class _BackupScreenState extends State<BackupScreen> {
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
-    final isWide = MediaQuery.sizeOf(context).width >= 840;
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
     final sync = _latestSync;
     final dedupPct = ((sync?.dedupRatio ?? 0.0) * 100).round();
 
@@ -316,7 +317,7 @@ class _BackupScreenState extends State<BackupScreen> {
         isWide ? NeuSpace.lg : NeuSpace.md,
         isWide ? NeuSpace.lg : NeuSpace.md,
         isWide ? NeuSpace.lg : NeuSpace.md,
-        isWide ? NeuSpace.lg : 88,
+        isWide ? NeuSpace.lg : 104,
       ),
       children: <Widget>[
         if (isWide)
@@ -388,9 +389,9 @@ class _BackupScreenState extends State<BackupScreen> {
           ),
         ],
         const SizedBox(height: NeuSpace.md),
-        _buildTaskListCard(context),
+        _buildTaskListCard(context, isWide),
         const SizedBox(height: NeuSpace.md),
-        _buildStorageConfigCard(context),
+        _buildStorageConfigCard(context, isWide),
       ],
     );
     if (isWide) return list;
@@ -539,7 +540,7 @@ class _BackupScreenState extends State<BackupScreen> {
     );
   }
 
-  Widget _buildTaskListCard(BuildContext context) {
+  Widget _buildTaskListCard(BuildContext context, bool isWide) {
     final textTheme = Theme.of(context).textTheme;
 
     return NeuCard(
@@ -565,58 +566,52 @@ class _BackupScreenState extends State<BackupScreen> {
               child: Text('正在加载备份任务…', style: textTheme.bodySmall),
             )
           else if (_folders.isEmpty)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.all(20),
-              decoration: BoxDecoration(
-                color: NeuTokens.insetSurface,
-                borderRadius: const BorderRadius.all(Radius.circular(12)),
-              ),
-              child: Text(
-                '尚未添加备份目录，点击右上角“+ 新建备份任务”选择需要保护的本地文件夹。',
-                style: textTheme.bodySmall,
-              ),
+            const NeuEmptyState(
+              icon: Icons.folder_copy_outlined,
+              title: '尚未添加备份目录',
+              subtitle: '点击“新建备份任务”选择需要保护的本地文件夹。',
             )
           else
             for (var i = 0; i < _folders.length; i++) ...<Widget>[
               Builder(
+                key: ValueKey<String>(_folders[i].ruleId),
                 builder: (context) {
                   final folder = _folders[i];
                   final isScanning = _scanningRuleIds.contains(folder.ruleId);
                   final isToggling = _togglingRuleIds.contains(folder.ruleId);
+                  final displayName = SystemEnvHelper.folderDisplayName(
+                    folder.localDir,
+                  );
+
                   return Padding(
                     padding: const EdgeInsets.symmetric(vertical: 10),
                     child: Row(
                       children: <Widget>[
-                        Container(
-                          width: 42,
-                          height: 42,
-                          decoration: const BoxDecoration(
-                            color: NeuTokens.folderGoldSoft,
-                            borderRadius: BorderRadius.all(Radius.circular(12)),
-                          ),
-                          child: const Icon(
-                            Icons.folder_rounded,
-                            size: 22,
-                            color: NeuTokens.folderGold,
-                          ),
+                        const NeuIconBadge(
+                          icon: Icons.folder_rounded,
+                          color: NeuTokens.folderGold,
+                          backgroundColor: NeuTokens.folderGoldSoft,
+                          size: 42,
+                          iconSize: 22,
                         ),
-                        const SizedBox(width: 14),
+                        const SizedBox(width: 12),
                         Expanded(
                           child: Column(
                             crossAxisAlignment: CrossAxisAlignment.start,
                             children: <Widget>[
                               Text(
-                                SystemEnvHelper.folderDisplayName(
-                                  folder.localDir,
-                                ),
+                                displayName,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
                                 style: textTheme.titleSmall?.copyWith(
                                   fontSize: 15,
                                 ),
                               ),
                               const SizedBox(height: 2),
                               Text(
-                                folder.localDir,
+                                isWide
+                                    ? folder.localDir
+                                    : '${folder.scheduleLabel} · ${folder.localDir}',
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: textTheme.bodySmall,
@@ -624,28 +619,49 @@ class _BackupScreenState extends State<BackupScreen> {
                             ],
                           ),
                         ),
-                        const SizedBox(width: 8),
-                        NeuStatusBadge(
-                          label: folder.scheduleLabel,
-                          tone: folder.scheduleMode == 'manual'
-                              ? NeuStatusTone.neutral
-                              : NeuStatusTone.accent,
-                          showDot: false,
-                        ),
+                        if (isWide) ...<Widget>[
+                          const SizedBox(width: 8),
+                          NeuStatusBadge(
+                            label: folder.scheduleLabel,
+                            tone: folder.scheduleMode == 'manual'
+                                ? NeuStatusTone.neutral
+                                : NeuStatusTone.accent,
+                            showDot: false,
+                          ),
+                        ],
                         const SizedBox(width: 8),
                         NeuSwitch(
                           title: '',
-                          semanticLabel:
-                              '切换 ${SystemEnvHelper.folderDisplayName(folder.localDir)} 自动备份',
+                          semanticLabel: '切换 $displayName 自动备份',
                           value: folder.enabled,
                           onChanged: isToggling
                               ? null
                               : (val) => _toggleRule(folder, val),
                         ),
-                        const SizedBox(width: 4),
-                        IconButton(
-                          tooltip: '立即增量扫描',
-                          icon: isScanning
+                        if (isWide) ...<Widget>[
+                          const SizedBox(width: 4),
+                          IconButton(
+                            tooltip: '立即增量扫描',
+                            icon: isScanning
+                                ? const SizedBox(
+                                    width: 18,
+                                    height: 18,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                    ),
+                                  )
+                                : const Icon(
+                                    Icons.play_arrow_rounded,
+                                    color: NeuTokens.accent,
+                                  ),
+                            onPressed: isScanning
+                                ? null
+                                : () => _triggerRuleScan(folder),
+                          ),
+                        ],
+                        PopupMenuButton<String>(
+                          tooltip: '更多操作',
+                          icon: isScanning && !isWide
                               ? const SizedBox(
                                   width: 18,
                                   height: 18,
@@ -654,19 +670,9 @@ class _BackupScreenState extends State<BackupScreen> {
                                   ),
                                 )
                               : const Icon(
-                                  Icons.play_arrow_rounded,
-                                  color: NeuTokens.accent,
+                                  Icons.more_horiz_rounded,
+                                  color: NeuTokens.textSecondary,
                                 ),
-                          onPressed: isScanning
-                              ? null
-                              : () => _triggerRuleScan(folder),
-                        ),
-                        PopupMenuButton<String>(
-                          tooltip: '更多操作',
-                          icon: const Icon(
-                            Icons.more_horiz_rounded,
-                            color: NeuTokens.textSecondary,
-                          ),
                           onSelected: (value) {
                             if (value == 'scan') {
                               _triggerRuleScan(folder);
@@ -757,7 +763,7 @@ class _BackupScreenState extends State<BackupScreen> {
     );
   }
 
-  Widget _buildStorageConfigCard(BuildContext context) {
+  Widget _buildStorageConfigCard(BuildContext context, bool isWide) {
     final textTheme = Theme.of(context).textTheme;
 
     return AnimatedBuilder(
@@ -849,56 +855,99 @@ class _BackupScreenState extends State<BackupScreen> {
                     const SizedBox(height: 14),
                 const Divider(height: 1),
                 const SizedBox(height: 14),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: <Widget>[
-                    Expanded(
-                      child: NeuInsetField(
-                        controller: _primaryDirController,
-                        label: primaryDrive == null
-                            ? '主备份文件夹'
-                            : '主备份文件夹（$primaryDrive）',
-                        hint: Platform.isAndroid
-                            ? '/storage/emulated/0/EveryoneNAS'
-                            : r'D:\EveryoneNAS_Primary',
-                        prefixIcon: Icons.save_outlined,
+                if (isWide)
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: <Widget>[
+                      Expanded(
+                        child: NeuInsetField(
+                          controller: _primaryDirController,
+                          label: primaryDrive == null
+                              ? '主备份文件夹'
+                              : '主备份文件夹（$primaryDrive）',
+                          hint: Platform.isAndroid
+                              ? '/storage/emulated/0/EveryoneNAS'
+                              : r'D:\EveryoneNAS_Primary',
+                          prefixIcon: Icons.save_outlined,
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: NeuSpace.sm),
-                    NeuButton(
-                      label: '浏览',
-                      icon: Icons.folder_open_outlined,
-                      onPressed: () => _pickTargetDirectory(isPrimary: true),
-                    ),
-                  ],
-                ),
+                      const SizedBox(width: NeuSpace.sm),
+                      NeuButton(
+                        label: '浏览',
+                        icon: Icons.folder_open_outlined,
+                        onPressed: () => _pickTargetDirectory(isPrimary: true),
+                      ),
+                    ],
+                  )
+                else ...<Widget>[
+                  NeuInsetField(
+                    controller: _primaryDirController,
+                    label: primaryDrive == null
+                        ? '主备份文件夹'
+                        : '主备份文件夹（$primaryDrive）',
+                    hint: Platform.isAndroid
+                        ? '/storage/emulated/0/EveryoneNAS'
+                        : r'D:\EveryoneNAS_Primary',
+                    prefixIcon: Icons.save_outlined,
+                  ),
+                  const SizedBox(height: NeuSpace.sm),
+                  NeuButton(
+                    label: '浏览主目录',
+                    icon: Icons.folder_open_outlined,
+                    expanded: true,
+                    onPressed: () => _pickTargetDirectory(isPrimary: true),
+                  ),
+                ],
                 const SizedBox(height: 12),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: <Widget>[
-                    Expanded(
-                      child: NeuInsetField(
-                        controller: _fallbackDirController,
-                        label: fallbackDrive == null
-                            ? '备用备份文件夹（可选，需不同存储卷）'
-                            : '备用备份文件夹（$fallbackDrive）',
-                        hint: Platform.isAndroid
-                            ? '/storage/<SD_UUID>/EveryoneNAS_Backup'
-                            : r'E:\EveryoneNAS_Backup',
-                        errorText: sameDriveConflict
-                            ? '备用存储位置不能与主备份位于同一存储卷（当前同为 $primaryDrive）'
-                            : null,
-                        prefixIcon: Icons.drive_file_move_outlined,
+                if (isWide)
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.end,
+                    children: <Widget>[
+                      Expanded(
+                        child: NeuInsetField(
+                          controller: _fallbackDirController,
+                          label: fallbackDrive == null
+                              ? '备用备份文件夹（可选，需不同存储卷）'
+                              : '备用备份文件夹（$fallbackDrive）',
+                          hint: Platform.isAndroid
+                              ? '/storage/<SD_UUID>/EveryoneNAS_Backup'
+                              : r'E:\EveryoneNAS_Backup',
+                          errorText: sameDriveConflict
+                              ? '备用存储位置不能与主备份位于同一存储卷（当前同为 $primaryDrive）'
+                              : null,
+                          prefixIcon: Icons.drive_file_move_outlined,
+                        ),
                       ),
-                    ),
-                    const SizedBox(width: NeuSpace.sm),
-                    NeuButton(
-                      label: '浏览',
-                      icon: Icons.folder_open_outlined,
-                      onPressed: () => _pickTargetDirectory(isPrimary: false),
-                    ),
-                  ],
-                ),
+                      const SizedBox(width: NeuSpace.sm),
+                      NeuButton(
+                        label: '浏览',
+                        icon: Icons.folder_open_outlined,
+                        onPressed: () => _pickTargetDirectory(isPrimary: false),
+                      ),
+                    ],
+                  )
+                else ...<Widget>[
+                  NeuInsetField(
+                    controller: _fallbackDirController,
+                    label: fallbackDrive == null
+                        ? '备用备份文件夹（可选，需不同存储卷）'
+                        : '备用备份文件夹（$fallbackDrive）',
+                    hint: Platform.isAndroid
+                        ? '/storage/<SD_UUID>/EveryoneNAS_Backup'
+                        : r'E:\EveryoneNAS_Backup',
+                    errorText: sameDriveConflict
+                        ? '备用存储位置不能与主备份位于同一存储卷（当前同为 $primaryDrive）'
+                        : null,
+                    prefixIcon: Icons.drive_file_move_outlined,
+                  ),
+                  const SizedBox(height: NeuSpace.sm),
+                  NeuButton(
+                    label: '浏览备用目录',
+                    icon: Icons.folder_open_outlined,
+                    expanded: true,
+                    onPressed: () => _pickTargetDirectory(isPrimary: false),
+                  ),
+                ],
                 const SizedBox(height: 14),
                 NeuButton(
                   label: '保存备份目录配置',
@@ -994,64 +1043,60 @@ class _CreateBackupTaskDialogState extends State<_CreateBackupTaskDialog> {
 
   @override
   Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
     final dirHint = Platform.isAndroid
         ? '/storage/emulated/0/DCIM'
-        : Platform.environment['USERPROFILE'] != null ? '${Platform.environment['USERPROFILE']}\\Documents' : r'C:\Users\Documents';
+        : Platform.environment['USERPROFILE'] != null
+            ? '${Platform.environment['USERPROFILE']}\\Documents'
+            : r'C:\Users\Documents';
 
-    return Dialog(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 460),
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: <Widget>[
-                  Text('新建备份任务', style: textTheme.titleMedium?.copyWith(fontSize: 18)),
-                  IconButton(
-                    icon: const Icon(Icons.close_rounded, size: 20),
-                    onPressed: () => Navigator.of(context).pop(false),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: <Widget>[
-                  Expanded(
-                    child: NeuInsetField(
-                      controller: _dirController,
-                      label: '本地源文件夹路径',
-                      hint: dirHint,
-                      prefixIcon: Icons.folder_outlined,
-                      onSubmitted: (_) => _submit(),
-                    ),
-                  ),
-                  const SizedBox(width: NeuSpace.sm),
-                  NeuButton(
-                    label: '浏览',
-                    icon: Icons.folder_open_rounded,
-                    onPressed: _browse,
-                  ),
-                ],
-              ),
-              const SizedBox(height: 18),
-              NeuButton(
-                label: '添加并启用自动增量备份',
-                icon: Icons.check_rounded,
-                tone: NeuButtonTone.primary,
-                loading: _submitting,
-                expanded: true,
-                onPressed: _submit,
-              ),
-            ],
-          ),
+    final field = NeuInsetField(
+      controller: _dirController,
+      label: '本地源文件夹路径',
+      hint: dirHint,
+      prefixIcon: Icons.folder_outlined,
+      onSubmitted: (_) => _submit(),
+    );
+    final browseBtn = NeuButton(
+      label: '浏览',
+      icon: Icons.folder_open_rounded,
+      onPressed: _browse,
+    );
+
+    return NeuDialog(
+      title: '新建备份任务',
+      maxWidth: 460,
+      actions: <Widget>[
+        NeuButton(
+          label: '取消',
+          onPressed: _submitting ? null : () => Navigator.of(context).pop(false),
         ),
-      ),
+        NeuButton(
+          label: '添加并启用自动增量备份',
+          icon: Icons.check_rounded,
+          tone: NeuButtonTone.primary,
+          loading: _submitting,
+          onPressed: _submit,
+        ),
+      ],
+      child: isWide
+          ? Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: <Widget>[
+                Expanded(child: field),
+                const SizedBox(width: NeuSpace.sm),
+                browseBtn,
+              ],
+            )
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                field,
+                const SizedBox(height: NeuSpace.sm),
+                browseBtn,
+              ],
+            ),
     );
   }
 }

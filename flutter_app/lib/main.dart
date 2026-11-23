@@ -13,8 +13,27 @@ import 'features/settings/settings_screen.dart';
 import 'features/snapshots/snapshots_screen.dart';
 import 'features/vault/vault_screen.dart';
 import 'theme/neu_theme.dart';
+import 'theme/neu_toast.dart';
 
 bool _isReportingError = false;
+bool _bundledFontLoaded = false;
+
+Future<void> _loadBundledAppFont() async {
+  if (_bundledFontLoaded) return;
+  try {
+    final woff2 = await rootBundle.load('assets/fonts/SourceHanSansSC-Regular.woff2');
+    final sfnt = await LanVaultBridge.decodeWoff2ToSfnt(
+      woff2.buffer.asUint8List(woff2.offsetInBytes, woff2.lengthInBytes),
+    );
+    if (sfnt.isEmpty) return;
+    final loader = FontLoader(NeuTokens.appFontFamily);
+    loader.addFont(Future<ByteData>.value(ByteData.sublistView(sfnt)));
+    await loader.load();
+    _bundledFontLoaded = true;
+  } catch (error) {
+    debugPrint('SourceHanSansSC WOFF2 font load skipped: $error');
+  }
+}
 
 void _safeReportUnhandledError(
   LanVaultBridge? bridge, {
@@ -44,7 +63,7 @@ void main() {
   LanVaultBridge? appBridge;
 
   runZonedGuarded<void>(
-    () {
+    () async {
       WidgetsFlutterBinding.ensureInitialized();
       final bridge = LanVaultBridge();
       appBridge = bridge;
@@ -71,6 +90,10 @@ void main() {
         return true;
       };
 
+      await _loadBundledAppFont().timeout(
+        const Duration(seconds: 3),
+        onTimeout: () {},
+      );
       runApp(LanVaultApp(bridge: bridge));
     },
     (Object error, StackTrace stack) {
@@ -196,48 +219,15 @@ class _LanVaultShellState extends State<LanVaultShell> {
     ),
   ];
 
-  static const List<_NavItem> _mobileDestinations = <_NavItem>[
-    _NavItem(
-      tab: _ShellTab.dashboard,
-      label: '总览',
-      icon: Icons.home_outlined,
-      selectedIcon: Icons.home_rounded,
-    ),
-    _NavItem(
-      tab: _ShellTab.devices,
-      label: '设备',
-      icon: Icons.devices_outlined,
-      selectedIcon: Icons.devices_rounded,
-    ),
-    _NavItem(
-      tab: _ShellTab.backup,
-      label: '备份',
-      icon: Icons.cloud_sync_outlined,
-      selectedIcon: Icons.cloud_sync_rounded,
-    ),
-    _NavItem(
-      tab: _ShellTab.storage,
-      label: '存储',
-      icon: Icons.layers_outlined,
-      selectedIcon: Icons.layers_rounded,
-    ),
-    _NavItem(
-      tab: _ShellTab.snapshots,
-      label: '快照',
-      icon: Icons.history_rounded,
-      selectedIcon: Icons.history_rounded,
-    ),
-    _NavItem(
-      tab: _ShellTab.transfer,
-      label: '传输',
-      icon: Icons.send_outlined,
-      selectedIcon: Icons.send_rounded,
-    ),
-  ];
+  static final List<_NavItem> _mobileDestinations = _desktopDestinations
+      .where((item) => item.tab != _ShellTab.settings)
+      .toList(growable: false);
 
   final GlobalKey _pagesStackKey = GlobalKey();
   late List<Widget> _pages;
   _ShellTab _selectedTab = _ShellTab.dashboard;
+  String? _activePairDialogRequestId;
+  final Set<String> _handledPairRequestIds = <String>{};
 
   List<Widget> _buildPages(LanVaultBridge bridge) {
     return <Widget>[
@@ -260,13 +250,183 @@ class _LanVaultShellState extends State<LanVaultShell> {
   void initState() {
     super.initState();
     _pages = _buildPages(widget.bridge);
+    widget.bridge.pendingPairRequestsNotifier.addListener(_onPendingPairRequests);
+    unawaited(_hydratePersistedSettings());
   }
 
   @override
   void didUpdateWidget(covariant LanVaultShell oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.bridge != widget.bridge) {
+      oldWidget.bridge.pendingPairRequestsNotifier
+          .removeListener(_onPendingPairRequests);
+      widget.bridge.pendingPairRequestsNotifier
+          .addListener(_onPendingPairRequests);
       _pages = _buildPages(widget.bridge);
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.bridge.pendingPairRequestsNotifier
+        .removeListener(_onPendingPairRequests);
+    super.dispose();
+  }
+
+  Future<void> _hydratePersistedSettings() async {
+    try {
+      await widget.bridge.getRoleMode();
+      await widget.bridge.getAutoReconnect();
+    } catch (_) {
+      // 持久化读取失败时保留默认内存状态。
+    }
+  }
+
+  void _onPendingPairRequests() {
+    if (!mounted) return;
+    if (_activePairDialogRequestId != null) return;
+    final pending = widget.bridge.pendingPairRequestsNotifier.value;
+    PendingPairRequestModel? nextRequest;
+    for (final item in pending) {
+      if (!_handledPairRequestIds.contains(item.requestId)) {
+        nextRequest = item;
+        break;
+      }
+    }
+    if (nextRequest == null) return;
+
+    final chosen = nextRequest;
+    _activePairDialogRequestId = chosen.requestId;
+    Future<void>.microtask(() {
+      if (!mounted) return;
+      unawaited(_showIncomingPairDialog(chosen));
+    });
+  }
+
+  Future<void> _showIncomingPairDialog(PendingPairRequestModel request) async {
+    var submitting = false;
+    var resolved = false;
+    try {
+      await showNeuDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (context, setDialogState) {
+              return NeuDialog(
+                title: '收到设备配对请求',
+                subtitle: '确认后对方设备将自动完成安全配对，无需手动输入配对码',
+                actions: <Widget>[
+                  NeuButton(
+                    label: '拒绝',
+                    tone: NeuButtonTone.neutral,
+                    onPressed: submitting
+                        ? null
+                        : () async {
+                            setDialogState(() => submitting = true);
+                            resolved = true;
+                            _handledPairRequestIds.add(request.requestId);
+                            try {
+                              await widget.bridge.respondPairRequest(
+                                requestId: request.requestId,
+                                accept: false,
+                              );
+                            } catch (_) {}
+                            if (dialogContext.mounted) {
+                              Navigator.of(dialogContext).pop();
+                            }
+                            if (mounted) {
+                              NeuToast.info(
+                                this.context,
+                                '已拒绝 ${request.deviceName} 的配对请求',
+                              );
+                            }
+                          },
+                  ),
+                  NeuButton(
+                    label: '同意配对',
+                    icon: Icons.verified_user_rounded,
+                    tone: NeuButtonTone.primary,
+                    loading: submitting,
+                    onPressed: submitting
+                        ? null
+                        : () async {
+                            setDialogState(() => submitting = true);
+                            resolved = true;
+                            _handledPairRequestIds.add(request.requestId);
+                            try {
+                              await widget.bridge.respondPairRequest(
+                                requestId: request.requestId,
+                                accept: true,
+                              );
+                              if (dialogContext.mounted) {
+                                Navigator.of(dialogContext).pop();
+                              }
+                              if (mounted) {
+                                NeuToast.success(
+                                  this.context,
+                                  '已同意与 ${request.deviceName} 配对',
+                                );
+                              }
+                            } catch (error) {
+                              if (dialogContext.mounted) {
+                                Navigator.of(dialogContext).pop();
+                              }
+                              if (mounted) {
+                                NeuToast.error(
+                                  this.context,
+                                  LanVaultBridge.formatUserError(error),
+                                );
+                              }
+                            }
+                          },
+                  ),
+                ],
+                child: NeuCard(
+                  inset: true,
+                  padding: const EdgeInsets.all(14),
+                  child: Row(
+                    children: <Widget>[
+                      NeuIconBadge(
+                        icon: request.osType.toLowerCase().contains('android')
+                            ? Icons.phone_android_rounded
+                            : Icons.computer_rounded,
+                        color: NeuTokens.accent,
+                        backgroundColor: NeuTokens.accentSoft,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            Text(
+                              request.deviceName,
+                              style: Theme.of(context).textTheme.titleSmall,
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              request.fingerprint.isEmpty
+                                  ? '${request.osType} · ${request.remoteIp}'
+                                  : '${request.osType} · ${request.remoteIp} · 指纹 ${request.fingerprint}',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      );
+    } finally {
+      if (!resolved) {
+        _handledPairRequestIds.add(request.requestId);
+      }
+      _activePairDialogRequestId = null;
+      _onPendingPairRequests();
     }
   }
 
@@ -276,9 +436,36 @@ class _LanVaultShellState extends State<LanVaultShell> {
         .label;
   }
 
+  Widget _buildAnimatedPageContent() {
+    return RepaintBoundary(
+      child: TweenAnimationBuilder<double>(
+        key: ValueKey<_ShellTab>(_selectedTab),
+        tween: Tween<double>(begin: 0.0, end: 1.0),
+        duration: const Duration(milliseconds: 160),
+        curve: Curves.linearToEaseOut,
+        builder: (context, t, child) {
+          final reduced = NeuMotion.isReduced(context);
+          return Opacity(
+            opacity: 0.92 + 0.08 * t,
+            child: Transform.translate(
+              offset: Offset(0, reduced ? 0 : (1 - t) * 5),
+              child: child,
+            ),
+          );
+        },
+        child: IndexedStack(
+          key: _pagesStackKey,
+          index: _selectedTab.index,
+          children: _pages,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final isWide = MediaQuery.sizeOf(context).width >= 840;
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
 
     return Scaffold(
       backgroundColor: NeuTokens.canvas,
@@ -291,31 +478,7 @@ class _LanVaultShellState extends State<LanVaultShell> {
                     selectedTab: _selectedTab,
                     onSelected: (tab) => setState(() => _selectedTab = tab),
                   ),
-                  Expanded(
-                    child: RepaintBoundary(
-                      child: TweenAnimationBuilder<double>(
-                        key: ValueKey<_ShellTab>(_selectedTab),
-                        tween: Tween<double>(begin: 0.0, end: 1.0),
-                        duration: const Duration(milliseconds: 160),
-                        curve: Curves.linearToEaseOut,
-                        builder: (context, t, child) {
-                          final reduced = NeuMotion.isReduced(context);
-                          return Opacity(
-                            opacity: 0.92 + 0.08 * t,
-                            child: Transform.translate(
-                              offset: Offset(0, reduced ? 0 : (1 - t) * 5),
-                              child: child,
-                            ),
-                          );
-                        },
-                        child: IndexedStack(
-                          key: _pagesStackKey,
-                          index: _selectedTab.index,
-                          children: _pages,
-                        ),
-                      ),
-                    ),
-                  ),
+                  Expanded(child: _buildAnimatedPageContent()),
                 ],
               )
             : Column(
@@ -331,31 +494,7 @@ class _LanVaultShellState extends State<LanVaultShell> {
                       });
                     },
                   ),
-                  Expanded(
-                    child: RepaintBoundary(
-                      child: TweenAnimationBuilder<double>(
-                        key: ValueKey<_ShellTab>(_selectedTab),
-                        tween: Tween<double>(begin: 0.0, end: 1.0),
-                        duration: const Duration(milliseconds: 160),
-                        curve: Curves.linearToEaseOut,
-                        builder: (context, t, child) {
-                          final reduced = NeuMotion.isReduced(context);
-                          return Opacity(
-                            opacity: 0.92 + 0.08 * t,
-                            child: Transform.translate(
-                              offset: Offset(0, reduced ? 0 : (1 - t) * 5),
-                              child: child,
-                            ),
-                          );
-                        },
-                        child: IndexedStack(
-                          key: _pagesStackKey,
-                          index: _selectedTab.index,
-                          children: _pages,
-                        ),
-                      ),
-                    ),
-                  ),
+                  Expanded(child: _buildAnimatedPageContent()),
                 ],
               ),
       ),
@@ -384,17 +523,16 @@ class _MobileTopBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.fromLTRB(20, 12, 14, 8),
+      padding: const EdgeInsets.fromLTRB(20, 12, 16, 6),
       color: NeuTokens.canvas,
       child: Row(
         children: <Widget>[
-          const BrandLogoMark(size: 26),
-          const SizedBox(width: 10),
           Expanded(
             child: Text(
               title,
               style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                    fontSize: 22,
+                    fontSize: 24,
+                    fontWeight: FontWeight.w800,
                   ),
             ),
           ),
@@ -403,18 +541,19 @@ class _MobileTopBar extends StatelessWidget {
             label: inSettings ? '返回总览' : '打开设置',
             child: InkWell(
               onTap: onToggleSettings,
-              borderRadius: const BorderRadius.all(Radius.circular(12)),
+              borderRadius: const BorderRadius.all(Radius.circular(NeuRadius.pill)),
               child: Container(
-                width: 40,
-                height: 40,
+                width: NeuTokens.minMobileTouchTarget,
+                height: NeuTokens.minMobileTouchTarget,
                 decoration: BoxDecoration(
                   color: inSettings ? NeuTokens.accentSoft : NeuTokens.surface,
-                  borderRadius: const BorderRadius.all(Radius.circular(12)),
+                  shape: BoxShape.circle,
                   border: Border.all(
                     color: inSettings
                         ? NeuTokens.accent.withValues(alpha: 0.35)
                         : NeuTokens.hairlineBorder,
                   ),
+                  boxShadow: NeuTokens.controlShadows,
                 ),
                 child: Icon(
                   inSettings

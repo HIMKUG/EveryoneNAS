@@ -78,6 +78,16 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   @override
+  void didUpdateWidget(covariant SettingsScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.bridge != widget.bridge) {
+      oldWidget.bridge.serverStateVersion.removeListener(_loadSettings);
+      widget.bridge.serverStateVersion.addListener(_loadSettings);
+      _loadSettings();
+    }
+  }
+
+  @override
   void dispose() {
     widget.bridge.serverStateVersion.removeListener(_loadSettings);
     _maxKbpsController.dispose();
@@ -440,7 +450,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (path == null || path.isEmpty) return;
     if (Platform.isWindows) {
       try {
-        await Process.run('explorer.exe', <String>['/select,"$path"']);
+        await Process.run('explorer.exe', <String>['/select,$path']);
       } catch (err) {
         if (!mounted) return;
         NeuToast.error(context, '打开日志目录失败：${LanVaultBridge.formatUserError(err)}');
@@ -468,7 +478,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
-    final isWide = MediaQuery.sizeOf(context).width >= 840;
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
 
     return ValueListenableBuilder<RoleMode>(
       valueListenable: widget.bridge.roleModeNotifier,
@@ -476,7 +487,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         final detailPanel = NeuMotionSwitcher(
           child: KeyedSubtree(
             key: ValueKey<_SettingsSection>(_activeSection),
-            child: _buildActiveSection(context, roleMode),
+            child: _buildActiveSection(context, roleMode, isWide),
           ),
         );
 
@@ -526,63 +537,72 @@ class _SettingsScreenState extends State<SettingsScreen> {
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
-            SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
+            Padding(
               padding: const EdgeInsets.symmetric(
                 horizontal: NeuSpace.md,
                 vertical: 6,
               ),
-              child: Row(
+              child: Wrap(
+                spacing: 8,
+                runSpacing: 8,
                 children: <Widget>[
-                  for (final sec in _SettingsSection.values) ...<Widget>[
-                    GestureDetector(
-                      onTap: () => setState(() => _activeSection = sec),
-                      child: AnimatedContainer(
-                        duration: NeuMotion.resolveState(context),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 8,
+                  for (final sec in _SettingsSection.values)
+                    Semantics(
+                      button: true,
+                      selected: sec == _activeSection,
+                      label: sec.label,
+                      child: InkWell(
+                        onTap: () => setState(() => _activeSection = sec),
+                        borderRadius: const BorderRadius.all(
+                          Radius.circular(NeuRadius.pill),
                         ),
-                        decoration: BoxDecoration(
-                          color: sec == _activeSection
-                              ? null
-                              : NeuTokens.surface,
-                          gradient: sec == _activeSection
-                              ? NeuTokens.primaryGradient
-                              : null,
-                          borderRadius:
-                              const BorderRadius.all(Radius.circular(999)),
-                          border: sec == _activeSection
-                              ? null
-                              : Border.all(color: NeuTokens.hairlineBorder),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: <Widget>[
-                            Icon(
-                              sec.icon,
-                              size: 16,
-                              color: sec == _activeSection
-                                  ? Colors.white
-                                  : NeuTokens.textSecondary,
+                        child: AnimatedContainer(
+                          duration: NeuMotion.resolveState(context),
+                          constraints: const BoxConstraints(minHeight: 38),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 13,
+                            vertical: 8,
+                          ),
+                          decoration: BoxDecoration(
+                            color: sec == _activeSection
+                                ? null
+                                : NeuTokens.surface,
+                            gradient: sec == _activeSection
+                                ? NeuTokens.primaryGradient
+                                : null,
+                            borderRadius: const BorderRadius.all(
+                              Radius.circular(NeuRadius.pill),
                             ),
-                            const SizedBox(width: 6),
-                            Text(
-                              sec.label,
-                              style: TextStyle(
-                                fontSize: 13,
-                                fontWeight: FontWeight.w600,
+                            border: sec == _activeSection
+                                ? null
+                                : Border.all(color: NeuTokens.hairlineBorder),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: <Widget>[
+                              Icon(
+                                sec.icon,
+                                size: 15,
                                 color: sec == _activeSection
                                     ? Colors.white
-                                    : NeuTokens.textPrimary,
+                                    : NeuTokens.textSecondary,
                               ),
-                            ),
-                          ],
+                              const SizedBox(width: 6),
+                              Text(
+                                sec.label,
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                  color: sec == _activeSection
+                                      ? Colors.white
+                                      : NeuTokens.textPrimary,
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
                       ),
                     ),
-                    const SizedBox(width: 8),
-                  ],
                 ],
               ),
             ),
@@ -598,11 +618,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  Widget _buildActiveSection(BuildContext context, RoleMode roleMode) {
+  Widget _buildActiveSection(
+    BuildContext context,
+    RoleMode roleMode,
+    bool isWide,
+  ) {
     return switch (_activeSection) {
       _SettingsSection.general => _buildGeneralSection(context, roleMode),
-      _SettingsSection.security => _buildSecuritySection(context),
-      _SettingsSection.backupPolicy => _buildBackupPolicySection(context),
+      _SettingsSection.security => _buildSecuritySection(context, isWide),
+      _SettingsSection.backupPolicy => _buildBackupPolicySection(context, isWide),
       _SettingsSection.networkService => _buildNetworkServiceSection(context),
       _SettingsSection.diagnostics => _buildDiagnosticsSection(context),
       _SettingsSection.about => _buildAboutSection(context),
@@ -692,7 +716,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  Widget _buildSecuritySection(BuildContext context) {
+  Widget _buildSecuritySection(BuildContext context, bool isWide) {
     final textTheme = Theme.of(context).textTheme;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -759,28 +783,51 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 style: textTheme.bodySmall,
               ),
               const SizedBox(height: 12),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: <Widget>[
-                  Expanded(
-                    child: NeuInsetField(
+              if (isWide)
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: <Widget>[
+                    Expanded(
+                      child: NeuInsetField(
+                        controller: _keyPassphraseController,
+                        label: '备份加密口令（至少 12 位）',
+                        hint: '输入高强度口令',
+                        obscureText: true,
+                        prefixIcon: Icons.key_rounded,
+                      ),
+                    ),
+                    const SizedBox(width: NeuSpace.sm),
+                    NeuButton(
+                      label: '导出备份',
+                      icon: Icons.download_rounded,
+                      tone: NeuButtonTone.primary,
+                      loading: _exportingKey,
+                      onPressed: _exportKeyBackup,
+                    ),
+                  ],
+                )
+              else
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: <Widget>[
+                    NeuInsetField(
                       controller: _keyPassphraseController,
                       label: '备份加密口令（至少 12 位）',
                       hint: '输入高强度口令',
                       obscureText: true,
                       prefixIcon: Icons.key_rounded,
                     ),
-                  ),
-                  const SizedBox(width: NeuSpace.sm),
-                  NeuButton(
-                    label: '导出备份',
-                    icon: Icons.download_rounded,
-                    tone: NeuButtonTone.primary,
-                    loading: _exportingKey,
-                    onPressed: _exportKeyBackup,
-                  ),
-                ],
-              ),
+                    const SizedBox(height: NeuSpace.sm),
+                    NeuButton(
+                      label: '导出备份',
+                      icon: Icons.download_rounded,
+                      tone: NeuButtonTone.primary,
+                      loading: _exportingKey,
+                      expanded: true,
+                      onPressed: _exportKeyBackup,
+                    ),
+                  ],
+                ),
             ],
           ),
         ),
@@ -788,7 +835,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  Widget _buildBackupPolicySection(BuildContext context) {
+  Widget _buildBackupPolicySection(BuildContext context, bool isWide) {
     final textTheme = Theme.of(context).textTheme;
     final scan = _networkSnapshot;
     final scannedSsids = <String>{
@@ -849,28 +896,47 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ),
             const SizedBox(height: 10),
           ],
-          Row(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: <Widget>[
-              Expanded(
-                child: NeuDropdown<String>(
-                  label: '允许同步的家庭网络（支持多选添加）',
-                  emptyHint: '不限制网络',
-                  prefixIcon: Icons.wifi_rounded,
-                  options: wifiOptions,
-                  value: dropdownValue,
-                  onChanged: _handleWifiSelected,
+          if (isWide)
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: <Widget>[
+                Expanded(
+                  child: NeuDropdown<String>(
+                    label: '允许同步的家庭网络（支持多选添加）',
+                    emptyHint: '不限制网络',
+                    prefixIcon: Icons.wifi_rounded,
+                    options: wifiOptions,
+                    value: dropdownValue,
+                    onChanged: _handleWifiSelected,
+                  ),
                 ),
-              ),
-              const SizedBox(width: NeuSpace.sm),
-              NeuButton(
-                label: '扫描',
-                icon: Icons.refresh_rounded,
-                loading: _scanningWifi,
-                onPressed: _rescanNetworks,
-              ),
-            ],
-          ),
+                const SizedBox(width: NeuSpace.sm),
+                NeuButton(
+                  label: '扫描',
+                  icon: Icons.refresh_rounded,
+                  loading: _scanningWifi,
+                  onPressed: _rescanNetworks,
+                ),
+              ],
+            )
+          else ...<Widget>[
+            NeuDropdown<String>(
+              label: '允许同步的家庭网络（支持多选添加）',
+              emptyHint: '不限制网络',
+              prefixIcon: Icons.wifi_rounded,
+              options: wifiOptions,
+              value: dropdownValue,
+              onChanged: _handleWifiSelected,
+            ),
+            const SizedBox(height: NeuSpace.sm),
+            NeuButton(
+              label: '扫描周边 Wi-Fi',
+              icon: Icons.refresh_rounded,
+              loading: _scanningWifi,
+              expanded: true,
+              onPressed: _rescanNetworks,
+            ),
+          ],
           if (_allowedSsids.isNotEmpty) ...<Widget>[
             const SizedBox(height: 10),
             Wrap(
@@ -879,10 +945,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
               children: <Widget>[
                 for (final ssid in _allowedSsids)
                   Container(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 10,
-                      vertical: 6,
-                    ),
+                    key: ValueKey<String>('ssid_$ssid'),
+                    padding: const EdgeInsets.only(left: 12, right: 2),
                     decoration: BoxDecoration(
                       color: NeuTokens.accentSoft,
                       borderRadius: const BorderRadius.all(
@@ -898,13 +962,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             color: NeuTokens.accent,
                           ),
                         ),
-                        const SizedBox(width: 6),
-                        GestureDetector(
-                          onTap: () => _removeAllowedSsid(ssid),
-                          child: const Icon(
-                            Icons.close_rounded,
-                            size: 15,
-                            color: NeuTokens.accent,
+                        const SizedBox(width: 2),
+                        Semantics(
+                          button: true,
+                          label: '移除允许的 Wi-Fi $ssid',
+                          child: InkWell(
+                            borderRadius: const BorderRadius.all(
+                              Radius.circular(NeuRadius.pill),
+                            ),
+                            onTap: () => _removeAllowedSsid(ssid),
+                            child: const SizedBox(
+                              width: 44,
+                              height: 44,
+                              child: Icon(
+                                Icons.close_rounded,
+                                size: 16,
+                                color: NeuTokens.accent,
+                              ),
+                            ),
                           ),
                         ),
                       ],
@@ -944,27 +1019,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
         children: <Widget>[
           Text('网络与服务状态', style: textTheme.titleMedium),
           const SizedBox(height: 14),
-          _InfoRow(
+          NeuKeyValueRow(
             label: '本机局域网 IP',
             value: overview == null || overview.lanIp.isEmpty
                 ? '未获取'
                 : overview.lanIp,
           ),
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 10),
-            child: Divider(height: 1),
-          ),
-          _InfoRow(
+          const Divider(height: 1),
+          NeuKeyValueRow(
             label: '本地服务端口',
             value: overview?.serverRunning == true
                 ? '运行中 · :${overview?.serverPort ?? LanVaultBridge.defaultServerPort}'
                 : '未启动',
           ),
-          const Padding(
-            padding: EdgeInsets.symmetric(vertical: 10),
-            child: Divider(height: 1),
-          ),
-          _InfoRow(
+          const Divider(height: 1),
+          NeuKeyValueRow(
             label: '后台保活等级',
             value: _keepAliveLevel?.displayLabel ?? '检测中',
           ),
@@ -1175,12 +1244,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
           ),
           const SizedBox(height: 20),
           const Divider(height: 1),
-          const SizedBox(height: 16),
-          const _InfoRow(label: '核心引擎', value: 'Rust Native FFI (FastCDC + Zstd + BLAKE3)'),
           const SizedBox(height: 8),
-          const _InfoRow(label: '快照策略', value: 'GFS 多级保留 (7日 / 4周 / 12月)'),
-          const SizedBox(height: 8),
-          const _InfoRow(label: '支持平台', value: 'Windows 桌面端 & Android 移动端'),
+          const NeuKeyValueRow(
+            label: '核心引擎',
+            value: 'Rust Native FFI (FastCDC + Zstd + BLAKE3)',
+          ),
+          const NeuKeyValueRow(
+            label: '快照策略',
+            value: 'GFS 多级保留 (7日 / 4周 / 12月)',
+          ),
+          const NeuKeyValueRow(
+            label: '支持平台',
+            value: 'Windows 桌面端 & Android 移动端',
+          ),
         ],
       ),
     );
@@ -1265,33 +1341,6 @@ class _SecurityRow extends StatelessWidget {
         ),
         const SizedBox(width: 12),
         NeuStatusBadge(label: status, tone: tone),
-      ],
-    );
-  }
-}
-
-class _InfoRow extends StatelessWidget {
-  const _InfoRow({required this.label, required this.value});
-
-  final String label;
-  final String value;
-
-  @override
-  Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-      children: <Widget>[
-        Text(label, style: textTheme.bodySmall),
-        const SizedBox(width: 12),
-        Flexible(
-          child: Text(
-            value,
-            textAlign: TextAlign.right,
-            overflow: TextOverflow.ellipsis,
-            style: textTheme.titleSmall,
-          ),
-        ),
       ],
     );
   }

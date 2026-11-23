@@ -10,24 +10,6 @@ import '../../theme/neu_toast.dart';
 
 enum _TransferMode { file, clipboard }
 
-class _TransferRecord {
-  const _TransferRecord({
-    required this.isFile,
-    required this.title,
-    required this.subtitle,
-    required this.targetLabel,
-    required this.timestamp,
-    this.copyableText,
-  });
-
-  final bool isFile;
-  final String title;
-  final String subtitle;
-  final String targetLabel;
-  final DateTime timestamp;
-  final String? copyableText;
-}
-
 /// 6. 传输页：
 /// - 顶部两张大动作卡：“发送文件（调用 push_clipboard_file）”与“剪贴板同步（调用 push_clipboard_text）”
 /// - 下方目标设备选择、文件/文本输入与最近传输列表（带文件/文本图标、目标设备、时间戳与绿色完成勾）
@@ -149,14 +131,6 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
             effectiveSelection == _broadcastTargetSentinel)
         ? null
         : effectiveSelection;
-    final targetLabel = targetId == null
-        ? '全部已配对设备'
-        : peers
-            .firstWhere(
-              (p) => p.deviceId == targetId,
-              orElse: () => peers.first,
-            )
-            .displayLabel;
 
     setState(() {
       _selectedTarget = effectiveSelection;
@@ -205,14 +179,6 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
             effectiveSelection == _broadcastTargetSentinel)
         ? null
         : effectiveSelection;
-    final targetLabel = targetId == null
-        ? '全部已配对设备'
-        : peers
-            .firstWhere(
-              (p) => p.deviceId == targetId,
-              orElse: () => peers.first,
-            )
-            .displayLabel;
 
     setState(() {
       _selectedTarget = effectiveSelection;
@@ -242,15 +208,11 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
     NeuToast.success(context, '已复制到剪贴板');
   }
 
-  String _formatTime(DateTime dt) {
-    return '${dt.hour.toString().padLeft(2, '0')}:'
-        '${dt.minute.toString().padLeft(2, '0')}';
-  }
-
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
-    final isWide = MediaQuery.sizeOf(context).width >= 840;
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
 
     return ValueListenableBuilder<List<PairedPeerModel>>(
       valueListenable: widget.bridge.pairedPeersNotifier,
@@ -331,39 +293,64 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                       child: _mode == _TransferMode.file
                           ? Column(
                               key: const ValueKey<_TransferMode>(_TransferMode.file),
-                              crossAxisAlignment: CrossAxisAlignment.start,
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
                               children: <Widget>[
-                                Row(
-                                  crossAxisAlignment: CrossAxisAlignment.end,
-                                  children: <Widget>[
-                                    Expanded(
-                                      child: NeuInsetField(
-                                        controller: _filePathController,
-                                        label: '本地文件路径',
-                                        hint: Platform.isAndroid
-                                            ? '/storage/emulated/0/Download/report.pdf'
-                                            : r'C:\Users\YourName\Desktop\report.pdf',
-                                        prefixIcon:
-                                            Icons.insert_drive_file_outlined,
+                                if (isWide)
+                                  Row(
+                                    crossAxisAlignment: CrossAxisAlignment.end,
+                                    children: <Widget>[
+                                      Expanded(
+                                        child: NeuInsetField(
+                                          controller: _filePathController,
+                                          label: '本地文件路径',
+                                          hint: Platform.isAndroid
+                                              ? '/storage/emulated/0/Download/report.pdf'
+                                              : r'C:\Users\YourName\Desktop\report.pdf',
+                                          prefixIcon:
+                                              Icons.insert_drive_file_outlined,
+                                        ),
                                       ),
-                                    ),
-                                    const SizedBox(width: NeuSpace.sm),
-                                    NeuButton(
-                                      label: '选择文件',
-                                      icon: Icons.attach_file_rounded,
-                                      onPressed: _pickFileToSend,
-                                    ),
-                                  ],
-                                ),
+                                      const SizedBox(width: NeuSpace.sm),
+                                      NeuButton(
+                                        label: '选择文件',
+                                        icon: Icons.attach_file_rounded,
+                                        onPressed: _pickFileToSend,
+                                      ),
+                                    ],
+                                  )
+                                else ...<Widget>[
+                                  NeuInsetField(
+                                    controller: _filePathController,
+                                    label: '本地文件路径',
+                                    hint: Platform.isAndroid
+                                        ? '/storage/emulated/0/Download/report.pdf'
+                                        : r'C:\Users\YourName\Desktop\report.pdf',
+                                    prefixIcon:
+                                        Icons.insert_drive_file_outlined,
+                                  ),
+                                  const SizedBox(height: NeuSpace.sm),
+                                  NeuButton(
+                                    label: '选择文件',
+                                    icon: Icons.attach_file_rounded,
+                                    expanded: true,
+                                    onPressed: _pickFileToSend,
+                                  ),
+                                ],
                                 const SizedBox(height: 14),
-                                NeuButton(
-                                  label: '加密发送文件',
-                                  icon: Icons.send_rounded,
-                                  tone: NeuButtonTone.primary,
-                                  loading: _sending,
-                                  onPressed: peers.isEmpty
-                                      ? null
-                                      : () => _sendFile(peers, validSelection),
+                                Align(
+                                  alignment: isWide
+                                      ? Alignment.centerLeft
+                                      : Alignment.center,
+                                  child: NeuButton(
+                                    label: '加密发送文件',
+                                    icon: Icons.send_rounded,
+                                    tone: NeuButtonTone.primary,
+                                    loading: _sending,
+                                    expanded: !isWide,
+                                    onPressed: peers.isEmpty
+                                        ? null
+                                        : () => _sendFile(peers, validSelection),
+                                  ),
                                 ),
                               ],
                             )
@@ -427,48 +414,34 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                     ),
                     const SizedBox(height: 14),
                     if (_history.isEmpty)
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(18),
-                        decoration: BoxDecoration(
-                          color: NeuTokens.insetSurface,
-                          borderRadius:
-                              const BorderRadius.all(Radius.circular(12)),
-                        ),
-                        child: Text(
-                          '暂无传输记录。选择上方“发送文件”或“剪贴板同步”即可向局域网设备高速加密发送。',
-                          style: textTheme.bodySmall,
-                        ),
+                      const NeuEmptyState(
+                        icon: Icons.swap_horiz_rounded,
+                        title: '暂无传输记录',
+                        subtitle: '选择上方“发送文件”或“剪贴板同步”即可向局域网设备高速加密发送。',
                       )
                     else
                       for (var i = 0; i < _history.length; i++) ...<Widget>[
                         Builder(
+                          key: ValueKey<String>(
+                            '${_history[i].formattedTime}_${_history[i].title}_$i',
+                          ),
                           builder: (context) {
                             final item = _history[i];
                             return Padding(
                               padding: const EdgeInsets.symmetric(vertical: 10),
                               child: Row(
                                 children: <Widget>[
-                                  Container(
-                                    width: 40,
-                                    height: 40,
-                                    decoration: BoxDecoration(
-                                      color: item.isFile
-                                          ? NeuTokens.folderGoldSoft
-                                          : NeuTokens.accentSoft,
-                                      borderRadius: const BorderRadius.all(
-                                        Radius.circular(10),
-                                      ),
-                                    ),
-                                    child: Icon(
-                                      item.isFile
-                                          ? Icons.description_rounded
-                                          : Icons.notes_rounded,
-                                      size: 20,
-                                      color: item.isFile
-                                          ? NeuTokens.folderGold
-                                          : NeuTokens.accent,
-                                    ),
+                                  NeuIconBadge(
+                                    icon: item.isFile
+                                        ? Icons.description_rounded
+                                        : Icons.notes_rounded,
+                                    color: item.isFile
+                                        ? NeuTokens.folderGold
+                                        : NeuTokens.accent,
+                                    backgroundColor: item.isFile
+                                        ? NeuTokens.folderGoldSoft
+                                        : NeuTokens.accentSoft,
+                                    radius: 10,
                                   ),
                                   const SizedBox(width: 12),
                                   Expanded(
@@ -484,7 +457,9 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                                         ),
                                         const SizedBox(height: 2),
                                         Text(
-                                          item.subtitle,
+                                          isWide
+                                              ? item.subtitle
+                                              : '${item.subtitle} · ${item.formattedTime}',
                                           maxLines: 1,
                                           overflow: TextOverflow.ellipsis,
                                           style: textTheme.bodySmall,
@@ -494,7 +469,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                                   ),
                                   const SizedBox(width: 8),
                                   if (item.content != null &&
-                                      item.content!.isNotEmpty) ...<Widget>[
+                                      item.content!.isNotEmpty)
                                     IconButton(
                                       tooltip: '复制文本',
                                       icon: const Icon(
@@ -505,12 +480,13 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                                       onPressed: () =>
                                           _copyMessage(item.content!),
                                     ),
+                                  if (isWide) ...<Widget>[
+                                    Text(
+                                      item.formattedTime,
+                                      style: textTheme.labelMedium,
+                                    ),
+                                    const SizedBox(width: 8),
                                   ],
-                                  Text(
-                                    item.formattedTime,
-                                    style: textTheme.labelMedium,
-                                  ),
-                                  const SizedBox(width: 8),
                                   const Icon(
                                     Icons.check_circle_outline_rounded,
                                     size: 18,

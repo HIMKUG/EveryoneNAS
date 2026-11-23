@@ -284,7 +284,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
-    final isWide = MediaQuery.sizeOf(context).width >= 840;
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
     final overview = _overview;
     final sync = _latestSync;
     final isSyncActive = sync != null &&
@@ -295,42 +296,79 @@ class _DashboardScreenState extends State<DashboardScreen> {
     return ValueListenableBuilder<RoleMode>(
       valueListenable: widget.bridge.roleModeNotifier,
       builder: (context, roleMode, _) {
-        return SingleChildScrollView(
-          padding: EdgeInsets.all(isWide ? NeuSpace.lg : NeuSpace.md),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[
-              if (isWide) ...<Widget>[
-                Row(
-                  children: <Widget>[
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: <Widget>[
-                          Text('总览', style: textTheme.headlineSmall),
-                          const SizedBox(height: 4),
-                          Text(
-                            '欢迎回来，数据正在安全守护中',
-                            style: textTheme.bodySmall,
-                          ),
-                        ],
+        return RefreshIndicator(
+          onRefresh: _refreshAll,
+          color: NeuTokens.accent,
+          child: SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: EdgeInsets.all(isWide ? NeuSpace.lg : NeuSpace.md),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                if (isWide) ...<Widget>[
+                  Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            Text('总览', style: textTheme.headlineSmall),
+                            const SizedBox(height: 4),
+                            Text(
+                              '欢迎回来，数据正在安全守护中',
+                              style: textTheme.bodySmall,
+                            ),
+                          ],
+                        ),
                       ),
-                    ),
-                    NeuStatusBadge(
-                      label: roleMode.label,
-                      tone: NeuStatusTone.accent,
-                    ),
-                    const SizedBox(width: NeuSpace.sm),
-                    NeuButton(
-                      label: '刷新',
-                      icon: Icons.refresh_rounded,
-                      loading: _loading,
-                      onPressed: _refreshAll,
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 20),
-              ],
+                      NeuStatusBadge(
+                        label: roleMode.label,
+                        tone: NeuStatusTone.accent,
+                      ),
+                      const SizedBox(width: NeuSpace.sm),
+                      NeuButton(
+                        label: '刷新',
+                        icon: Icons.refresh_rounded,
+                        loading: _loading,
+                        onPressed: _refreshAll,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+                ] else ...<Widget>[
+                  Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: Text(
+                          '欢迎回来，数据正在安全守护中',
+                          style: textTheme.bodySmall,
+                        ),
+                      ),
+                      const SizedBox(width: NeuSpace.sm),
+                      NeuStatusBadge(
+                        label: roleMode.label,
+                        tone: NeuStatusTone.accent,
+                      ),
+                      const SizedBox(width: 6),
+                      IconButton(
+                        tooltip: '刷新总览',
+                        onPressed: _loading ? null : _refreshAll,
+                        icon: _loading
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(strokeWidth: 2),
+                              )
+                            : const Icon(
+                                Icons.refresh_rounded,
+                                size: 20,
+                                color: NeuTokens.textPrimary,
+                              ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                ],
               if (isWide) ...<Widget>[
                 _buildKpiRow(context, isWide, overview),
                 if (isSyncActive) ...<Widget>[
@@ -373,6 +411,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ],
             ],
           ),
+        ),
         );
       },
     );
@@ -873,6 +912,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   ),
                   const SizedBox(width: 8),
                   Expanded(
+                    flex: 3,
                     child: Text(
                       '保活等级：${_keepAliveLevel!.displayLabel}',
                       overflow: TextOverflow.ellipsis,
@@ -882,13 +922,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ),
                     ),
                   ),
-                  if (overview != null && overview.lanIp.isNotEmpty)
-                    Text(
-                      overview.lanIp,
-                      style: textTheme.labelMedium?.copyWith(
-                        color: NeuTokens.textSecondary,
+                  if (overview != null && overview.lanIp.isNotEmpty) ...<Widget>[
+                    const SizedBox(width: 8),
+                    Flexible(
+                      flex: 2,
+                      child: Text(
+                        overview.lanIp,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.right,
+                        style: textTheme.labelMedium?.copyWith(
+                          color: NeuTokens.textSecondary,
+                        ),
                       ),
                     ),
+                  ],
                 ],
               ),
             ),
@@ -923,36 +970,30 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
           const SizedBox(height: 14),
           if (activities.isEmpty)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 20),
-              decoration: BoxDecoration(
-                color: NeuTokens.insetSurface,
-                borderRadius: const BorderRadius.all(Radius.circular(12)),
-              ),
-              child: Text(
-                '暂无最近活动记录。开始备份、配对设备或执行完整性校验后将在此实时显示。',
-                style: textTheme.bodySmall,
-              ),
+            const NeuEmptyState(
+              icon: Icons.bolt_rounded,
+              title: '暂无最近活动记录',
+              subtitle: '开始备份、配对设备或执行完整性校验后将在此实时显示。',
             )
           else
             for (var i = 0; i < activities.length; i++) ...<Widget>[
               Builder(
+                key: ValueKey<String>(
+                  '${activities[i].timestamp}_${activities[i].title}_$i',
+                ),
                 builder: (context) {
                   final item = activities[i];
                   final (icon, fg, bg) = _activityVisual(item.kind);
                   return Row(
                     crossAxisAlignment: CrossAxisAlignment.center,
                     children: <Widget>[
-                      Container(
-                        width: 32,
-                        height: 32,
-                        decoration: BoxDecoration(
-                          color: bg,
-                          borderRadius:
-                              const BorderRadius.all(Radius.circular(10)),
-                        ),
-                        child: Icon(icon, size: 17, color: fg),
+                      NeuIconBadge(
+                        icon: icon,
+                        color: fg,
+                        backgroundColor: bg,
+                        size: 32,
+                        iconSize: 17,
+                        radius: 10,
                       ),
                       const SizedBox(width: 12),
                       Expanded(

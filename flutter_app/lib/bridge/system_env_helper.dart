@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -19,14 +18,16 @@ class NetworkScanSnapshot {
 }
 
 /// 平台级系统辅助工具：
-/// - Windows 原生目录/文件选择器与 Android SAF 目录选择器
+/// - Windows 原生 COM IFileOpenDialog 目录/文件选择器与 Android SAF 选择器（零 PowerShell 启动耗时与弹窗）
 /// - 盘符/卷根提取（与 Rust `normalized_drive_key()` 严格对齐）
-/// - Windows Wi-Fi 列表扫描与有线网络检测
+/// - Windows Wi-Fi 列表扫描与有线网络检测（通过 Rust FFI + CREATE_NO_WINDOW 隐藏控制台）
 /// - 统一字节容量格式化
 abstract final class SystemEnvHelper {
   static const MethodChannel _keepAliveChannel =
       MethodChannel('com.lanvault.app/keep_alive');
-  static const Utf8Codec _lenientUtf8 = Utf8Codec(allowMalformed: true);
+
+  /// 由 [LanVaultBridge] 注入的 Windows 无窗口网络扫描器，避免 Dart 直接拉起 cmd/netsh 闪窗。
+  static Future<NetworkScanSnapshot> Function()? windowsNetworkScanner;
 
   /// 统一字节大小格式化（B / KB / MB / GB / TB）。
   static String formatBytes(int bytes) {
@@ -50,11 +51,7 @@ abstract final class SystemEnvHelper {
     return '$bytes B';
   }
 
-  /// 提取路径对应的存储卷标识（与 Rust `normalized_drive_key()` 100% 对齐）：
-  /// - Windows：剥离 `\\?\` 后提取大写盘符 `C:`，或 UNC `\\host\share`
-  /// - Android：`/storage/emulated/<user>/...` -> `/storage/emulated/<user>`；
-  ///   `/storage/<UUID>/...` -> `/storage/<UUID>`
-  /// - 其他 Unix：取顶层挂载点 `/<first>`
+  /// 提取路径对应的存储卷标识（与 Rust `normalized_drive_key()` 100% 对齐）。
   static String? extractDriveKey(String rawPath) {
     var trimmed = rawPath.trim();
     if (trimmed.isEmpty) return null;
@@ -111,111 +108,29 @@ abstract final class SystemEnvHelper {
   }
 
   /// 调用平台原生文件夹选择器：
-  /// - Windows：通过 PowerShell FolderBrowserDialog（显式 UTF-8 编码避免中文路径乱码）
+  /// - Windows：通过 C++ Runner COM `IFileOpenDialog` MethodChannel（毫秒级弹出，无 PowerShell）
   /// - Android：通过 `com.lanvault.app/keep_alive` 的 `pickDirectory` MethodChannel（SAF）
   static Future<String?> pickDirectory({String description = '选择文件夹'}) async {
-    if (Platform.isAndroid) {
-      final picked = await _keepAliveChannel.invokeMethod<String>(
-        'pickDirectory',
-      );
-      if (picked == null) return null;
-      final trimmed = picked.trim();
-      return trimmed.isEmpty ? null : trimmed;
-    }
-
-    if (!Platform.isWindows) return null;
-    final escapedDesc = description.replaceAll("'", "''");
-    final script = '''
-Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public static class WinFolderPicker {
-  [ComImport, Guid("DC1C5A9C-E88A-4dde-A5A1-60F82A20AEF7")] class FileOpenDialogRCW {}
-  [ComImport, Guid("42f85136-db7e-439c-85f1-e4075d135fc8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-  interface IFileDialog {
-    [PreserveSig] int Show(IntPtr parent);
-    void SetFileTypes(); void SetFileTypeIndex(); void GetFileTypeIndex(); void Advise(); void Unadvise();
-    void SetOptions(uint fos);
-    void GetOptions(out uint fos);
-    void SetDefaultFolder(); void SetFolder(); void GetFolder(); void GetCurrentSelection(); void SetFileName(); void GetFileName();
-    void SetTitle([MarshalAs(UnmanagedType.LPWStr)] string pszTitle);
-    void SetOkButtonLabel(); void SetFileNameLabel();
-    void GetResult(out IShellItem ppsi);
-  }
-  [ComImport, Guid("43826d1e-e718-42ee-bc55-a1e261c37bfe"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-  interface IShellItem {
-    void BindToHandler(); void GetParent();
-    void GetDisplayName(uint sigdnName, [MarshalAs(UnmanagedType.LPWStr)] out string ppszName);
-  }
-  public static string Pick(string title) {
-    var dlg = (IFileDialog)new FileOpenDialogRCW();
-    uint opts; dlg.GetOptions(out opts);
-    dlg.SetOptions(opts | 0x20 | 0x40);
-    dlg.SetTitle(title);
-    if (dlg.Show(IntPtr.Zero) == 0) {
-      IShellItem item; dlg.GetResult(out item);
-      string path; item.GetDisplayName(0x80058000, out path);
-      return path;
-    }
-    return null;
-  }
-}
-"@
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-\$picked = [WinFolderPicker]::Pick('$escapedDesc')
-if (\$picked) { Write-Output \$picked }
-''';
-    final result = await Process.run(
-      'powershell',
-      <String>['-NoProfile', '-STA', '-Command', script],
-      stdoutEncoding: _lenientUtf8,
-      stderrEncoding: _lenientUtf8,
+    if (!Platform.isAndroid && !Platform.isWindows) return null;
+    final picked = await _keepAliveChannel.invokeMethod<String>(
+      'pickDirectory',
+      Platform.isWindows ? <String, Object>{'title': description} : null,
     );
-    if (result.exitCode != 0) {
-      final errText = (result.stderr as String).trim();
-      throw StateError(
-        'Windows 目录选择器执行失败（退出码 ${result.exitCode}）${errText.isEmpty ? '' : '：$errText'}',
-      );
-    }
-    final selected = (result.stdout as String).trim();
-    return selected.isEmpty ? null : selected;
+    if (picked == null) return null;
+    final trimmed = picked.trim();
+    return trimmed.isEmpty ? null : trimmed;
   }
 
-  /// 调用平台原生文件选择器（Windows 使用 OpenFileDialog，Android 使用 SAF ACTION_OPEN_DOCUMENT）。
+  /// 调用平台原生文件选择器（Windows 使用原生 COM `IFileOpenDialog`，Android 使用 SAF）。
   static Future<String?> pickFile({String title = '选择要发送的文件'}) async {
-    if (Platform.isAndroid) {
-      final picked = await _keepAliveChannel.invokeMethod<String>('pickFile');
-      if (picked == null) return null;
-      final trimmed = picked.trim();
-      return trimmed.isEmpty ? null : trimmed;
-    }
-    if (!Platform.isWindows) return null;
-    final escapedTitle = title.replaceAll("'", "''");
-    final script = '''
-Add-Type -AssemblyName System.Windows.Forms
-\$dialog = New-Object System.Windows.Forms.OpenFileDialog
-\$dialog.Title = '$escapedTitle'
-\$dialog.Filter = 'All Files (*.*)|*.*'
-\$dialog.Multiselect = \$false
-if (\$dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-  [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-  Write-Output \$dialog.FileName
-}
-''';
-    final result = await Process.run(
-      'powershell',
-      <String>['-NoProfile', '-STA', '-Command', script],
-      stdoutEncoding: _lenientUtf8,
-      stderrEncoding: _lenientUtf8,
+    if (!Platform.isAndroid && !Platform.isWindows) return null;
+    final picked = await _keepAliveChannel.invokeMethod<String>(
+      'pickFile',
+      Platform.isWindows ? <String, Object>{'title': title} : null,
     );
-    if (result.exitCode != 0) {
-      final errText = (result.stderr as String).trim();
-      throw StateError(
-        'Windows 文件选择器执行失败（退出码 ${result.exitCode}）${errText.isEmpty ? '' : '：$errText'}',
-      );
-    }
-    final selected = (result.stdout as String).trim();
-    return selected.isEmpty ? null : selected;
+    if (picked == null) return null;
+    final trimmed = picked.trim();
+    return trimmed.isEmpty ? null : trimmed;
   }
 
   /// 扫描当前可见 Wi-Fi 网络并判断是否通过网线连接。
@@ -235,76 +150,16 @@ if (\$dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
       );
     }
 
-    String? currentSsid;
-    var hasWifiAdapter = false;
-    final ssids = <String>{};
-
-    final ifaceRes = await Process.run(
-      'cmd',
-      <String>['/c', 'chcp 65001 >nul && netsh wlan show interfaces'],
-      stdoutEncoding: _lenientUtf8,
-      stderrEncoding: _lenientUtf8,
-    );
-    final ifaceOut = ifaceRes.stdout as String;
-    final ifaceErr = (ifaceRes.stderr as String).trim();
-
-    if (ifaceRes.exitCode != 0) {
-      final combined = '$ifaceOut\n$ifaceErr';
-      final noWirelessInterface =
-          combined.contains('There is no wireless interface') ||
-              combined.contains('系统上没有无线接口');
-      if (!noWirelessInterface) {
-        throw StateError(
-          'netsh wlan show interfaces 执行失败（退出码 ${ifaceRes.exitCode}）：'
-          '${ifaceErr.isNotEmpty ? ifaceErr : ifaceOut.trim()}',
-        );
-      }
-    } else {
-      if (!ifaceOut.contains('There is no wireless interface') &&
-          !ifaceOut.contains('系统上没有无线接口')) {
-        hasWifiAdapter = true;
-      }
-      for (final line in ifaceOut.split(RegExp(r'\r?\n'))) {
-        final match = RegExp(r'^\s*SSID\s*:\s*(.+)$').firstMatch(line);
-        if (match != null) {
-          final val = match.group(1)!.trim();
-          if (val.isNotEmpty) {
-            currentSsid = val;
-            ssids.add(val);
-          }
-        }
-      }
+    final scanner = windowsNetworkScanner;
+    if (scanner != null) {
+      return scanner();
     }
-
-    if (hasWifiAdapter) {
-      final netRes = await Process.run(
-        'cmd',
-        <String>['/c', 'chcp 65001 >nul && netsh wlan show networks'],
-        stdoutEncoding: _lenientUtf8,
-        stderrEncoding: _lenientUtf8,
-      );
-      if (netRes.exitCode == 0) {
-        final out = netRes.stdout as String;
-        for (final line in out.split(RegExp(r'\r?\n'))) {
-          final match = RegExp(r'^\s*SSID\s+\d+\s*:\s*(.+)$').firstMatch(line);
-          if (match != null) {
-            final val = match.group(1)!.trim();
-            if (val.isNotEmpty) {
-              ssids.add(val);
-            }
-          }
-        }
-      }
-    }
-
-    final isWiredEthernet = !hasWifiAdapter || currentSsid == null;
-    final sorted = ssids.toList(growable: false)..sort();
 
     return NetworkScanSnapshot(
-      hasWifiAdapter: hasWifiAdapter,
-      isWiredEthernet: isWiredEthernet,
-      currentSsid: currentSsid,
-      availableSsids: sorted,
+      hasWifiAdapter: false,
+      isWiredEthernet: true,
+      currentSsid: fallbackCurrentSsid,
+      availableSsids: const <String>[],
     );
   }
 }
