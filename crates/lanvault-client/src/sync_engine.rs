@@ -217,6 +217,7 @@ impl SyncEngine {
         shared_rate_limiter: Option<Arc<TokenBucket>>,
     ) -> Result<Self, ClientError> {
         let http = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(30))
             .build()?;
         let rate_limiter = shared_rate_limiter
@@ -508,11 +509,12 @@ impl SyncEngine {
                 continue;
             }
 
-            let permit = upload_sem
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("upload semaphore closed");
+            let Ok(permit) = upload_sem.clone().acquire_owned().await else {
+                loop_err = Some(ClientError::Io(std::io::Error::other(
+                    "upload semaphore closed",
+                )));
+                break;
+            };
             self.rate_limiter.acquire(packed.stored_bytes.len()).await;
 
             let http = self.http.clone();
@@ -560,7 +562,13 @@ impl SyncEngine {
                         {
                             let mut guard = self.known_remote_chunks.write().await;
                             if guard.len() >= MAX_KNOWN_REMOTE_CHUNKS {
-                                guard.clear();
+                                // Evict ~25% of entries instead of wiping the entire dedup cache at once.
+                                let to_remove = guard.len() / 4;
+                                let evict_keys: Vec<(String, [u8; 32])> =
+                                    guard.iter().take(to_remove).cloned().collect();
+                                for key in evict_keys {
+                                    guard.remove(&key);
+                                }
                             }
                             guard.insert((vault_id.to_string(), h));
                         }
@@ -603,6 +611,10 @@ impl SyncEngine {
         drop(rx);
         let _ = producer.await;
 
+        if loop_err.is_some() {
+            inflight_uploads.abort_all();
+        }
+
         while let Some(joined) = inflight_uploads.join_next().await {
             if loop_err.is_some() {
                 continue;
@@ -612,7 +624,12 @@ impl SyncEngine {
                     {
                         let mut guard = self.known_remote_chunks.write().await;
                         if guard.len() >= MAX_KNOWN_REMOTE_CHUNKS {
-                            guard.clear();
+                            let to_remove = guard.len() / 4;
+                            let evict_keys: Vec<(String, [u8; 32])> =
+                                guard.iter().take(to_remove).cloned().collect();
+                            for key in evict_keys {
+                                guard.remove(&key);
+                            }
                         }
                         guard.insert((vault_id.to_string(), h));
                     }

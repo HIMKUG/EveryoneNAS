@@ -142,7 +142,10 @@ impl GarbageCollector {
         }
 
         let (deleted_chunks, reclaimed_bytes) = self.vault_store.with_write_lock(|| {
-            let orphans = self.db.list_orphan_chunks(vault_id)?;
+            // 5-minute grace period prevents GC from deleting in-flight chunks before `create_snapshot` commits.
+            const ORPHAN_GRACE_SECS: i64 = 300;
+            let cutoff = now_unix_secs.saturating_sub(ORPHAN_GRACE_SECS);
+            let orphans = self.db.list_orphan_chunks_before(vault_id, cutoff)?;
             let orphan_hashes: Vec<[u8; 32]> = orphans.iter().map(|o| o.hash_blake3).collect();
             let batch_deleted = self.db.delete_chunks_batch(vault_id, &orphan_hashes)? as u64;
 

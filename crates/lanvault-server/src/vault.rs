@@ -11,7 +11,6 @@
 //! └── staging/<uuid>.tmp
 //! ```
 
-use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -120,25 +119,26 @@ impl VaultStore {
             ));
         }
 
-        let mut mount_paths = HashSet::new();
-        mount_paths.insert(normalized_mount_key(&primary_mount_path)?);
+        let mut mount_paths: Vec<PathBuf> = Vec::with_capacity(1 + extra_volumes.len());
+        let primary_key = normalized_mount_key(&primary_mount_path)?;
+        mount_paths.push(primary_key);
         for extra in &extra_volumes {
-            if !mount_paths.insert(normalized_mount_key(&extra.mount_path)?) {
+            let extra_key = normalized_mount_key(&extra.mount_path)?;
+            if mount_paths.iter().any(|existing| paths_overlap(existing, &extra_key)) {
                 return Err(LanVaultError::InvalidInput(
-                    "vault volumes must use distinct mount paths".to_string(),
+                    "vault volumes must use distinct, non-overlapping mount paths".to_string(),
                 ));
             }
+            mount_paths.push(extra_key);
         }
-        for existing_vault in self.db.list_vaults()? {
-            for existing in self.db.list_vault_volumes(&existing_vault.vault_id)? {
-                let existing_path = normalized_mount_key(&existing.mount_path)?;
-                for requested in &mount_paths {
-                    if paths_overlap(&existing_path, requested) {
-                        return Err(LanVaultError::InvalidInput(format!(
-                            "mount path overlaps existing volume {}",
-                            existing.mount_path
-                        )));
-                    }
+        for existing in self.db.list_all_volumes()? {
+            let existing_path = normalized_mount_key(&existing.mount_path)?;
+            for requested in &mount_paths {
+                if paths_overlap(&existing_path, requested) {
+                    return Err(LanVaultError::InvalidInput(format!(
+                        "mount path overlaps existing volume {}",
+                        existing.mount_path
+                    )));
                 }
             }
         }
@@ -200,7 +200,12 @@ impl VaultStore {
             write_vault_meta_atomic(Path::new(&vol.mount_path), &meta)?;
         }
 
-        self.db.insert_vault(&vault, &volumes)?;
+        if let Err(err) = self.db.insert_vault(&vault, &volumes) {
+            for vol in &volumes {
+                let _ = fs::remove_file(Path::new(&vol.mount_path).join("vault.meta.json"));
+            }
+            return Err(err);
+        }
         Ok((vault, volumes))
     }
 
@@ -352,12 +357,31 @@ impl VaultStore {
                 Err(LanVaultError::NotFound(format!("chunk {hash_hex}")))
             }
             PoolMode::MirrorRaid1 => {
-                for vol in volumes.iter().filter(|volume| {
-                    matches!(volume.role, VolumeRole::Primary | VolumeRole::Mirror)
-                }) {
+                let candidates: Vec<&VaultVolumeRecord> = volumes
+                    .iter()
+                    .filter(|volume| matches!(volume.role, VolumeRole::Primary | VolumeRole::Mirror))
+                    .collect();
+                for vol in &candidates {
                     if let Ok(bytes) =
                         read_verified_chunk(Path::new(&vol.mount_path), &hash_hex, hash)
                     {
+                        if vol.role == VolumeRole::Mirror {
+                            if let Some(primary) =
+                                candidates.iter().find(|v| v.role == VolumeRole::Primary)
+                            {
+                                if let Err(err) = write_chunk_atomic(
+                                    Path::new(&primary.mount_path),
+                                    &hash_hex,
+                                    &bytes,
+                                ) {
+                                    tracing::warn!(
+                                        vault_id = %vault_id,
+                                        hash = %hash_hex,
+                                        "failed to self-heal primary chunk from mirror: {err}"
+                                    );
+                                }
+                            }
+                        }
                         return Ok(bytes);
                     }
                 }
@@ -582,7 +606,7 @@ fn write_vault_meta_atomic(root: &Path, meta: &VaultMetaFile) -> Result<()> {
 
 /// Computes `<root>/chunks/<first_2_hex>/<full_hex>`.
 pub fn chunk_file_path(volume_root: &Path, hash_hex: &str) -> PathBuf {
-    let bucket = &hash_hex[..2];
+    let bucket = hash_hex.get(..2).unwrap_or("00");
     volume_root.join("chunks").join(bucket).join(hash_hex)
 }
 
@@ -634,20 +658,42 @@ fn normalized_mount_key(raw: &str) -> Result<PathBuf> {
             "vault mount path must be an absolute path".to_string(),
         ));
     }
-    let mut resolved = path.to_path_buf();
-    if resolved.exists() {
-        resolved = fs::canonicalize(&resolved)?;
-    }
+    let mut resolved = if path.exists() {
+        fs::canonicalize(path)?
+    } else {
+        // Walk up to the longest existing ancestor so `..` or symlinks cannot bypass overlap checks.
+        let mut ancestor = path.to_path_buf();
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        while !ancestor.exists() {
+            let Some(name) = ancestor.file_name() else {
+                break;
+            };
+            let name_str = name.to_string_lossy();
+            if name_str == ".." {
+                return Err(LanVaultError::InvalidInput(
+                    "vault mount path must not contain parent '..' segments".to_string(),
+                ));
+            }
+            if name_str != "." {
+                tail.push(name.to_os_string());
+            }
+            if !ancestor.pop() {
+                break;
+            }
+        }
+        let mut base = if ancestor.exists() {
+            fs::canonicalize(&ancestor)?
+        } else {
+            ancestor
+        };
+        for seg in tail.into_iter().rev() {
+            base.push(seg);
+        }
+        base
+    };
     #[cfg(windows)]
     {
-        let s = resolved.to_string_lossy();
-        let stripped = if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{unc}")
-        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            s.into_owned()
-        };
+        let stripped = lanvault_core::strip_windows_verbatim(&resolved.to_string_lossy());
         resolved = PathBuf::from(stripped.to_lowercase());
     }
     Ok(resolved)
@@ -661,6 +707,9 @@ fn striped_target_volume<'a>(
     volumes: &'a [VaultVolumeRecord],
     hash: &[u8; 32],
 ) -> Result<&'a VaultVolumeRecord> {
+    if volumes.is_empty() {
+        return Err(LanVaultError::NotFound("no online volumes in vault".to_string()));
+    }
     let idx = (hash[0] as usize) % volumes.len();
     Ok(&volumes[idx])
 }
@@ -670,4 +719,36 @@ pub(crate) fn unix_timestamp_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_vault_rejects_nested_self_overlapping_extra_volumes() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("lanvault-vault-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let db = Arc::new(Database::open(&temp_dir.join("index.db")).unwrap());
+        let store = VaultStore::new(db);
+
+        let primary = temp_dir.join("primary");
+        let nested_mirror = primary.join("mirror_sub");
+        let res = store.create_vault(
+            "Test Pool".to_string(),
+            primary.to_string_lossy().into_owned(),
+            None,
+            PoolMode::MirrorRaid1,
+            1024 * 1024,
+            true,
+            vec![ExtraVolumeSpec {
+                mount_path: nested_mirror.to_string_lossy().into_owned(),
+                volume_guid: None,
+                role: VolumeRole::Mirror,
+            }],
+        );
+        assert!(matches!(res, Err(LanVaultError::InvalidInput(_))));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }

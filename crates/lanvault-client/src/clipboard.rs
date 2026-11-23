@@ -65,6 +65,7 @@ impl ClipboardClient {
         channel_key: SymmetricKey,
     ) -> Result<Self, ClientError> {
         let http = Client::builder()
+            .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(20))
             .build()?;
         Ok(Self {
@@ -153,11 +154,12 @@ impl ClipboardClient {
                 Ok(DecryptedClipboardItem::Text(text))
             }
             "file" => {
-                let name = filename.ok_or_else(|| {
+                let raw_name = filename.ok_or_else(|| {
                     ClientError::InvalidInput("file clipboard item missing filename".to_string())
                 })?;
+                let safe_name = sanitize_received_filename(&raw_name)?;
                 Ok(DecryptedClipboardItem::File {
-                    filename: name,
+                    filename: safe_name,
                     bytes: plaintext,
                 })
             }
@@ -214,4 +216,28 @@ fn open_payload(envelope: &EncryptedEnvelope, key: &SymmetricKey) -> Result<Vec<
         .map_err(|e| ClientError::Crypto(format!("invalid clipboard wire hex: {e}")))?;
     let plaintext = decrypt_aead(key, &wire, CLIPBOARD_AAD)?;
     Ok(plaintext)
+}
+
+fn sanitize_received_filename(raw: &str) -> Result<String, ClientError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(ClientError::InvalidInput(
+            "clipboard filename must not be empty or contain NUL".to_string(),
+        ));
+    }
+    let basename = trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if basename.is_empty()
+        || basename == "."
+        || basename == ".."
+        || basename.chars().any(|c| c.is_control())
+    {
+        return Err(ClientError::InvalidInput(format!(
+            "unsafe clipboard filename `{raw}`"
+        )));
+    }
+    Ok(basename.to_string())
 }

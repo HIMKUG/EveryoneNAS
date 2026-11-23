@@ -58,6 +58,39 @@ const WS_OUTBOUND_QUEUE_CAPACITY: usize = 32;
 const GRACEFUL_DRAIN_SECS: u64 = 3;
 const MAX_CHUNK_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CLIPBOARD_BODY_BYTES: usize = 16 * 1024 * 1024;
+pub const PENDING_PAIR_TTL_SECS: i64 = 60;
+const MAX_PENDING_PAIR_REQUESTS: usize = 16;
+
+/// Interactive pairing request summary exposed to the receiving device UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPairRequestDto {
+    pub request_id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub os_type: String,
+    pub fingerprint: String,
+    pub remote_ip: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub enum PendingPairStatus {
+    Pending,
+    Approved(PairPinResponse),
+    Rejected,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingPairEntry {
+    pub dto: PendingPairRequestDto,
+    pub poll_token: String,
+    pub nonce: String,
+    pub client_ed25519_pubkey: [u8; 32],
+    pub client_x25519_pubkey: [u8; 32],
+    pub identity_message: Vec<u8>,
+    pub status: PendingPairStatus,
+}
 
 /// RAII guard tracking in-flight chunk writes for graceful restart draining.
 struct ActiveChunkWriteGuard {
@@ -95,6 +128,7 @@ pub enum WsServerEvent {
         encrypted: bool,
         timestamp: i64,
     },
+    PairingRequested(PendingPairRequestDto),
 }
 
 /// Shared runtime state injected into all Axum handlers.
@@ -114,6 +148,7 @@ pub struct AppState {
     pub active_chunk_writes: AtomicU64,
     pub accepting_tasks: AtomicBool,
     pub pairing_pin: StdMutex<String>,
+    pub pending_pair_requests: DashMap<String, PendingPairEntry>,
     pub online_peers: DashMap<String, usize>,
     pub db: Arc<Database>,
     pub vault_store: Arc<VaultStore>,
@@ -152,18 +187,14 @@ impl AppState {
         }
         let corrupted_chunks = self.db.count_corrupted_chunks()?;
         let vaults = self.db.list_vaults()?;
+        let all_volumes = self.db.list_all_volumes()?;
         let mut vault_used_bytes = 0u64;
         let mut vault_quota_bytes = 0u64;
-        let mut any_volume_offline = false;
-
         for v in &vaults {
             vault_used_bytes = vault_used_bytes.saturating_add(v.used_bytes);
             vault_quota_bytes = vault_quota_bytes.saturating_add(v.quota_bytes);
-            let vols = self.db.list_vault_volumes(&v.vault_id)?;
-            if vols.iter().any(|vol| !vol.is_online) {
-                any_volume_offline = true;
-            }
         }
+        let any_volume_offline = all_volumes.iter().any(|vol| !vol.is_online);
 
         let bit_rot_health = if corrupted_chunks > 0 {
             "corrupted"
@@ -245,6 +276,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/scrub/trigger", post(handle_scrub_trigger))
         .route("/api/peers", get(handle_list_peers))
+        .route("/api/peers/pair-requests", get(handle_list_pair_requests))
+        .route(
+            "/api/peers/pair-requests/{request_id}/respond",
+            post(handle_respond_pair_request),
+        )
         .route("/api/peers/{device_id}", delete(handle_delete_peer))
         .route(
             "/api/clipboard",
@@ -265,6 +301,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let api_router = Router::new()
         .route("/api/auth/login", post(handle_login))
         .route("/api/peers/pair", post(handle_pair_peer))
+        .route("/api/peers/pair-request", post(handle_pair_request_initiate))
+        .route("/api/peers/pair-status", post(handle_pair_request_status))
         .merge(protected_router)
         .layer(CookieManagerLayer::new())
         .with_state(state);
@@ -631,14 +669,35 @@ struct PairPinRequest {
     os_type: String,
 }
 
-#[derive(Debug, Serialize)]
-struct PairPinResponse {
-    device_id: String,
-    server_ed25519_pubkey_hex: String,
-    server_x25519_pubkey_hex: String,
-    server_ed25519_signature_hex: String,
-    clipboard_key_envelope_hex: String,
-    session_cookie: Option<String>,
+#[derive(Debug, Deserialize)]
+struct PairRequestInitiateBody {
+    nonce: String,
+    client_ed25519_pubkey_hex: String,
+    client_x25519_pubkey_hex: String,
+    client_ed25519_signature_hex: String,
+    device_name: String,
+    os_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PairRequestStatusBody {
+    request_id: String,
+    poll_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RespondPairRequestBody {
+    accept: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PairPinResponse {
+    pub device_id: String,
+    pub server_ed25519_pubkey_hex: String,
+    pub server_x25519_pubkey_hex: String,
+    pub server_ed25519_signature_hex: String,
+    pub clipboard_key_envelope_hex: String,
+    pub session_cookie: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -805,46 +864,55 @@ async fn handle_list_vaults(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<SessionInfo>,
 ) -> Response {
-    let vaults = match state.db.list_vaults() {
-        Ok(v) => v,
-        Err(err) => return map_domain_error(err),
-    };
-
-    let mut result = Vec::with_capacity(vaults.len());
-    for v in vaults {
-        let volumes = if session.is_admin {
-            match state.db.list_vault_volumes(&v.vault_id) {
-                Ok(vols) => vols,
-                Err(err) => return map_domain_error(err),
-            }
-        } else {
-            Vec::new()
-        };
-        result.push(VaultDto {
-            vault_id: v.vault_id,
-            name: v.name,
-            pool_mode: v.pool_mode,
-            quota_bytes: v.quota_bytes,
-            used_bytes: v.used_bytes,
-            e2ee_enabled: v.e2ee_enabled,
-            volumes: volumes
-                .into_iter()
-                .map(|vol| VolumeDto {
+    let db = Arc::clone(&state.db);
+    let is_admin = session.is_admin;
+    let join_res = tokio::task::spawn_blocking(move || -> lanvault_core::Result<Vec<VaultDto>> {
+        let vaults = db.list_vaults()?;
+        let mut by_vault: std::collections::HashMap<String, Vec<VolumeDto>> =
+            std::collections::HashMap::new();
+        if is_admin {
+            for vol in db.list_all_volumes()? {
+                by_vault.entry(vol.vault_id).or_default().push(VolumeDto {
                     volume_id: vol.volume_id,
                     mount_path: vol.mount_path,
                     volume_guid: vol.volume_guid,
                     role: vol.role,
                     is_online: vol.is_online,
-                })
-                .collect(),
-        });
-    }
+                });
+            }
+        }
+        Ok(vaults
+            .into_iter()
+            .map(|v| {
+                let volumes = by_vault.remove(&v.vault_id).unwrap_or_default();
+                VaultDto {
+                    vault_id: v.vault_id,
+                    name: v.name,
+                    pool_mode: v.pool_mode,
+                    quota_bytes: v.quota_bytes,
+                    used_bytes: v.used_bytes,
+                    e2ee_enabled: v.e2ee_enabled,
+                    volumes,
+                }
+            })
+            .collect())
+    })
+    .await;
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({ "vaults": result })),
-    )
-        .into_response()
+    match join_res {
+        Ok(Ok(result)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "vaults": result })),
+        )
+            .into_response(),
+        Ok(Err(err)) => map_domain_error(err),
+        Err(err) => {
+            warn!("list_vaults blocking task failed: {err}");
+            map_domain_error(LanVaultError::InvalidState(
+                "list_vaults task failed".to_string(),
+            ))
+        }
+    }
 }
 
 async fn handle_create_vault(
@@ -863,16 +931,22 @@ async fn handle_create_vault(
             "vaults must keep end-to-end encryption enabled".to_string(),
         ));
     }
-    match state.vault_store.create_vault(
-        req.name,
-        req.mount_path,
-        req.volume_guid,
-        req.pool_mode,
-        req.quota_bytes,
-        req.e2ee_enabled,
-        req.extra_volumes,
-    ) {
-        Ok((vault, volumes)) => {
+    let _write_guard = ActiveChunkWriteGuard::new(Arc::clone(&state));
+    let vault_store = Arc::clone(&state.vault_store);
+    let join_res = tokio::task::spawn_blocking(move || {
+        vault_store.create_vault(
+            req.name,
+            req.mount_path,
+            req.volume_guid,
+            req.pool_mode,
+            req.quota_bytes,
+            req.e2ee_enabled,
+            req.extra_volumes,
+        )
+    })
+    .await;
+    match join_res {
+        Ok(Ok((vault, volumes))) => {
             let dto = VaultDto {
                 vault_id: vault.vault_id,
                 name: vault.name,
@@ -893,19 +967,33 @@ async fn handle_create_vault(
             };
             (StatusCode::CREATED, Json(dto)).into_response()
         }
-        Err(err) => map_domain_error(err),
+        Ok(Err(err)) => map_domain_error(err),
+        Err(err) => {
+            warn!("create_vault blocking task failed: {err}");
+            map_domain_error(LanVaultError::InvalidState(
+                "create_vault task failed".to_string(),
+            ))
+        }
     }
 }
 
 async fn handle_put_chunk(
     State(state): State<Arc<AppState>>,
-    Extension(_session): Extension<SessionInfo>,
+    Extension(session): Extension<SessionInfo>,
     Path((vault_id, hash_hex)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
+    }
+    if !session.is_admin {
+        let Some(dev_id) = session.device_id.as_deref() else {
+            return unauthorized_response();
+        };
+        if state.auth.validate_session_device_active(dev_id) == false {
+            return unauthorized_response();
+        }
     }
 
     let expected_hash = match decode_hex_32(&hash_hex, "hash_hex") {
@@ -992,34 +1080,53 @@ async fn handle_list_snapshots(
     Extension(session): Extension<SessionInfo>,
     Query(query): Query<SnapshotQuery>,
 ) -> Response {
-    match state.db.list_snapshots(query.vault_id.as_deref()) {
-        Ok(snaps) => {
-            let dtos: Vec<SnapshotDto> = snaps
+    let db = Arc::clone(&state.db);
+    let vault_id = query.vault_id;
+    let limit = query.limit.clamp(1, 1000);
+    let offset = query.offset;
+    let is_admin = session.is_admin;
+    let session_device_id = session.device_id;
+
+    let join_res = tokio::task::spawn_blocking(move || -> lanvault_core::Result<Vec<SnapshotDto>> {
+        let snaps = if is_admin {
+            db.list_snapshots_paginated(vault_id.as_deref(), limit, offset)?
+        } else {
+            db.list_snapshots(vault_id.as_deref())?
                 .into_iter()
-                .filter(|snapshot| {
-                    session.is_admin
-                        || session.device_id.as_deref() == Some(snapshot.device_id.as_str())
-                })
-                .skip(query.offset)
-                .take(query.limit.clamp(1, 1000))
-                .map(|s| SnapshotDto {
-                    snapshot_id: s.snapshot_id,
-                    vault_id: s.vault_id,
-                    rule_id: s.rule_id,
-                    device_id: s.device_id,
-                    retention_tier: s.retention_tier.as_str().to_string(),
-                    file_count: s.file_count,
-                    total_bytes: s.total_bytes,
-                    created_at: s.created_at,
-                })
-                .collect();
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "snapshots": dtos })),
-            )
-                .into_response()
+                .filter(|snapshot| session_device_id.as_deref() == Some(snapshot.device_id.as_str()))
+                .skip(offset)
+                .take(limit)
+                .collect()
+        };
+        Ok(snaps
+            .into_iter()
+            .map(|s| SnapshotDto {
+                snapshot_id: s.snapshot_id,
+                vault_id: s.vault_id,
+                rule_id: s.rule_id,
+                device_id: s.device_id,
+                retention_tier: s.retention_tier.as_str().to_string(),
+                file_count: s.file_count,
+                total_bytes: s.total_bytes,
+                created_at: s.created_at,
+            })
+            .collect())
+    })
+    .await;
+
+    match join_res {
+        Ok(Ok(dtos)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "snapshots": dtos })),
+        )
+            .into_response(),
+        Ok(Err(err)) => map_domain_error(err),
+        Err(err) => {
+            warn!("list_snapshots blocking task failed: {err}");
+            map_domain_error(LanVaultError::InvalidState(
+                "list_snapshots task failed".to_string(),
+            ))
         }
-        Err(err) => map_domain_error(err),
     }
 }
 
@@ -1096,6 +1203,7 @@ async fn handle_create_snapshot(
     }
     normalized_files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
 
+    let _write_guard = ActiveChunkWriteGuard::new(Arc::clone(&state));
     let retention_tier = req.retention_tier.unwrap_or(RetentionTier::Daily);
     let rule_id = req.rule_id;
     let device_id = req.device_id;
@@ -1104,14 +1212,8 @@ async fn handle_create_snapshot(
     let vid = vault_id.clone();
 
     let join_res = tokio::task::spawn_blocking(move || -> lanvault_core::Result<SnapshotRecord> {
-        vault_store.with_write_lock(|| {
-        let vault = db
-            .get_vault(&vid)?
-            .ok_or_else(|| LanVaultError::NotFound(format!("vault {vid}")))?;
-        if db.get_trusted_peer(&device_id)?.is_none() {
-            return Err(LanVaultError::NotFound(format!("trusted peer {device_id}")));
-        }
-
+        // Verify all referenced chunks on disk BEFORE acquiring the global vault write_lock
+        // so slow disk reads/hashing do not stall concurrent chunk uploads.
         for hash in &unique_hashes {
             if !vault_store.has_verified_chunk(&vid, hash)? {
                 return Err(LanVaultError::NotFound(format!(
@@ -1119,6 +1221,14 @@ async fn handle_create_snapshot(
                     hex::encode(hash)
                 )));
             }
+        }
+
+        vault_store.with_write_lock(|| {
+        let vault = db
+            .get_vault(&vid)?
+            .ok_or_else(|| LanVaultError::NotFound(format!("vault {vid}")))?;
+        if db.get_trusted_peer(&device_id)?.is_none() {
+            return Err(LanVaultError::NotFound(format!("trusted peer {device_id}")));
         }
         let manifest_roots = vault_store.manifest_backup_roots(&vid)?;
 
@@ -1365,10 +1475,18 @@ async fn handle_snapshot_file_download(
                     Ok(Some((axum::body::Bytes::from(framed), (iter, store, vid))))
                 },
             );
-            let mut resp = axum::response::Response::builder()
+            let mut resp = match axum::response::Response::builder()
                 .status(StatusCode::OK)
                 .body(axum::body::Body::from_stream(chunk_stream))
-                .expect("valid streaming snapshot response");
+            {
+                Ok(resp) => resp,
+                Err(err) => {
+                    warn!("failed to build streaming snapshot response: {err}");
+                    return map_domain_error(LanVaultError::InvalidState(
+                        "failed to build snapshot stream".to_string(),
+                    ));
+                }
+            };
             resp.headers_mut().insert(
                 CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
@@ -1416,6 +1534,7 @@ async fn handle_scrub_trigger(
         return resp;
     }
 
+    let _write_guard = ActiveChunkWriteGuard::new(Arc::clone(&state));
     let state_clone = Arc::clone(&state);
     let vault_id = query.vault_id;
 
@@ -1497,11 +1616,10 @@ async fn handle_list_peers(
         })
         .collect();
 
-    let pairing_pin = state
-        .pairing_pin
-        .lock()
-        .expect("pairing PIN lock poisoned")
-        .clone();
+    let pairing_pin = match state.pairing_pin.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
     let pairing_qr_uri = format!(
         "lanvault://pair?id={}&ip={}&port={}&pin={}",
         state.device_id, state.lan_ip, state.port, pairing_pin
@@ -1516,6 +1634,126 @@ async fn handle_list_peers(
         })),
     )
         .into_response()
+}
+
+impl AppState {
+    fn complete_pairing_handshake(
+        &self,
+        client_ed25519_pubkey: [u8; 32],
+        client_x25519_pubkey: [u8; 32],
+        identity_message: &[u8],
+        challenge: &str,
+        device_name: String,
+        os_type: String,
+        remote_ip: String,
+    ) -> Result<(PairPinResponse, String), LanVaultError> {
+        let server_kex = SessionKeyExchange::new();
+        let server_x25519_pub = server_kex.public_key_bytes();
+        let session_key = server_kex.agree(&client_x25519_pubkey, identity_message)?;
+
+        let peer_fp = public_key_fingerprint(&client_ed25519_pubkey);
+        let peer_device_id = format!("lv-{}", &peer_fp[..12]);
+        let existing_last_port = self
+            .db
+            .get_trusted_peer(&peer_device_id)?
+            .and_then(|peer| peer.last_port);
+        let peer = TrustedPeer {
+            device_id: peer_device_id.clone(),
+            device_name,
+            os_type,
+            ed25519_pubkey: client_ed25519_pubkey.to_vec(),
+            last_ip: Some(remote_ip),
+            last_port: existing_last_port,
+            auto_connect: true,
+            paired_at: unix_timestamp_secs(),
+            revoked_at: None,
+        };
+
+        self.db.upsert_trusted_peer(&peer)?;
+        self.auth.unrevoke_device(&peer_device_id);
+
+        let session_token = self.auth.issue_peer_session(peer_device_id);
+        let server_public_key = self.identity.public_key_bytes();
+        let clipboard_key_envelope = encrypt_aead(
+            &session_key,
+            self.clipboard_key.as_bytes(),
+            b"lanvault.clipboard.key.v1",
+        )?;
+        let response_message = pairing_response_message(
+            challenge,
+            &client_ed25519_pubkey,
+            &client_x25519_pubkey,
+            &server_public_key,
+            &server_x25519_pub,
+            &self.device_id,
+            &clipboard_key_envelope,
+        );
+        let response_signature = self.identity.sign(&response_message);
+
+        Ok((
+            PairPinResponse {
+                device_id: self.device_id.clone(),
+                server_ed25519_pubkey_hex: hex::encode(server_public_key),
+                server_x25519_pubkey_hex: hex::encode(server_x25519_pub),
+                server_ed25519_signature_hex: hex::encode(response_signature),
+                clipboard_key_envelope_hex: hex::encode(clipboard_key_envelope),
+                session_cookie: Some(session_token.clone()),
+            },
+            session_token,
+        ))
+    }
+
+    pub fn list_pending_pair_requests(&self) -> Vec<PendingPairRequestDto> {
+        let now = unix_timestamp_secs();
+        self.pending_pair_requests
+            .retain(|_, entry| entry.dto.expires_at > now);
+        let mut items: Vec<PendingPairRequestDto> = self
+            .pending_pair_requests
+            .iter()
+            .filter(|entry| matches!(entry.value().status, PendingPairStatus::Pending))
+            .map(|entry| entry.value().dto.clone())
+            .collect();
+        items.sort_by_key(|item| item.created_at);
+        items
+    }
+
+    pub fn respond_pair_request(
+        &self,
+        request_id: &str,
+        accept: bool,
+    ) -> Result<bool, LanVaultError> {
+        let now = unix_timestamp_secs();
+        self.pending_pair_requests
+            .retain(|_, entry| entry.dto.expires_at > now);
+
+        let Some(mut entry) = self.pending_pair_requests.get_mut(request_id) else {
+            return Err(LanVaultError::NotFound(format!(
+                "pairing request {request_id}"
+            )));
+        };
+        if !matches!(entry.status, PendingPairStatus::Pending) {
+            return Err(LanVaultError::InvalidState(
+                "pairing request was already resolved".to_string(),
+            ));
+        }
+
+        if !accept {
+            entry.status = PendingPairStatus::Rejected;
+            return Ok(false);
+        }
+
+        let (resp, _) = self.complete_pairing_handshake(
+            entry.client_ed25519_pubkey,
+            entry.client_x25519_pubkey,
+            &entry.identity_message,
+            &entry.nonce,
+            entry.dto.device_name.clone(),
+            entry.dto.os_type.clone(),
+            entry.dto.remote_ip.clone(),
+        )?;
+        entry.status = PendingPairStatus::Approved(resp);
+        Ok(true)
+    }
 }
 
 async fn handle_pair_peer(
@@ -1583,10 +1821,10 @@ async fn handle_pair_peer(
     }
 
     let pair_outcome = {
-        let mut pairing_pin = state
-            .pairing_pin
-            .lock()
-            .expect("pairing PIN lock poisoned");
+        let mut pairing_pin = match state.pairing_pin.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let matched = constant_time_eq(req.pin.as_bytes(), pairing_pin.as_bytes());
         let outcome = state.auth.check_and_record_pair_attempt(addr.ip(), matched);
         if matches!(outcome, AuthOutcome::Allowed) {
@@ -1623,69 +1861,246 @@ async fn handle_pair_peer(
         }
     }
 
-    let server_kex = SessionKeyExchange::new();
-    let server_x25519_pub = server_kex.public_key_bytes();
-    let session_key = match server_kex.agree(&client_x25519_pubkey, &identity_message) {
-        Ok(key) => key,
-        Err(err) => return map_domain_error(err),
-    };
+    match state.complete_pairing_handshake(
+        client_ed25519_pubkey,
+        client_x25519_pubkey,
+        &identity_message,
+        &req.pin,
+        req.device_name.trim().to_string(),
+        req.os_type.trim().to_string(),
+        addr.ip().to_string(),
+    ) {
+        Ok((pair_resp, session_token)) => {
+            cookies.add(build_session_cookie(session_token));
+            (StatusCode::OK, Json(pair_resp)).into_response()
+        }
+        Err(err) => map_domain_error(err),
+    }
+}
 
-    let peer_fp = public_key_fingerprint(&client_ed25519_pubkey);
-    let peer_device_id = format!("lv-{}", &peer_fp[..12]);
-    let existing_last_port = match state.db.get_trusted_peer(&peer_device_id) {
-        Ok(existing) => existing.and_then(|peer| peer.last_port),
-        Err(err) => return map_domain_error(err),
-    };
-    let peer = TrustedPeer {
-        device_id: peer_device_id.clone(),
-        device_name: req.device_name,
-        os_type: req.os_type,
-        ed25519_pubkey: client_ed25519_pubkey.to_vec(),
-        last_ip: Some(addr.ip().to_string()),
-        last_port: existing_last_port,
-        auto_connect: true,
-        paired_at: unix_timestamp_secs(),
-        revoked_at: None,
-    };
+async fn handle_pair_request_initiate(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<PairRequestInitiateBody>,
+) -> Response {
+    if let Err(resp) = require_accepting_tasks(&state) {
+        return resp;
+    }
+    if let Some(retry_after_secs) = state.auth.pair_lockout_remaining(addr.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "locked_out",
+                "retry_after_secs": retry_after_secs,
+            })),
+        )
+            .into_response();
+    }
+    if req.nonce.trim().is_empty()
+        || req.device_name.trim().is_empty()
+        || req.os_type.trim().is_empty()
+    {
+        return map_domain_error(LanVaultError::InvalidInput(
+            "nonce, device_name and os_type must not be empty".to_string(),
+        ));
+    }
+    let client_ed25519_pubkey =
+        match decode_hex_32(&req.client_ed25519_pubkey_hex, "client_ed25519_pubkey_hex") {
+            Ok(pk) => pk,
+            Err(err) => return map_domain_error(err),
+        };
+    let client_x25519_pubkey =
+        match decode_hex_32(&req.client_x25519_pubkey_hex, "client_x25519_pubkey_hex") {
+            Ok(pk) => pk,
+            Err(err) => return map_domain_error(err),
+        };
+    let device_name = req.device_name.trim().to_string();
+    let os_type = req.os_type.trim().to_string();
+    let nonce = req.nonce.trim().to_string();
 
-    if let Err(err) = state.db.upsert_trusted_peer(&peer) {
+    let identity_message = pairing_identity_message(
+        &nonce,
+        &client_ed25519_pubkey,
+        &client_x25519_pubkey,
+        &device_name,
+        &os_type,
+    );
+    let signature_bytes = match hex::decode(&req.client_ed25519_signature_hex) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return map_domain_error(LanVaultError::InvalidInput(format!(
+                "invalid client identity signature hex: {err}"
+            )))
+        }
+    };
+    if let Err(err) = verify_ed25519(&client_ed25519_pubkey, &identity_message, &signature_bytes) {
         return map_domain_error(err);
     }
 
-    let session_token = state.auth.issue_peer_session(peer_device_id);
-    cookies.add(build_session_cookie(session_token.clone()));
-    let server_public_key = state.identity.public_key_bytes();
-    let clipboard_key_envelope = match encrypt_aead(
-        &session_key,
-        state.clipboard_key.as_bytes(),
-        b"lanvault.clipboard.key.v1",
-    ) {
-        Ok(envelope) => envelope,
-        Err(err) => return map_domain_error(err),
+    let now = unix_timestamp_secs();
+    state
+        .pending_pair_requests
+        .retain(|_, entry| entry.dto.expires_at > now);
+
+    let fp = public_key_fingerprint(&client_ed25519_pubkey);
+    let device_id = format!("lv-{}", &fp[..12]);
+    let remote_ip = addr.ip().to_string();
+
+    // Deduplicate pending requests from the same device + IP so repeated clicks stay idempotent.
+    let stale_ids: Vec<String> = state
+        .pending_pair_requests
+        .iter()
+        .filter(|e| {
+            e.value().dto.device_id == device_id
+                && e.value().dto.remote_ip == remote_ip
+                && matches!(e.value().status, PendingPairStatus::Pending)
+        })
+        .map(|e| e.key().clone())
+        .collect();
+    for id in stale_ids {
+        state.pending_pair_requests.remove(&id);
+    }
+
+    if state.pending_pair_requests.len() >= MAX_PENDING_PAIR_REQUESTS {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "too_many_pending_pair_requests" })),
+        )
+            .into_response();
+    }
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let mut poll_bytes = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut poll_bytes);
+    let poll_token = hex::encode(poll_bytes);
+    let expires_at = now + PENDING_PAIR_TTL_SECS;
+
+    let dto = PendingPairRequestDto {
+        request_id: request_id.clone(),
+        device_id,
+        device_name,
+        os_type,
+        fingerprint: fp,
+        remote_ip,
+        created_at: now,
+        expires_at,
     };
-    let response_message = pairing_response_message(
-        &req.pin,
-        &client_ed25519_pubkey,
-        &client_x25519_pubkey,
-        &server_public_key,
-        &server_x25519_pub,
-        &state.device_id,
-        &clipboard_key_envelope,
+
+    state.pending_pair_requests.insert(
+        request_id.clone(),
+        PendingPairEntry {
+            dto: dto.clone(),
+            poll_token: poll_token.clone(),
+            nonce,
+            client_ed25519_pubkey,
+            client_x25519_pubkey,
+            identity_message,
+            status: PendingPairStatus::Pending,
+        },
     );
-    let response_signature = state.identity.sign(&response_message);
+
+    let _ = state.ws_tx.send(WsServerEvent::PairingRequested(dto));
 
     (
-        StatusCode::OK,
-        Json(PairPinResponse {
-            device_id: state.device_id.clone(),
-            server_ed25519_pubkey_hex: hex::encode(server_public_key),
-            server_x25519_pubkey_hex: hex::encode(server_x25519_pub),
-            server_ed25519_signature_hex: hex::encode(response_signature),
-            clipboard_key_envelope_hex: hex::encode(clipboard_key_envelope),
-            session_cookie: Some(session_token),
-        }),
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "request_id": request_id,
+            "poll_token": poll_token,
+            "expires_in_secs": PENDING_PAIR_TTL_SECS,
+        })),
     )
         .into_response()
+}
+
+async fn handle_pair_request_status(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PairRequestStatusBody>,
+) -> Response {
+    let now = unix_timestamp_secs();
+    state
+        .pending_pair_requests
+        .retain(|_, entry| entry.dto.expires_at > now);
+
+    let Some(entry) = state.pending_pair_requests.get(&req.request_id) else {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "expired" })),
+        )
+            .into_response();
+    };
+    if !constant_time_eq(req.poll_token.as_bytes(), entry.poll_token.as_bytes()) {
+        return unauthorized_response();
+    }
+
+    match &entry.status {
+        PendingPairStatus::Pending => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "status": "pending" })),
+        )
+            .into_response(),
+        PendingPairStatus::Rejected => {
+            drop(entry);
+            state.pending_pair_requests.remove(&req.request_id);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "status": "rejected" })),
+            )
+                .into_response()
+        }
+        PendingPairStatus::Approved(pair_resp) => {
+            let cloned = pair_resp.clone();
+            drop(entry);
+            state.pending_pair_requests.remove(&req.request_id);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "approved",
+                    "response": cloned,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn handle_list_pair_requests(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<SessionInfo>,
+) -> Response {
+    if let Err(resp) = require_admin(&session) {
+        return resp;
+    }
+    let requests = state.list_pending_pair_requests();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "requests": requests })),
+    )
+        .into_response()
+}
+
+async fn handle_respond_pair_request(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<SessionInfo>,
+    Path(request_id): Path<String>,
+    Json(req): Json<RespondPairRequestBody>,
+) -> Response {
+    if let Err(resp) = require_accepting_tasks(&state) {
+        return resp;
+    }
+    if let Err(resp) = require_admin(&session) {
+        return resp;
+    }
+    match state.respond_pair_request(&request_id, req.accept) {
+        Ok(accepted) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "request_id": request_id,
+                "accepted": accepted,
+            })),
+        )
+            .into_response(),
+        Err(err) => map_domain_error(err),
+    }
 }
 
 async fn handle_delete_peer(
@@ -1880,6 +2295,13 @@ async fn serve_ws_connection(
             event = broadcast_rx.recv() => {
                 match event {
                     Ok(ev) => {
+                        if matches!(
+                            ev,
+                            WsServerEvent::BitRotAlert(_) | WsServerEvent::PairingRequested(_)
+                        ) && connected_device_id.is_some()
+                        {
+                            continue;
+                        }
                         if let WsServerEvent::ClipboardReceived {
                             target_device_id: Some(ref target_id),
                             ..

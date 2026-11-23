@@ -142,6 +142,17 @@ pub async fn serve_with_shutdown(
     shutdown_rx: oneshot::Receiver<()>,
     bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
 ) -> Result<ServerExitReason> {
+    serve_with_shutdown_and_state(config, shutdown_rx, bound_addr_tx, None).await
+}
+
+/// Variant of `serve_with_shutdown` that also returns the live `AppState` to in-process hosts
+/// (used by `lanvault-ffi` for direct interactive pairing approval without HTTP login round-trips).
+pub async fn serve_with_shutdown_and_state(
+    config: ServerConfig,
+    shutdown_rx: oneshot::Receiver<()>,
+    bound_addr_tx: Option<oneshot::Sender<SocketAddr>>,
+    app_state_tx: Option<oneshot::Sender<Arc<AppState>>>,
+) -> Result<ServerExitReason> {
     #[cfg(unix)]
     let vault_root_existed = config.vault_root.exists();
     std::fs::create_dir_all(&config.vault_root)?;
@@ -304,6 +315,7 @@ pub async fn serve_with_shutdown(
         active_chunk_writes: AtomicU64::new(0),
         accepting_tasks: AtomicBool::new(true),
         pairing_pin: std::sync::Mutex::new(pairing_pin),
+        pending_pair_requests: DashMap::new(),
         online_peers: DashMap::new(),
         db: Arc::clone(&db),
         vault_store: Arc::clone(&vault_store),
@@ -313,6 +325,10 @@ pub async fn serve_with_shutdown(
         restart_notify: Arc::clone(&restart_notify),
         telemetry_cache: std::sync::RwLock::new(None),
     });
+
+    if let Some(tx) = app_state_tx {
+        let _ = tx.send(Arc::clone(&state));
+    }
 
     let gc_db = Arc::clone(&db);
     let gc_store = Arc::clone(&vault_store);
