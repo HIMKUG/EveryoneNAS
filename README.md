@@ -612,8 +612,10 @@ R8 Full Mode 下用 `proguard-rules.pro` 严格保留全部 JNI 方法、AIDL �
 | 工具 | 版本 | 用途 |
 | :--- | :--- | :--- |
 | Rust | `stable`（已验证 1.100.0） | 全部 Rust crate |
-| Flutter | `>= 3.24` | 桌面 / Android UI（可选） |
-| Android NDK + `cargo-ndk` | 最新 | Android `.so`（可选） |
+| Flutter | `3.50.0 stable`（已验证） | 桌面 / Android UI |
+| Android NDK | `28.2.13676358`（已验证） | Android `.so` 交叉编译 |
+| JDK | `17`（已验证 17.0.21） | Gradle / AGP 9 |
+| Android Gradle Plugin | `9.3.1`（已验证） | Android 构建 |
 | Node.js | 任意 | 仅用于 `node --check` 语法校验（可选） |
 
 ### 1. 克隆
@@ -678,6 +680,24 @@ flutter analyze
 flutter build windows --release
 ```
 
+### 6. Android APK
+
+```powershell
+# 先交叉编译 arm64 原生库并放进 jniLibs
+$env:CC_aarch64_linux_android = "$env:ANDROID_HOME\ndk\28.2.13676358\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android26-clang.cmd"
+$env:CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER = $env:CC_aarch64_linux_android
+cargo build --release -p lanvault-ffi --target aarch64-linux-android
+
+Copy-Item target\aarch64-linux-android\release\liblanvault_ffi.so `
+  flutter_app\android\app\src\main\jniLibs\arm64-v8a\ -Force
+
+cd flutter_app
+flutter build apk --release --target-platform android-arm64
+```
+
+产物 `build/app/outputs/flutter-apk/app-release.apk` 内含三个 arm64 共享库：
+`libapp.so`（AOT Dart）、`libflutter.so`（引擎）、`liblanvault_ffi.so`（Rust 内核）。
+
 ---
 
 ## 项目结构
@@ -736,6 +756,7 @@ EveryoneNAS/
 │   │   ├── bridge/lanvault_bridge.dart  FFI 绑定
 │   │   ├── features/**             五个功能页
 │   │   └── theme/neu_theme.dart    跨端主题
+│   ├── windows/                    CMake runner + AVX2/LTCG Release 模板
 │   └── android/app/src/main/kotlin/com/lanvault/app/
 │       ├── MainActivity.kt
 │       ├── privilege/*.kt          四级保活
@@ -758,6 +779,10 @@ EveryoneNAS/
 | 单元测试 | `cargo test --workspace` | ✅ 11 passed / 0 failed |
 | 发布构建 | `cargo build --workspace --release` | ✅ 1m36s，产物 4.7 MB / 4.9 MB / 7.0 MB |
 | JS 语法 | `node --check web-ui/js/*.js` | ✅ 5/5 通过 |
+| Flutter 静态分析 | `flutter analyze` | ✅ No issues found |
+| Flutter Windows 构建 | `flutter build windows --release` | ✅ 32s，实机启动无 panic |
+| Flutter Android 构建 | `flutter build apk --release` | ✅ 22.8 MB，含 `lib/arm64-v8a/liblanvault_ffi.so` |
+| Android 交叉编译 | `cargo build --target aarch64-linux-android` | ✅ 0 warning，JNI/ABI 符号齐全 |
 | 真实启动冒烟 | 启动服务端 → 静态页 + 登录 + 遥测 | ✅ HTTP 200 / 认证成功 / 状态 JSON 正确 |
 
 冒烟测试实测响应：
@@ -785,12 +810,19 @@ EveryoneNAS/
 | `crates/lanvault-ffi/c_abi.rs` | 公开 C-ABI 函数解引用裸指针却未标 `unsafe` | 加 `unsafe extern "C"` + `# Safety` 文档 |
 | `crates/lanvault-win-svc/volume_guid.rs` | `guid_for_mount_path` 无调用方 | 保留为诊断入口并标注 `#[allow(dead_code)]` |
 | `Cargo.toml` | `static-serve 0.4` 在运行时 panic（路由路径必须以 `/` 开头） | 升级到 `0.6.4` |
+| `windows/CMakeLists.txt` | `runner` 是独立 CMake 子工程，跨目录挂 `POST_BUILD` 报 "TARGET was not created in this directory" | 改为 ALL 自定义目标并 `DEPENDS` 可执行文件 |
+| `sync_engine` 冷启动路径 | `start_client_background_tasks` 无 ambient Tokio runtime 就 `tokio::spawn`，Windows 桌面端启动即 panic | 函数入口统一 `runtime.enter()` |
+| `c_abi.rs` JNI | `return -2` 作用于 `u8` 返回类型（Android 端编译失败） | Kotlin 侧是 `Boolean`，改为记录日志后返回 `false` |
+| `.cargo/config.toml` | aarch64 的 `+crc` 是 unstable 目标特性，rustc 告警 | 移除，保留 `+neon,+aes,+sha2` |
+| `backup_screen.dart` | `dangerColor`/`healthyColor`/`borderRadius`/`label` 四个 Widdget 参数名与主题定义不符 | 改用 `NeuTokens.danger`/`NeuTokens.healthy`/`radius`/`title` |
+| `flutter_app/android` | AGP 8.7.3 低于 Flutter 3.50 要求的 9.1.1；`kotlin-android` 与 AGP 9 内置 Kotlin 冲突；`configuration-cache` 无法序列化 `ReleaseMinSdkCheck` | 升级 AGP 9.3.1 / Kotlin 2.4.20、移除 kotlin 插件改用 `compilerOptions`、关闭配置缓存 |
+| `flutter_app/lib` | `package:flutter/material.dart` 在 Flutter 3.50 已废弃 | 迁移到 `package:material_ui/material_ui.dart` |
 
 ### 已知限制
 
-- **Flutter 端未在本机编译**：构建机未安装 Flutter SDK，`flutter analyze` / `flutter build` 未执行。Rust 侧 FFI 符号与 Dart 侧 `lookupFunction` 声明已逐项比对一致。
-- **Android 端未在本机编译**：需要 NDK 与 `cargo-ndk`，本机缺失。
-- 冒烟测试覆盖了启动、静态资源、登录、遥测；**未**覆盖多设备真实配对、跨设备传输与断网重连的端到端场景。
+- 冒烟测试覆盖了服务端启动、静态资源、登录、遥测，以及 Windows 桌面端实机启动；**未**覆盖多设备真实配对、跨设备传输与断网重连的端到端场景。
+- Android APK 已构建并确认包含 `liblanvault_ffi.so` 与全部 JNI/ABI 导出符号，但**未在真机上安装运行**。
+- Android 构建在本机用 NDK clang 直接交叉编译（`cargo-ndk` 未安装），`scripts/build_android_release.ps1` 仍按 `cargo-ndk` 编写，未在本机端到端执行。
 
 ---
 
@@ -802,6 +834,7 @@ EveryoneNAS/
 - [ ] 增量同步断点续传（当前为整文件重传失败块）
 - [ ] 快照差异浏览（`GET /api/snapshots/{a}/diff/{b}`）
 - [ ] ARM64 Windows 与 Linux 服务端发行件
+- [ ] Android 真机端到端验证（当前仅构建与符号校验通过）
 - [ ] 审计导出：把巡检与配对事件写为可签名日志
 
 ---
