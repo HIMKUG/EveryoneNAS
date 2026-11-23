@@ -118,6 +118,18 @@ struct SetSyncPausedPayload {
 }
 
 #[derive(Deserialize)]
+struct RequestPairingPayload {
+    ip: String,
+    port: u16,
+}
+
+#[derive(Deserialize)]
+struct RespondPairRequestPayload {
+    request_id: String,
+    accept: bool,
+}
+
+#[derive(Deserialize)]
 struct SetSyncRuleSchedulePayload {
     rule_id: String,
     schedule_mode: String,
@@ -154,6 +166,30 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
                 serde_json::from_str(payload_json).context("invalid pair_with_pin JSON payload")?;
             let device_id = api::block_on(api::pair_with_pin(req.ip, req.port, req.pin))??;
             Ok(json!({ "ok": true, "device_id": device_id }))
+        }
+        "request_pairing" => {
+            let req: RequestPairingPayload = serde_json::from_str(payload_json)
+                .context("invalid request_pairing JSON payload")?;
+            let device_id = api::block_on(api::request_pairing(req.ip, req.port))??;
+            Ok(json!({ "ok": true, "device_id": device_id }))
+        }
+        "list_pending_pair_requests" => {
+            let requests = api::block_on(api::list_pending_pair_requests())??;
+            Ok(json!({ "ok": true, "requests": requests }))
+        }
+        "respond_pair_request" => {
+            let req: RespondPairRequestPayload = serde_json::from_str(payload_json)
+                .context("invalid respond_pair_request JSON payload")?;
+            let accepted = api::block_on(api::respond_pair_request(req.request_id, req.accept))??;
+            Ok(json!({ "ok": true, "accepted": accepted }))
+        }
+        "scan_windows_networks" => {
+            let scan = api::block_on(api::scan_windows_networks())??;
+            let mut obj = serde_json::to_value(scan)?;
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("ok".to_string(), json!(true));
+            }
+            Ok(obj)
         }
         "enable_auto_reconnect" => {
             let req: EnableAutoReconnectPayload = serde_json::from_str(payload_json)
@@ -523,6 +559,56 @@ pub unsafe extern "C" fn lanvault_ffi_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         unsafe {
             drop(CString::from_raw(ptr));
+        }
+    }
+}
+
+/// 将捆绑的 `.woff2` 字体字节流在 Rust 原生层解压为 SFNT (`.otf`/`.ttf`)，供 Flutter `FontLoader` 跨平台注册。
+/// 返回 `0` 表示成功（调用方须调用 `lanvault_ffi_free_bytes(*out_ptr, *out_len)` 释放），非 0 表示失败。
+///
+/// # Safety
+///
+/// `woff2_ptr` 须指向至少 `woff2_len` 字节的只读内存；`out_ptr` 与 `out_len` 须为有效可写指针。
+#[no_mangle]
+pub unsafe extern "C" fn lanvault_ffi_decode_woff2(
+    woff2_ptr: *const u8,
+    woff2_len: usize,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    let outcome = std::panic::catch_unwind(|| -> i32 {
+        if woff2_ptr.is_null() || out_ptr.is_null() || out_len.is_null() || woff2_len == 0 {
+            return -1;
+        }
+        let input = unsafe { std::slice::from_raw_parts(woff2_ptr, woff2_len) };
+        match lanvault_core::decode_woff2_to_sfnt(input) {
+            Ok(sfnt) => {
+                let mut boxed = sfnt.into_boxed_slice();
+                let len = boxed.len();
+                let ptr = boxed.as_mut_ptr();
+                std::mem::forget(boxed);
+                unsafe {
+                    *out_ptr = ptr;
+                    *out_len = len;
+                }
+                0
+            }
+            Err(_) => -2,
+        }
+    });
+    outcome.unwrap_or(-3)
+}
+
+/// 释放由 `lanvault_ffi_decode_woff2` 分配的字节缓冲区。
+///
+/// # Safety
+///
+/// `ptr` 与 `len` 必须来自 `lanvault_ffi_decode_woff2` 的输出，且仅释放一次。
+#[no_mangle]
+pub unsafe extern "C" fn lanvault_ffi_free_bytes(ptr: *mut u8, len: usize) {
+    if !ptr.is_null() && len > 0 {
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)));
         }
     }
 }
