@@ -1,0 +1,329 @@
+/**
+ * LanVault Accessible Neumorphism Design Tokens & Base Controls
+ *
+ * Reference basis:
+ * - Apple Human Interface Guidelines (Motion, ConcentricRectangle, Buttons 44pt/48dp)
+ * - W3C WCAG 2.2 AA (Body >= 4.5:1, Non-text UI boundaries & states >= 3:1)
+ * - /working_dir/c_0c10370daccfa96e/lanvault/ARCHITECTURE_CONTRACTS.md (Section 6)
+ *
+ * 1:1 Token Parity with Flutter (flutter_app/lib/theme/neu_theme.dart):
+ * - Base surface #E6E9EF with 135deg dual shadows (#FFFFFF / #C5CCD8)
+ * - Body ink #1E293B (>11:1 contrast) & secondary ink #475569 (>5.9:1 contrast)
+ * - Semantic status colors & control outlines strictly >= 3:1 contrast on #E6E9EF
+ * - Concentric radii: card 20px, group 14px, control 12px, inner 10px, pill 999px
+ * - Unified Apple motion: press 220ms, state 280ms, reduced 120ms, ease-apple cubic-bezier(0.22, 1, 0.36, 1)
+ */
+
+:root {
+  /* Surface & Ink Palette */
+  --lv-bg: #E6E9EF;
+  --lv-surface: #E6E9EF;
+  --lv-surface-sunk: #DCE1EA;
+  --lv-ink-primary: #1E293B;
+  --lv-ink-secondary: #475569;
+  --lv-ink-inverse: #FFFFFF;
+
+  /* 135deg Light-Source Dual Shadows */
+  --lv-shadow-light: #FFFFFF;
+  --lv-shadow-dark: #C5CCD8;
+  --lv-shadow-extruded: 6px 6px 12px var(--lv-shadow-dark), -6px -6px 12px var(--lv-shadow-light);
+  --lv-shadow-control: 4px 4px 9px var(--lv-shadow-dark), -4px -4px 9px var(--lv-shadow-light);
+  --lv-shadow-inset: inset 3px 3px 6px var(--lv-shadow-dark), inset -3px -3px 6px var(--lv-shadow-light);
+  --lv-shadow-pressed: inset 2px 2px 5px var(--lv-shadow-dark), inset -2px -2px 5px var(--lv-shadow-light);
+
+  /* Accessible Control Hairline, Outline (>= 3:1) & Focus Ring */
+  --lv-border-hairline: rgba(30, 41, 59, 0.14);
+  --lv-control-outline: #64748B;
+  --lv-focus-ring: #1D4ED8;
+
+  /* Semantic Status Colors (>= 3:1 non-text & >= 4.5:1 text on #E6E9EF) */
+  --lv-status-ok: #0F766E;
+  --lv-status-ok-alt: #15803D;
+  --lv-status-warn: #B45309;
+  --lv-status-danger: #B91C1C;
+  --lv-accent: #1D4ED8;
+  --lv-accent-pressed: #1E40AF;
+
+  /* 4pt / 8pt Spacing Scale */
+  --lv-space-1: 4px;
+  --lv-space-2: 8px;
+  --lv-space-3: 12px;
+  --lv-space-4: 16px;
+  --lv-space-5: 20px;
+  --lv-space-6: 24px;
+  --lv-space-8: 32px;
+
+  /* Apple Concentric Radii (inner = max(8px, outer - padding)) */
+  --lv-radius-card: 20px;
+  --lv-radius-group: 14px;
+  --lv-radius-control: 12px;
+  --lv-radius-inner: 10px;
+  --lv-radius-pill: 999px;
+
+  /* Touch & Typography */
+  --lv-touch-min: 44px;
+  --lv-touch-mobile: 48px;
+  --lv-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --lv-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+
+  /* Unified Apple HIG Motion Tokens (1:1 with Flutter NeuMotion) */
+  --lv-dur-press: 220ms;
+  --lv-dur-state: 280ms;
+  --lv-dur-reduced: 120ms;
+  --lv-ease-apple: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 16px;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background-color: var(--lv-bg);
+  color: var(--lv-ink-primary);
+  font-family: var(--lv-font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Focus Accessibility (>= 3:1 ring) */
+:focus-visible {
+  outline: 2px solid var(--lv-focus-ring);
+  outline-offset: 2px;
+}
+
+/* Extruded Surface (Cards & Panels) */
+.neu-surface {
+  background-color: var(--lv-surface);
+  border: 1px solid var(--lv-border-hairline);
+  border-radius: var(--lv-radius-card);
+  box-shadow: var(--lv-shadow-extruded);
+}
+
+/* Inset Surface (Inputs, Capacity Slots, Logs, Timeline Wells) */
+.neu-inset {
+  background-color: var(--lv-surface);
+  border: 1px solid var(--lv-border-hairline);
+  border-radius: var(--lv-radius-control);
+  box-shadow: var(--lv-shadow-inset);
+}
+
+/* Extruded Interactive Button (>= 44x44px desktop, >= 48px coarse pointer) */
+.neu-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--lv-space-2);
+  min-height: var(--lv-touch-min);
+  min-width: var(--lv-touch-min);
+  padding: 0 var(--lv-space-4);
+  border: 1px solid var(--lv-border-hairline);
+  border-radius: var(--lv-radius-control);
+  background-color: var(--lv-surface);
+  color: var(--lv-ink-primary);
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  user-select: none;
+  touch-action: manipulation;
+  box-shadow: var(--lv-shadow-control);
+  transition:
+    box-shadow var(--lv-dur-press) var(--lv-ease-apple),
+    transform var(--lv-dur-press) var(--lv-ease-apple),
+    background-color var(--lv-dur-press) var(--lv-ease-apple),
+    color var(--lv-dur-press) var(--lv-ease-apple),
+    border-color var(--lv-dur-press) var(--lv-ease-apple);
+}
+
+.neu-btn:active,
+.neu-btn[data-pressed="true"],
+.neu-btn[aria-pressed="true"] {
+  box-shadow: var(--lv-shadow-pressed);
+  transform: scale(0.97);
+}
+
+.neu-btn:disabled {
+  opacity: 0.52;
+  cursor: not-allowed;
+  box-shadow: none;
+  transform: none;
+}
+
+.neu-btn--primary {
+  background-color: var(--lv-accent);
+  border-color: var(--lv-accent);
+  color: var(--lv-ink-inverse);
+}
+
+.neu-btn--primary:active,
+.neu-btn--primary[data-pressed="true"] {
+  background-color: var(--lv-accent-pressed);
+  box-shadow: inset 2px 2px 5px rgba(15, 23, 42, 0.35);
+}
+
+.neu-btn--danger {
+  color: var(--lv-status-danger);
+  border-color: rgba(185, 28, 28, 0.4);
+}
+
+.neu-btn--ok {
+  color: var(--lv-status-ok);
+  border-color: rgba(15, 118, 110, 0.4);
+}
+
+.neu-btn--pill {
+  border-radius: var(--lv-radius-pill);
+}
+
+.neu-btn--compact {
+  padding: 0 var(--lv-space-3);
+  font-size: 14px;
+}
+
+/* Inset Inputs, Selects & Textareas (>= 16px font size to prevent mobile zoom) */
+.neu-input,
+.neu-select,
+.neu-textarea {
+  width: 100%;
+  min-height: var(--lv-touch-min);
+  padding: var(--lv-space-2) var(--lv-space-3);
+  border: 1px solid rgba(100, 116, 139, 0.55);
+  border-radius: var(--lv-radius-control);
+  background-color: var(--lv-surface);
+  color: var(--lv-ink-primary);
+  font-family: inherit;
+  font-size: 16px;
+  line-height: 1.4;
+  box-shadow: var(--lv-shadow-inset);
+  transition:
+    border-color var(--lv-dur-press) var(--lv-ease-apple),
+    box-shadow var(--lv-dur-press) var(--lv-ease-apple);
+}
+
+.neu-textarea {
+  min-height: 88px;
+  resize: vertical;
+}
+
+.neu-input::placeholder,
+.neu-textarea::placeholder {
+  color: var(--lv-ink-secondary);
+}
+
+.neu-input:focus,
+.neu-select:focus,
+.neu-textarea:focus {
+  border-color: var(--lv-focus-ring);
+}
+
+.neu-input:disabled,
+.neu-select:disabled,
+.neu-textarea:disabled {
+  background-color: var(--lv-surface-sunk);
+  color: var(--lv-ink-secondary);
+  cursor: not-allowed;
+}
+
+/* Inset Progress Track (280ms Apple state transition) */
+.neu-track {
+  position: relative;
+  width: 100%;
+  height: 12px;
+  padding: 2px;
+  border-radius: var(--lv-radius-pill);
+  border: 1px solid rgba(100, 116, 139, 0.45);
+  background-color: var(--lv-surface);
+  box-shadow: var(--lv-shadow-inset);
+  overflow: hidden;
+}
+
+.neu-track__fill {
+  height: 100%;
+  width: 0%;
+  border-radius: var(--lv-radius-pill);
+  background-color: var(--lv-accent);
+  transition: width var(--lv-dur-state) var(--lv-ease-apple);
+}
+
+.neu-track__fill--ok {
+  background-color: var(--lv-status-ok);
+}
+
+.neu-track__fill--warn {
+  background-color: var(--lv-status-warn);
+}
+
+.neu-track__fill--danger {
+  background-color: var(--lv-status-danger);
+}
+
+/* Semantic Status Text Utilities */
+.status-ok {
+  color: var(--lv-status-ok);
+}
+
+.status-warn {
+  color: var(--lv-status-warn);
+}
+
+.status-danger {
+  color: var(--lv-status-danger);
+}
+
+.mono {
+  font-family: var(--lv-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* Mobile Coarse Pointer: >= 48px touch target */
+@media (pointer: coarse) {
+  .neu-btn,
+  .neu-input,
+  .neu-select {
+    min-height: var(--lv-touch-mobile);
+  }
+}
+
+/* Reduced Motion: degrade to unified 120ms short fade instead of 0ms jump */
+@media (prefers-reduced-motion: reduce) {
+  .neu-btn,
+  .neu-input,
+  .neu-select,
+  .neu-textarea,
+  .neu-track__fill {
+    transition:
+      opacity var(--lv-dur-reduced) ease-out,
+      background-color var(--lv-dur-reduced) ease-out,
+      color var(--lv-dur-reduced) ease-out,
+      border-color var(--lv-dur-reduced) ease-out;
+  }
+
+  .neu-btn:active,
+  .neu-btn[data-pressed="true"],
+  .neu-btn[aria-pressed="true"] {
+    transform: none;
+  }
+}

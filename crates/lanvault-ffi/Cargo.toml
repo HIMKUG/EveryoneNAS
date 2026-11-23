@@ -1,0 +1,21 @@
+[package]
+name = "lanvault-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+lanvault-core = { path = "../lanvault-core" }
+lanvault-server = { path = "../lanvault-server", features = ["embed-web-ui"] }
+lanvault-client = { path = "../lanvault-client" }
+flutter_rust_bridge.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+hex.workspace = true

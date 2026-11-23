@@ -1,0 +1,23 @@
+# LanVault 最高性能发行版编译配置（面向 8 核 16 线程构建主机）
+
+[build]
+jobs = 16
+
+[target.x86_64-pc-windows-msvc]
+# 本机极限性能构建（AVX2/FMA/AES-NI 等指令集全开）与 MSVC 链接器死代码/重复段折叠。
+# 如需跨机分发至不同 x86_64 CPU 主机，请将 "-C", "target-cpu=native" 替换为：
+# "-C", "target-feature=+avx2,+fma,+bmi2"
+rustflags = [
+    "-C", "target-cpu=native",
+    "-C", "link-arg=/OPT:REF",
+    "-C", "link-arg=/OPT:ICF",
+]
+
+[target.aarch64-linux-android]
+# 启用 ARM64 硬件 NEON / CRC32 / AES / SHA 加密指令加速（覆盖 blake3/chacha20poly1305/zstd）
+rustflags = [
+    "-C", "target-feature=+neon,+crc,+crypto",
+]
+
+[env]
+CARGO_BUILD_JOBS = "16"

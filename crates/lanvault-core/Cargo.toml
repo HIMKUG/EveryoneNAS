@@ -1,0 +1,24 @@
+[package]
+name = "lanvault-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rusqlite = { workspace = true }
+ed25519-dalek = { workspace = true }
+x25519-dalek = { workspace = true }
+chacha20poly1305 = { workspace = true }
+blake3 = { workspace = true }
+zeroize = { workspace = true }
+rand = { workspace = true }
+fastcdc = { workspace = true }
+zstd = { workspace = true }
+mdns-sd = { workspace = true }
+hex = { workspace = true }
+uuid = { workspace = true }

@@ -1,0 +1,6 @@
+id=lanvault_daemon
+name=LanVault Native Rust Daemon (Level 3)
+version=v1.0.0
+versionCode=10000
+author=LanVault Engineering
+description=Runs pure Rust lanvault-server static binary at late_start with watchdog and oom_score_adj=-1000 protection, completely independent of Android ART.

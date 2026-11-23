@@ -1,0 +1,20 @@
+[package]
+name = "lanvault-win-svc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lanvault-core = { path = "../lanvault-core" }
+lanvault-server = { path = "../lanvault-server" }
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service.workspace = true
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }

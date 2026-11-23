@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<!--
+  EveryoneNAS Local Area Network Web Management Console
+  Reference basis:
+  - /working_dir/c_0c10370daccfa96e/lanvault/ARCHITECTURE_CONTRACTS.md
+  - /working_dir/c_0c10370daccfa96e/lanvault/vendor_refs/web-neumorphism-ui/src/index.html
+  Zero build dependencies; embedded directly by Rust static-serve.
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EveryoneNAS 局域网管理台</title>
+  <link rel="stylesheet" href="./css/neumorphism-tokens.css">
+  <link rel="stylesheet" href="./css/dashboard.css">
+</head>
+<body>
+  <!-- Cookie Auth Lock Screen Overlay -->
+  <section id="auth-overlay" class="auth-overlay" aria-modal="true" role="dialog" aria-labelledby="auth-title">
+    <div class="neu-surface auth-card">
+      <h1 id="auth-title" class="auth-card__title">EveryoneNAS 管理台登录</h1>
+
+      <form id="login-form" class="form-stack" autocomplete="off">
+        <div class="field">
+          <label class="field__label" for="login-password">管理密码</label>
+          <input
+            id="login-password"
+            name="password"
+            type="password"
+            class="neu-input"
+            placeholder="请输入宿主机管理密码"
+            required
+            autocomplete="current-password"
+          >
+        </div>
+
+        <p id="login-error" class="feedback-line status-danger" role="alert" aria-live="polite"></p>
+
+        <div id="lockout-box" class="lockout-box" hidden>
+          <p id="lockout-text" class="lockout-box__text">连续密码错误已锁定，请等待 60 秒</p>
+          <div class="neu-track" role="progressbar" aria-label="锁定剩余时间" aria-valuemin="0" aria-valuemax="60" aria-valuenow="60">
+            <div id="lockout-progress" class="neu-track__fill neu-track__fill--danger"></div>
+          </div>
+        </div>
+
+        <button id="login-submit" type="submit" class="neu-btn neu-btn--primary">解锁进入</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- Main Authenticated Console -->
+  <div id="app-shell" class="app-shell" hidden>
+    <!-- Persistent Top Status Capsule -->
+    <header class="status-capsule" aria-label="系统实时状态">
+      <div class="capsule-brand">
+        <h1 class="capsule-brand__title">EveryoneNAS</h1>
+        <span id="ws-state" class="capsule-item__value status-warn">连接中…</span>
+      </div>
+
+      <div class="capsule-metrics">
+        <div class="capsule-item">
+          <span class="capsule-item__label">保活等级</span>
+          <span id="cap-keepalive" class="capsule-item__value">--</span>
+        </div>
+
+        <div class="capsule-item capsule-item--storage">
+          <span class="capsule-item__label">空间水位</span>
+          <span id="cap-storage-text" class="capsule-item__value">0 B / 0 B</span>
+          <div class="neu-track" aria-hidden="true">
+            <div id="cap-storage-fill" class="neu-track__fill neu-track__fill--ok"></div>
+          </div>
+        </div>
+
+        <div class="capsule-item">
+          <span class="capsule-item__label">实时吞吐</span>
+          <span id="cap-throughput" class="capsule-item__value mono">0 B/s</span>
+        </div>
+
+        <div class="capsule-item">
+          <span class="capsule-item__label">数据健康</span>
+          <span id="cap-bitrot" class="capsule-item__value status-ok">正常</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Live System Alert Banner (Restarting / Bit-Rot) -->
+    <div id="system-banner" class="system-banner" role="status" aria-live="polite" hidden>
+      <span id="system-banner-text"></span>
+      <button id="system-banner-dismiss" type="button" class="neu-btn neu-btn--compact">关闭</button>
+    </div>
+
+    <!-- 4 Cognitive Blocks Grid -->
+    <main class="dashboard-grid">
+      <!-- Block 1: Service & Keep-Alive -->
+      <section class="neu-surface block-card" aria-labelledby="block-service-title">
+        <div class="block-header">
+          <h2 id="block-service-title" class="block-title">服务与保活</h2>
+          <div class="block-actions">
+            <button id="btn-refresh-status" type="button" class="neu-btn neu-btn--compact">刷新状态</button>
+            <button id="btn-graceful-restart" type="button" class="neu-btn neu-btn--danger neu-btn--compact">一键优雅重启</button>
+          </div>
+        </div>
+
+        <div class="kv-grid">
+          <div class="kv-cell">
+            <span class="kv-cell__label">运行平台</span>
+            <span id="svc-os" class="kv-cell__value">--</span>
+          </div>
+          <div class="kv-cell">
+            <span class="kv-cell__label">保活通道</span>
+            <span id="svc-keepalive" class="kv-cell__value">--</span>
+          </div>
+          <div class="kv-cell">
+            <span class="kv-cell__label">局域网地址</span>
+            <span id="svc-lan" class="kv-cell__value mono">--</span>
+          </div>
+          <div class="kv-cell">
+            <span class="kv-cell__label">运行时间</span>
+            <span id="svc-uptime" class="kv-cell__value mono">--</span>
+          </div>
+        </div>
+
+        <p id="svc-feedback" class="feedback-line" aria-live="polite"></p>
+
+        <details class="adv-drawer">
+          <summary class="adv-drawer__summary">
+            <span>高级参数与通道诊断</span>
+            <span class="adv-drawer__chevron" aria-hidden="true">▾</span>
+          </summary>
+          <div class="adv-drawer__body">
+            <div class="kv-grid">
+              <div class="kv-cell">
+                <span class="kv-cell__label">mDNS 广播</span>
+                <span id="adv-mdns" class="kv-cell__value">--</span>
+              </div>
+              <div class="kv-cell">
+                <span class="kv-cell__label">损坏块计数</span>
+                <span id="adv-corrupted" class="kv-cell__value mono">0</span>
+              </div>
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <!-- Block 3: Paired Devices -->
+      <section class="neu-surface block-card" aria-labelledby="block-peers-title">
+        <div class="block-header">
+          <h2 id="block-peers-title" class="block-title">已配对设备</h2>
+          <div class="block-actions">
+            <button id="btn-refresh-peers" type="button" class="neu-btn neu-btn--compact">刷新设备</button>
+          </div>
+        </div>
+
+        <div class="neu-inset pairing-box">
+          <div id="pairing-qr" class="qr-frame" aria-label="配对二维码"></div>
+          <div class="pairing-info">
+            <span class="field__label">6 位配对码</span>
+            <div id="pairing-pin" class="pin-code">------</div>
+            <div id="pairing-uri" class="pairing-uri">--</div>
+            <div class="block-actions">
+              <button id="btn-copy-pin" type="button" class="neu-btn neu-btn--compact">复制配对码</button>
+              <button id="btn-copy-uri" type="button" class="neu-btn neu-btn--compact">复制配对链接</button>
+            </div>
+          </div>
+        </div>
+
+        <ul id="peer-list" class="peer-list" aria-live="polite"></ul>
+        <p id="peer-feedback" class="feedback-line" aria-live="polite"></p>
+      </section>
+
+      <!-- Block 2: Storage Space, GFS Snapshots & Bit-Rot Scrubbing -->
+      <section class="neu-surface block-card block-card--wide" aria-labelledby="block-storage-title">
+        <div class="block-header">
+          <h2 id="block-storage-title" class="block-title">存储空间与快照</h2>
+          <div class="block-actions">
+            <button id="btn-trigger-scrub" type="button" class="neu-btn neu-btn--ok neu-btn--compact">手动巡检校验</button>
+            <button id="btn-refresh-vaults" type="button" class="neu-btn neu-btn--compact">刷新空间</button>
+          </div>
+        </div>
+
+        <div id="vault-list" class="vault-list" aria-live="polite"></div>
+
+        <!-- Collapsible Create Vault Drawer -->
+        <details id="create-vault-drawer" class="adv-drawer">
+          <summary class="adv-drawer__summary">
+            <span>新建存储空间（单盘 / 串联 / 双盘镜像）</span>
+            <span class="adv-drawer__chevron" aria-hidden="true">▾</span>
+          </summary>
+          <div class="adv-drawer__body">
+            <form id="create-vault-form" class="form-stack">
+              <div class="form-row">
+                <div class="field">
+                  <label class="field__label" for="vault-name">空间名称</label>
+                  <input id="vault-name" name="name" type="text" class="neu-input" placeholder="例如：家庭相册主库" required>
+                </div>
+                <div class="field">
+                  <label class="field__label" for="vault-mode">存储池模式</label>
+                  <select id="vault-mode" name="pool_mode" class="neu-select">
+                    <option value="single">单盘模式 (single)</option>
+                    <option value="striped">多盘串联扩容 (striped)</option>
+                    <option value="mirror_raid1">双盘同步镜像 (mirror_raid1)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="form-row">
+                <div class="field">
+                  <label class="field__label" for="vault-mount">主卷挂载路径</label>
+                  <input id="vault-mount" name="mount_path" type="text" class="neu-input mono" placeholder="D:\EveryoneNAS 或 /storage/emulated/0/EveryoneNAS" required>
+                </div>
+                <div class="field">
+                  <label class="field__label" for="vault-guid">主卷 Volume GUID（可选）</label>
+                  <input id="vault-guid" name="volume_guid" type="text" class="neu-input mono" placeholder="\\?\Volume{xxxxxxxx-xxxx-...}\">
+                </div>
+              </div>
+
+              <div class="form-row">
+                <div class="field">
+                  <label class="field__label" for="vault-quota-gb">容量配额（GB）</label>
+                  <input id="vault-quota-gb" name="quota_gb" type="number" min="1" step="1" value="100" class="neu-input mono" required>
+                </div>
+                <div class="field field--inline">
+                  <input id="vault-e2ee" name="e2ee_enabled" type="checkbox" checked>
+                  <label class="field__label" for="vault-e2ee">启用客户端零知识加密（E2EE）</label>
+                </div>
+              </div>
+
+              <div id="extra-volumes-section" class="extra-volumes-box" hidden>
+                <div class="block-header">
+                  <span class="field__label">附加磁盘卷（串联或镜像目标）</span>
+                  <button id="btn-add-extra-vol" type="button" class="neu-btn neu-btn--compact">添加磁盘卷</button>
+                </div>
+                <div id="extra-volumes-list" class="form-stack"></div>
+              </div>
+
+              <div class="block-actions">
+                <button id="btn-create-vault" type="submit" class="neu-btn neu-btn--primary">创建存储空间</button>
+              </div>
+              <p id="vault-feedback" class="feedback-line" aria-live="polite"></p>
+            </form>
+          </div>
+        </details>
+
+        <!-- GFS Snapshot Timeline -->
+        <div class="timeline-controls">
+          <div class="field" style="min-width: 220px;">
+            <label class="field__label" for="snapshot-vault-select">快照所属空间</label>
+            <select id="snapshot-vault-select" class="neu-select"></select>
+          </div>
+          <div id="tier-filters" class="tier-filters" role="group" aria-label="按保留层级筛选快照">
+            <button type="button" class="neu-btn neu-btn--pill neu-btn--compact" data-tier="all" aria-pressed="true">全部</button>
+            <button type="button" class="neu-btn neu-btn--pill neu-btn--compact" data-tier="hourly" aria-pressed="false">每小时</button>
+            <button type="button" class="neu-btn neu-btn--pill neu-btn--compact" data-tier="daily" aria-pressed="false">每日</button>
+            <button type="button" class="neu-btn neu-btn--pill neu-btn--compact" data-tier="weekly" aria-pressed="false">每周</button>
+            <button type="button" class="neu-btn neu-btn--pill neu-btn--compact" data-tier="monthly" aria-pressed="false">每月</button>
+            <button type="button" class="neu-btn neu-btn--pill neu-btn--compact" data-tier="pinned" aria-pressed="false">永久固定</button>
+          </div>
+        </div>
+
+        <div id="snapshot-timeline" class="neu-inset timeline-well" aria-live="polite"></div>
+        <p id="timeline-feedback" class="feedback-line" aria-live="polite"></p>
+
+        <!-- Bit-Rot Scrub Results & Real-Time Alerts -->
+        <div class="scrub-panel">
+          <span class="field__label">Bit-Rot 巡检与自愈记录</span>
+          <div id="scrub-log" class="neu-inset log-well" aria-live="polite">
+            <p class="empty-state">暂无巡检记录</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- Block 4: Security Logout & LAN Clipboard Quick-Transfer -->
+      <section class="neu-surface block-card block-card--wide" aria-labelledby="block-security-title">
+        <div class="block-header">
+          <h2 id="block-security-title" class="block-title">安全与局域网快传</h2>
+          <div class="block-actions">
+            <button id="btn-logout" type="button" class="neu-btn neu-btn--danger neu-btn--compact">安全登出</button>
+          </div>
+        </div>
+
+        <form id="clipboard-form" class="form-stack">
+          <div class="form-row">
+            <div class="field">
+              <label class="field__label" for="clip-target">目标设备</label>
+              <select id="clip-target" name="target_device_id" class="neu-select">
+                <option value="">全部在线已配对设备</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="field__label" for="clip-kind">快传类型</label>
+              <select id="clip-kind" name="kind" class="neu-select">
+                <option value="text">文本剪贴板</option>
+                <option value="file">临时文本文件</option>
+              </select>
+            </div>
+          </div>
+
+          <div id="clip-filename-field" class="field" hidden>
+            <label class="field__label" for="clip-filename">文件名</label>
+            <input id="clip-filename" name="filename" type="text" class="neu-input mono" placeholder="例如：notes.txt">
+          </div>
+
+          <div class="field">
+            <label class="field__label" for="clip-content">发送内容</label>
+            <textarea id="clip-content" name="content" class="neu-textarea" placeholder="粘贴需要同步至局域网设备的文本或内容" required></textarea>
+          </div>
+
+          <div class="block-actions">
+            <button id="btn-send-clip" type="submit" class="neu-btn neu-btn--primary">发送至局域网</button>
+          </div>
+          <p id="clip-feedback" class="feedback-line" aria-live="polite"></p>
+        </form>
+
+        <div class="field">
+          <span class="field__label">已接收的局域网剪贴板</span>
+          <div id="clipboard-feed" class="neu-inset clipboard-feed" aria-live="polite">
+            <p class="empty-state">等待局域网设备推送剪贴板内容</p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script defer src="./js/api.js"></script>
+  <script defer src="./js/ws.js"></script>
+  <script defer src="./js/timeline.js"></script>
+  <script defer src="./js/app.js"></script>
+</body>
+</html>
