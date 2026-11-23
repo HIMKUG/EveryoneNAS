@@ -223,6 +223,6 @@ impl BitRotScrubber {
 fn unix_timestamp_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX_EPOCH")
+        .unwrap_or_default()
         .as_secs() as i64
 }

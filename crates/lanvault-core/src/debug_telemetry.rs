@@ -43,6 +43,7 @@ struct TelemetrySink {
 }
 
 static SINK: OnceLock<Mutex<TelemetrySink>> = OnceLock::new();
+static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 fn sink() -> &'static Mutex<TelemetrySink> {
     SINK.get_or_init(|| {
@@ -92,6 +93,14 @@ pub fn configure_debug_log_file(path: &Path) {
     }
 }
 
+/// Returns the currently configured disk debug log path (if any).
+pub fn get_debug_log_path() -> Option<String> {
+    sink()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.log_file_path.as_ref().map(|p| p.to_string_lossy().into_owned()))
+}
+
 /// Installs a global Rust panic hook that records native panics + backtraces into the unified log.
 pub fn install_rust_panic_hook() {
     PANIC_HOOK_ONCE.call_once(|| {
@@ -113,7 +122,7 @@ pub fn install_rust_panic_hook() {
                 "non-string panic payload".to_string()
             };
             let bt = std::backtrace::Backtrace::force_capture();
-            record_event_always(
+            record_event_try_lock(
                 "FATAL",
                 "rust.panic",
                 Some("panic.hook"),
@@ -126,7 +135,7 @@ pub fn install_rust_panic_hook() {
     });
 }
 
-fn write_file_line(path: &Path, entry: &DebugLogEntry) {
+fn write_file_line_locked(path: &Path, entry: &DebugLogEntry) {
     if let Ok(meta) = fs::metadata(path) {
         if meta.len() >= MAX_LOG_FILE_BYTES {
             let backup = path.with_extension("log.1");
@@ -140,6 +149,72 @@ fn write_file_line(path: &Path, entry: &DebugLogEntry) {
     }
 }
 
+fn write_file_line(path: &Path, entry: &DebugLogEntry) {
+    let _file_guard = match FILE_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    write_file_line_locked(path, entry);
+}
+
+fn build_log_entry(
+    level: &str,
+    source: &str,
+    probe: Option<&str>,
+    duration_us: Option<u64>,
+    message: impl Into<String>,
+    detail: Option<String>,
+) -> DebugLogEntry {
+    DebugLogEntry {
+        seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
+        timestamp_ms: now_ms(),
+        level: level.to_uppercase(),
+        source: truncate_utf8(source.to_string(), 128),
+        probe: probe.map(str::to_string),
+        duration_us,
+        message: truncate_utf8(message.into(), MAX_CLIENT_MESSAGE_BYTES),
+        detail: detail.map(|value| truncate_utf8(value, MAX_CLIENT_DETAIL_BYTES)),
+    }
+}
+
+fn push_ring_entry(guard: &mut TelemetrySink, entry: &DebugLogEntry) {
+    let entry_bytes = serialized_entry_bytes(entry);
+    while guard.ring.len() >= RING_CAPACITY
+        || guard.ring_bytes.saturating_add(entry_bytes) > MAX_RING_BYTES
+    {
+        let Some(removed) = guard.ring.pop_front() else {
+            break;
+        };
+        guard.ring_bytes = guard
+            .ring_bytes
+            .saturating_sub(serialized_entry_bytes(&removed));
+    }
+    guard.ring.push_back(entry.clone());
+    guard.ring_bytes = guard.ring_bytes.saturating_add(entry_bytes);
+}
+
+fn record_event_try_lock(
+    level: &str,
+    source: &str,
+    probe: Option<&str>,
+    duration_us: Option<u64>,
+    message: impl Into<String>,
+    detail: Option<String>,
+) {
+    let entry = build_log_entry(level, source, probe, duration_us, message, detail);
+    let path = if let Ok(mut guard) = sink().try_lock() {
+        push_ring_entry(&mut guard, &entry);
+        guard.log_file_path.clone()
+    } else {
+        None
+    };
+    if let Some(path) = path {
+        if let Ok(_file_guard) = FILE_LOCK.try_lock() {
+            write_file_line_locked(&path, &entry);
+        }
+    }
+}
+
 /// Records an event unconditionally (used for ERROR/WARN/FATAL, panics, and explicit client reports).
 pub fn record_event_always(
     level: &str,
@@ -149,35 +224,13 @@ pub fn record_event_always(
     message: impl Into<String>,
     detail: Option<String>,
 ) {
-    let entry = DebugLogEntry {
-        seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
-        timestamp_ms: now_ms(),
-        level: level.to_uppercase(),
-        source: truncate_utf8(source.to_string(), 128),
-        probe: probe.map(str::to_string),
-        duration_us,
-        message: truncate_utf8(message.into(), MAX_CLIENT_MESSAGE_BYTES),
-        detail: detail.map(|value| truncate_utf8(value, MAX_CLIENT_DETAIL_BYTES)),
+    let entry = build_log_entry(level, source, probe, duration_us, message, detail);
+    let path = if let Ok(mut guard) = sink().lock() {
+        push_ring_entry(&mut guard, &entry);
+        guard.log_file_path.clone()
+    } else {
+        None
     };
-    if let Ok(mut guard) = sink().lock() {
-        let entry_bytes = serialized_entry_bytes(&entry);
-        while guard.ring.len() >= RING_CAPACITY
-            || guard.ring_bytes.saturating_add(entry_bytes) > MAX_RING_BYTES
-        {
-            let Some(removed) = guard.ring.pop_front() else {
-                break;
-            };
-            guard.ring_bytes = guard
-                .ring_bytes
-                .saturating_sub(serialized_entry_bytes(&removed));
-        }
-        guard.ring.push_back(entry.clone());
-        guard.ring_bytes = guard.ring_bytes.saturating_add(entry_bytes);
-    }
-    let path = sink()
-        .lock()
-        .ok()
-        .and_then(|guard| guard.log_file_path.clone());
     if let Some(path) = path {
         write_file_line(&path, &entry);
     }
@@ -205,9 +258,17 @@ pub fn record_frontend_log(
     message: String,
     stack_or_detail: Option<String>,
 ) {
-    let source = match source {
-        "flutter" | "web" | "rust.ffi" | "frontend" => source.to_string(),
-        _ => "frontend.unknown".to_string(),
+    let trimmed_source = source.trim();
+    let source = if trimmed_source.starts_with("flutter")
+        || trimmed_source.starts_with("ui.")
+        || trimmed_source.starts_with("web")
+        || trimmed_source.starts_with("ai.")
+        || trimmed_source.starts_with("rust.")
+        || trimmed_source == "frontend"
+    {
+        trimmed_source.to_string()
+    } else {
+        "frontend.unknown".to_string()
     };
     let upper = level.trim().to_uppercase();
     let normalized = match upper.as_str() {
@@ -248,6 +309,10 @@ pub fn clear_debug_logs() {
         None
     };
     if let Some(path) = path {
+        let _file_guard = match FILE_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let _ = OpenOptions::new()
             .create(true)
             .write(true)

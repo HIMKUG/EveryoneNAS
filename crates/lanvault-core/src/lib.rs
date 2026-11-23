@@ -23,7 +23,7 @@ pub use crypto::{
 };
 pub use db::{
     ChunkRecord, Database, LocalFileStateRecord, PoolMode, RetentionTier, ScrubStatus,
-    SnapshotRecord, SyncRuleRecord, TrustedPeer, VaultRecord, VaultVolumeRecord, VolumeRole,
+    SnapshotRecord, SyncRuleRecord, TransferHistoryRecord, TrustedPeer, VaultRecord, VaultVolumeRecord, VolumeRole,
     WalCheckpointReport,
 };
 pub use discovery::{
@@ -34,7 +34,7 @@ pub use protocol::{
     pairing_identity_message, pairing_response_message, CLIPBOARD_AAD,
 };
 pub use debug_telemetry::{
-    clear_debug_logs, configure_debug_log_file, get_debug_logs, install_rust_panic_hook,
+    clear_debug_logs, configure_debug_log_file, get_debug_log_path, get_debug_logs, install_rust_panic_hook,
     is_debug_enabled, record_debug, record_event_always, record_frontend_log, set_debug_mode,
     DebugLogEntry, ProbeGuard,
 };

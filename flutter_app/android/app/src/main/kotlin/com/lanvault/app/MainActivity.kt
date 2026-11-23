@@ -1,5 +1,5 @@
 // 参考依据:
-// - ARCHITECTURE_CONTRACTS.md 第 5 节 (com.lanvault.app/keep_alive MethodChannel 5 个方法)
+// - ARCHITECTURE_CONTRACTS.md 第 5 节 (com.lanvault.app/keep_alive MethodChannel 契约)
 // - 严格遵循无过度防御原则：仅在 MethodChannel 入参边界校验必填参数，异常直接通过 result.error 暴露给上层。
 
 package com.lanvault.app
@@ -11,13 +11,18 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
-import android.os.BatteryManager
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
+import java.io.File
+import java.io.FileOutputStream
 import android.provider.Settings
+import androidx.core.content.ContextCompat
 import com.lanvault.app.privilege.KeepAliveLevel
 import com.lanvault.app.privilege.KeepAliveService
 import com.lanvault.app.privilege.PrivilegeDetector
@@ -27,18 +32,22 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
-import androidx.core.content.ContextCompat
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
 class MainActivity : FlutterActivity() {
     companion object {
         const val KEEP_ALIVE_CHANNEL = "com.lanvault.app/keep_alive"
-        private const val WIFI_SSID_PERMISSION_REQUEST = 7843
+        private const val LOCATION_PERMISSION_REQUEST = 7843
+        private const val NOTIFICATION_PERMISSION_REQUEST = 7844
+        private const val PICK_DIRECTORY_REQUEST = 7845
+        private const val PICK_FILE_REQUEST = 7846
     }
 
-    private val backgroundExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private val backgroundExecutor: ExecutorService = Executors.newCachedThreadPool()
     private val mainHandler = Handler(Looper.getMainLooper())
+    private var pendingDirectoryResult: MethodChannel.Result? = null
+    private var pendingFileResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -49,8 +58,55 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        pendingDirectoryResult?.success(null)
+        pendingDirectoryResult = null
+        pendingFileResult?.success(null)
+        pendingFileResult = null
         backgroundExecutor.shutdown()
         super.onDestroy()
+    }
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == PICK_DIRECTORY_REQUEST) {
+            val pending = pendingDirectoryResult
+            pendingDirectoryResult = null
+            if (pending == null) {
+                return
+            }
+            if (resultCode != RESULT_OK || data?.data == null) {
+                pending.success(null)
+                return
+            }
+            val treeUri = data.data!!
+            try {
+                contentResolver.takePersistableUriPermission(
+                    treeUri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+            } catch (_: SecurityException) {
+                // 部分外部文档提供方不支持持久化授权，忽略并继续解析路径
+            }
+            pending.success(resolveTreeUriToPath(treeUri))
+            return
+        }
+        if (requestCode == PICK_FILE_REQUEST) {
+            val pending = pendingFileResult
+            pendingFileResult = null
+            if (pending == null) {
+                return
+            }
+            if (resultCode != RESULT_OK || data?.data == null) {
+                pending.success(null)
+                return
+            }
+            val fileUri = data.data!!
+            runInBackground(pending) {
+                copyPickedUriToCachePath(fileUri)
+            }
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
     }
 
     private fun handleKeepAliveCall(call: MethodCall, result: MethodChannel.Result) {
@@ -70,9 +126,16 @@ class MainActivity : FlutterActivity() {
                     ?: return result.error("INVALID_ARGS", "port is required", null)
                 val webPassword = call.argument<String>("webPassword")
                     ?: return result.error("INVALID_ARGS", "webPassword is required", null)
+                val skipNativeStart = call.argument<Boolean>("skipNativeStart") ?: false
 
                 runInBackground(result) {
-                    startServerByPrivilegeLevel(vaultPath, quotaGb, port, webPassword)
+                    startServerByPrivilegeLevel(
+                        vaultPath,
+                        quotaGb,
+                        port,
+                        webPassword,
+                        skipNativeStart,
+                    )
                 }
             }
 
@@ -104,6 +167,40 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
+            "requestLocationPermission" -> {
+                try {
+                    result.success(requestLocationPermissions())
+                } catch (t: Throwable) {
+                    result.error("KEEP_ALIVE_ERROR", t.message ?: t.javaClass.simpleName, null)
+                }
+            }
+
+            "requestNotificationPermission" -> {
+                try {
+                    result.success(requestPostNotificationsPermission())
+                } catch (t: Throwable) {
+                    result.error("KEEP_ALIVE_ERROR", t.message ?: t.javaClass.simpleName, null)
+                }
+            }
+
+            "pickDirectory" -> {
+                try {
+                    launchDirectoryPicker(result)
+                } catch (t: Throwable) {
+                    pendingDirectoryResult = null
+                    result.error("KEEP_ALIVE_ERROR", t.message ?: t.javaClass.simpleName, null)
+                }
+            }
+
+            "pickFile" -> {
+                try {
+                    launchFilePicker(result)
+                } catch (t: Throwable) {
+                    pendingFileResult = null
+                    result.error("KEEP_ALIVE_ERROR", t.message ?: t.javaClass.simpleName, null)
+                }
+            }
+
             "getLastServerConfig" -> {
                 val config = KeepAliveService.loadLastConfig(applicationContext)
                 if (config == null) {
@@ -128,18 +225,6 @@ class MainActivity : FlutterActivity() {
                         connectivity.getNetworkCapabilities(connectivity.activeNetwork)
                     val onWifi =
                         capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
-                    if (
-                        onWifi &&
-                        ContextCompat.checkSelfPermission(
-                            this,
-                            Manifest.permission.ACCESS_FINE_LOCATION,
-                        ) != PackageManager.PERMISSION_GRANTED
-                    ) {
-                        requestPermissions(
-                            arrayOf(Manifest.permission.ACCESS_FINE_LOCATION),
-                            WIFI_SSID_PERMISSION_REQUEST,
-                        )
-                    }
                     val wifiManager =
                         applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
                     @Suppress("DEPRECATION")
@@ -184,6 +269,7 @@ class MainActivity : FlutterActivity() {
         quotaGb: Long,
         port: Int,
         webPassword: String,
+        skipNativeStart: Boolean,
     ): Boolean {
         KeepAliveService.rememberConfig(
             applicationContext,
@@ -193,7 +279,7 @@ class MainActivity : FlutterActivity() {
             webPassword,
         )
         return when (PrivilegeDetector.detect()) {
-            KeepAliveLevel.LEVEL_3_MAGISK_DAEMON -> true
+            KeepAliveLevel.LEVEL_3_MAGISK_DAEMON -> PrivilegeDetector.startMagiskDaemon()
             KeepAliveLevel.LEVEL_2_ROOT_LIBSU -> {
                 RootDaemonService.bindAndStart(
                     applicationContext,
@@ -219,6 +305,7 @@ class MainActivity : FlutterActivity() {
                     quotaGb,
                     port,
                     webPassword,
+                    skipNativeStart,
                 )
                 true
             }
@@ -229,7 +316,7 @@ class MainActivity : FlutterActivity() {
         return when (PrivilegeDetector.detect()) {
             KeepAliveLevel.LEVEL_3_MAGISK_DAEMON -> PrivilegeDetector.signalMagiskDaemonRestart()
             KeepAliveLevel.LEVEL_2_ROOT_LIBSU -> RootDaemonService.gracefulRestart(applicationContext)
-            KeepAliveLevel.LEVEL_1_SHIZUKU -> ShizukuBridge.gracefulRestart()
+            KeepAliveLevel.LEVEL_1_SHIZUKU -> ShizukuBridge.gracefulRestart(applicationContext)
             KeepAliveLevel.LEVEL_0_FOREGROUND -> {
                 KeepAliveService.requestGracefulRestart(applicationContext)
                 true
@@ -238,13 +325,14 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun stopServerByPrivilegeLevel(): Boolean {
+        KeepAliveService.cancelRecovery(applicationContext)
         return when (PrivilegeDetector.detect()) {
-            KeepAliveLevel.LEVEL_3_MAGISK_DAEMON -> false
+            KeepAliveLevel.LEVEL_3_MAGISK_DAEMON -> PrivilegeDetector.stopMagiskDaemon()
             KeepAliveLevel.LEVEL_2_ROOT_LIBSU -> {
                 RootDaemonService.stopServer(applicationContext)
             }
             KeepAliveLevel.LEVEL_1_SHIZUKU -> {
-                ShizukuBridge.stopServer()
+                ShizukuBridge.stopServer(applicationContext)
             }
             KeepAliveLevel.LEVEL_0_FOREGROUND -> {
                 val stopped = KeepAliveService.nativeGracefulRestartKeepAliveServer()
@@ -278,5 +366,122 @@ class MainActivity : FlutterActivity() {
         }
         startActivity(intent)
         return false
+    }
+
+    private fun requestLocationPermissions(): Boolean {
+        val fineGranted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (fineGranted) {
+            return true
+        }
+        requestPermissions(
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+            ),
+            LOCATION_PERMISSION_REQUEST,
+        )
+        return false
+    }
+
+    private fun requestPostNotificationsPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            return true
+        }
+        val granted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (granted) {
+            return true
+        }
+        requestPermissions(
+            arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+            NOTIFICATION_PERMISSION_REQUEST,
+        )
+        return false
+    }
+
+    @Suppress("DEPRECATION")
+    private fun launchDirectoryPicker(result: MethodChannel.Result) {
+        pendingDirectoryResult?.success(null)
+        pendingDirectoryResult = result
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+            )
+        }
+        startActivityForResult(intent, PICK_DIRECTORY_REQUEST)
+    }
+
+    private fun resolveTreeUriToPath(treeUri: Uri): String? {
+        val docId = try {
+            DocumentsContract.getTreeDocumentId(treeUri)
+        } catch (_: IllegalArgumentException) {
+            return null
+        }
+        if (docId.isBlank()) {
+            return null
+        }
+        if (docId.startsWith("raw:")) {
+            return docId.removePrefix("raw:").takeIf { it.isNotBlank() }
+        }
+        val colonIndex = docId.indexOf(':')
+        val volume = if (colonIndex >= 0) docId.substring(0, colonIndex) else docId
+        val relative = if (colonIndex >= 0) {
+            docId.substring(colonIndex + 1).trimStart('/')
+        } else {
+            ""
+        }
+        val primaryRoot = Environment.getExternalStorageDirectory().absolutePath.trimEnd('/')
+        val basePath = when {
+            volume.equals("primary", ignoreCase = true) -> primaryRoot
+            volume.equals("home", ignoreCase = true) -> "$primaryRoot/Documents"
+            volume.isNotBlank() -> "/storage/$volume"
+            else -> return null
+        }
+        return if (relative.isEmpty()) basePath else "$basePath/$relative"
+    }
+
+    @Suppress("DEPRECATION")
+    private fun launchFilePicker(result: MethodChannel.Result) {
+        pendingFileResult?.success(null)
+        pendingFileResult = result
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivityForResult(intent, PICK_FILE_REQUEST)
+    }
+
+    private fun copyPickedUriToCachePath(uri: Uri): String? {
+        var displayName = "transfer_${System.currentTimeMillis()}.bin"
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (idx >= 0) {
+                    val raw = cursor.getString(idx)
+                    if (!raw.isNullOrBlank()) {
+                        displayName = raw.replace(Regex("""[\\/:*?"<>|]"""), "_")
+                    }
+                }
+            }
+        }
+        val cacheFolder = File(cacheDir, "picked_files")
+        if (!cacheFolder.exists()) {
+            cacheFolder.mkdirs()
+        }
+        val destFile = File(cacheFolder, displayName)
+        contentResolver.openInputStream(uri)?.use { input ->
+            FileOutputStream(destFile).use { output ->
+                input.copyTo(output)
+            }
+        } ?: return null
+        return destFile.absolutePath
     }
 }

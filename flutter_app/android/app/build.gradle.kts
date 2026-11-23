@@ -2,6 +2,7 @@ import java.util.Properties
 
 plugins {
     id("com.android.application")
+    id("org.jetbrains.kotlin.android")
     id("dev.flutter.flutter-gradle-plugin")
 }
 
@@ -45,7 +46,6 @@ android {
                 keyPassword = keystoreProperties.getProperty("keyPassword")
                 storeFile = file(keystoreProperties.getProperty("storeFile"))
                 storePassword = keystoreProperties.getProperty("storePassword")
-                // v1 覆盖只认 JAR 签名的国产 ROM 安装器，v2/v3 是 Android 7+ 的标准方案。
                 enableV1Signing = true
                 enableV2Signing = true
                 enableV3Signing = true

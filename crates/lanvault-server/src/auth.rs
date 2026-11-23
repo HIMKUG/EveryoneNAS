@@ -79,7 +79,7 @@ pub struct AuthManager {
     pair_locks: DashMap<IpAddr, LockState>,
     login_gates: DashMap<IpAddr, Arc<Mutex<()>>>,
     sessions: DashMap<String, SessionRecord>,
-    revoked_tokens: DashMap<String, ()>,
+    revoked_tokens: DashMap<String, Instant>,
     revoked_devices: DashSet<String>,
 }
 
@@ -110,6 +110,18 @@ impl AuthManager {
     ) -> Result<Self> {
         let hash = hash_password(password)?;
         Self::from_password_hash(hash, identity)
+    }
+
+    /// Returns remaining lockout seconds if `client_ip` is currently locked out from pairing.
+    pub fn pair_lockout_remaining(&self, client_ip: IpAddr) -> Option<u64> {
+        let now = Instant::now();
+        let entry = self.pair_locks.get(&client_ip)?;
+        let until = entry.locked_until?;
+        if until > now {
+            Some(until.duration_since(now).as_secs().max(1))
+        } else {
+            None
+        }
     }
 
     /// Checks per-IP lockout status for pairing PIN attempts.
@@ -238,6 +250,8 @@ impl AuthManager {
         let now = Instant::now();
         self.sessions
             .retain(|_, session| session.expires_at > now);
+        self.revoked_tokens
+            .retain(|_, expires_at| *expires_at > now);
         self.ip_locks.retain(|_, state| {
             state.locked_until.map(|u| u > now).unwrap_or(state.failed_attempts > 0)
         });
@@ -314,14 +328,14 @@ impl AuthManager {
             self.prune_expired();
         }
         if self.sessions.len() >= MAX_SESSIONS {
-            if let Some(oldest) = self
+            if let Some((oldest, oldest_expires_at)) = self
                 .sessions
                 .iter()
                 .min_by_key(|entry| entry.value().expires_at)
-                .map(|entry| entry.key().clone())
+                .map(|entry| (entry.key().clone(), entry.value().expires_at))
             {
                 self.sessions.remove(&oldest);
-                self.revoked_tokens.insert(oldest, ());
+                self.revoked_tokens.insert(oldest, oldest_expires_at);
             }
         }
         self.sessions.insert(
@@ -361,8 +375,12 @@ impl AuthManager {
 
     /// Invalidates a session token on logout.
     pub fn revoke_session(&self, token: &str) {
-        self.sessions.remove(token);
-        self.revoked_tokens.insert(token.to_string(), ());
+        let expires_at = self
+            .sessions
+            .remove(token)
+            .map(|(_, record)| record.expires_at)
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(SESSION_TTL_SECS));
+        self.revoked_tokens.insert(token.to_string(), expires_at);
     }
 
     pub fn revoke_device_sessions(&self, device_id: &str) {

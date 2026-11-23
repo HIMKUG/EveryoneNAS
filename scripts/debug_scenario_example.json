@@ -1,0 +1,39 @@
+[
+  {
+    "name": "开启 Debug 模式",
+    "fn": "set_debug_mode",
+    "payload": { "enabled": true }
+  },
+  {
+    "name": "切换双端模式",
+    "fn": "set_role_mode",
+    "payload": { "mode": "dual" }
+  },
+  {
+    "name": "执行 mDNS 局域网扫描",
+    "fn": "start_mdns_scan",
+    "payload": {}
+  },
+  {
+    "name": "验证主备同盘符拦截（预期报错）",
+    "fn": "set_backup_storage_config",
+    "payload": {
+      "primary_dir": "D:\\EveryoneNAS_A",
+      "fallback_dir": "D:\\EveryoneNAS_B"
+    },
+    "expect_error": true
+  },
+  {
+    "name": "保存跨盘符主备配置",
+    "fn": "set_backup_storage_config",
+    "payload": {
+      "primary_dir": "D:\\EveryoneNAS_Primary",
+      "fallback_dir": "E:\\EveryoneNAS_Backup"
+    }
+  },
+  {
+    "name": "执行内置全链路探针自检",
+    "fn": "run_self_diagnostics",
+    "payload": {}
+  }
+]

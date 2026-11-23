@@ -268,6 +268,23 @@ mod win_scm {
         new_root.to_string_lossy().into_owned()
     }
 
+    fn report_stopped(
+        status_handle: &service_control_handler::ServiceStatusHandle,
+        exit_code: ServiceExitCode,
+    ) -> Result<()> {
+        status_handle
+            .set_service_status(ServiceStatus {
+                service_type: SERVICE_TYPE,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code,
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            })
+            .context("failed to report ServiceState::Stopped to SCM")
+    }
+
     fn run_service_loop() -> Result<()> {
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
@@ -294,6 +311,22 @@ mod win_scm {
             process_id: None,
         })?;
 
+        let mut stopped_reported = false;
+        let result = run_service_after_start_pending(&status_handle, stop_rx, &mut stopped_reported);
+        if result.is_err() && !stopped_reported {
+            if let Err(status_err) = report_stopped(&status_handle, ServiceExitCode::ServiceSpecific(1))
+            {
+                error!(error = %status_err, "failed to notify SCM of startup failure");
+            }
+        }
+        result
+    }
+
+    fn run_service_after_start_pending(
+        status_handle: &service_control_handler::ServiceStatusHandle,
+        stop_rx: mpsc::Receiver<()>,
+        stopped_reported: &mut bool,
+    ) -> Result<()> {
         let server_config = load_service_config()?;
         let db_path = server_config.vault_root.join("index.db");
 
@@ -357,14 +390,26 @@ mod win_scm {
             let _ = server_exit_tx.send(());
         });
 
-        let bound_addr = runtime.block_on(async {
+        let bound_addr = match runtime.block_on(async {
             tokio::time::timeout(SERVER_BIND_TIMEOUT, bound_rx)
                 .await
                 .context("timed out waiting for LanVault server to bind")?
                 .context("EveryoneNAS server exited before binding a port")
-        })?;
+        }) {
+            Ok(addr) => addr,
+            Err(err) => {
+                let _ = svc_stop_tx.send(true);
+                server_task.abort();
+                return Err(err);
+            }
+        };
         info!(addr = %bound_addr, "EveryoneNAS Windows Session 0 server bound and ready");
-        backfill_volume_guids(&db_path)?;
+
+        if let Err(err) = backfill_volume_guids(&db_path) {
+            let _ = svc_stop_tx.send(true);
+            server_task.abort();
+            return Err(err);
+        }
 
         status_handle.set_service_status(ServiceStatus {
             service_type: SERVICE_TYPE,
@@ -389,16 +434,9 @@ mod win_scm {
         };
 
         if unexpected_exit {
-            checkpoint_default_db(&db_path)?;
-            status_handle.set_service_status(ServiceStatus {
-                service_type: SERVICE_TYPE,
-                current_state: ServiceState::Stopped,
-                controls_accepted: ServiceControlAccept::empty(),
-                exit_code: ServiceExitCode::ServiceSpecific(1),
-                checkpoint: 0,
-                wait_hint: Duration::default(),
-                process_id: None,
-            })?;
+            let _ = checkpoint_default_db(&db_path);
+            report_stopped(status_handle, ServiceExitCode::ServiceSpecific(1))?;
+            *stopped_reported = true;
             anyhow::bail!("EveryoneNAS server exited while the service was running");
         }
 
@@ -424,20 +462,13 @@ mod win_scm {
         });
 
         let checkpoint_result = checkpoint_default_db(&db_path);
-
-        status_handle.set_service_status(ServiceStatus {
-            service_type: SERVICE_TYPE,
-            current_state: ServiceState::Stopped,
-            controls_accepted: ServiceControlAccept::empty(),
-            exit_code: if checkpoint_result.is_ok() {
-                ServiceExitCode::Win32(0)
-            } else {
-                ServiceExitCode::ServiceSpecific(1)
-            },
-            checkpoint: 0,
-            wait_hint: Duration::default(),
-            process_id: None,
-        })?;
+        let exit_code = if checkpoint_result.is_ok() {
+            ServiceExitCode::Win32(0)
+        } else {
+            ServiceExitCode::ServiceSpecific(1)
+        };
+        report_stopped(status_handle, exit_code)?;
+        *stopped_reported = true;
 
         checkpoint_result
     }
@@ -496,16 +527,32 @@ mod win_scm {
         service.update_failure_actions(failure_actions)?;
         service.set_failure_actions_on_non_crash_failures(true)?;
 
-        let firewall_port = std::env::var("LANVAULT_PORT")
-            .ok()
-            .and_then(|port| port.parse::<u16>().ok())
-            .unwrap_or(DEFAULT_LAN_PORT);
+        let firewall_port = resolve_firewall_port()?;
         firewall::ensure_firewall_rules(firewall_port)?;
         info!(
             service = SERVICE_NAME,
             "installed Windows service with 1s/5s/10s crash recovery"
         );
         Ok(())
+    }
+
+    fn resolve_firewall_port() -> Result<u16> {
+        if let Some(config_path) = std::env::var_os("LANVAULT_CONFIG_PATH") {
+            let path = PathBuf::from(config_path);
+            let cfg = ServerConfig::load_from_file(&path).with_context(|| {
+                format!(
+                    "failed to load server config from {} while configuring firewall",
+                    path.display()
+                )
+            })?;
+            return Ok(cfg.port);
+        }
+        if let Ok(port_raw) = std::env::var("LANVAULT_PORT") {
+            return port_raw
+                .parse::<u16>()
+                .with_context(|| format!("invalid LANVAULT_PORT value: `{port_raw}`"));
+        }
+        Ok(DEFAULT_LAN_PORT)
     }
 
     /// 停止并卸载 Windows 服务，同时移除防火墙规则。

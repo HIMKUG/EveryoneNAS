@@ -75,13 +75,26 @@ class RootDaemonService : RootService() {
         @Volatile
         private var pendingLaunch: PendingLaunch? = null
 
+        private val bindWaiters = mutableListOf<CountDownLatch>()
+
+        private fun notifyBindWaiters() {
+            val waiters = synchronized(bindWaiters) {
+                val copy = bindWaiters.toList()
+                bindWaiters.clear()
+                copy
+            }
+            waiters.forEach { it.countDown() }
+        }
+
         private val connection = object : ServiceConnection {
             override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
                 if (service == null || !service.pingBinder()) {
                     completePending(false)
+                    notifyBindWaiters()
                     return
                 }
                 remoteBinder = service
+                notifyBindWaiters()
                 val pending = pendingLaunch
                 if (pending != null) {
                     pendingLaunch = null
@@ -105,6 +118,7 @@ class RootDaemonService : RootService() {
             override fun onServiceDisconnected(name: ComponentName?) {
                 remoteBinder = null
                 completePending(false)
+                notifyBindWaiters()
             }
         }
 
@@ -168,11 +182,35 @@ class RootDaemonService : RootService() {
             bindOnMainThread(context)
         }
 
-        fun gracefulRestart(context: Context): Boolean {
-            val binder = remoteBinder ?: run {
-                ensureBound(context)
-                return false
+        private fun ensureBoundAndWait(
+            context: Context,
+            timeoutSeconds: Long = 8L,
+        ): IBinder? {
+            val existing = remoteBinder
+            if (existing != null && existing.pingBinder()) {
+                return existing
             }
+            val latch = CountDownLatch(1)
+            synchronized(bindWaiters) {
+                val current = remoteBinder
+                if (current != null && current.pingBinder()) {
+                    return current
+                }
+                bindWaiters.add(latch)
+            }
+            try {
+                bindOnMainThread(context)
+                latch.await(timeoutSeconds, TimeUnit.SECONDS)
+            } finally {
+                synchronized(bindWaiters) {
+                    bindWaiters.remove(latch)
+                }
+            }
+            return remoteBinder?.takeIf { it.pingBinder() }
+        }
+
+        fun gracefulRestart(context: Context): Boolean {
+            val binder = ensureBoundAndWait(context) ?: return false
             val data = Parcel.obtain()
             val reply = Parcel.obtain()
             try {
@@ -187,10 +225,7 @@ class RootDaemonService : RootService() {
         }
 
         fun stopServer(context: Context): Boolean {
-            val binder = remoteBinder ?: run {
-                ensureBound(context)
-                return false
-            }
+            val binder = ensureBoundAndWait(context) ?: return false
             val data = Parcel.obtain()
             val reply = Parcel.obtain()
             try {

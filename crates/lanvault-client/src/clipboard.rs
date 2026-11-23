@@ -3,7 +3,6 @@
 //! 对齐 `ARCHITECTURE_CONTRACTS.md` §3.1 路由 11 (`POST /api/clipboard`)：
 //! `{ "target_device_id": string|null, "kind": "text|file", "content": string, "filename": string|null }`。
 
-use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
@@ -99,7 +98,7 @@ impl ClipboardClient {
         target_device_id: Option<String>,
         file_path: &Path,
     ) -> Result<ClipboardPushResponse, ClientError> {
-        let meta = fs::metadata(file_path)?;
+        let meta = tokio::fs::metadata(file_path).await?;
         if !meta.is_file() {
             return Err(ClientError::InvalidPath {
                 path: file_path.to_path_buf(),
@@ -123,7 +122,7 @@ impl ClipboardClient {
             .to_string_lossy()
             .into_owned();
 
-        let bytes = fs::read(file_path)?;
+        let bytes = tokio::fs::read(file_path).await?;
         let envelope = seal_payload(&bytes, &self.channel_key)?;
         let content = serde_json::to_string(&envelope)?;
 

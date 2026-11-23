@@ -1,7 +1,7 @@
-// 参考依据:
-// - Apple Human Interface Guidelines (Motion, ConcentricRectangle, Buttons 44pt/48dp)
-// - W3C WCAG 2.2 AA (正文 >= 4.5:1, 非文本控件边界与状态 >= 3:1)
-// - ARCHITECTURE_CONTRACTS.md 第 6 节 (改良新拟态 Token 与 120Hz 高刷合规范式)
+// EveryoneNAS 全新柔冰蓝 / 纯白轻拟态玻璃卡片设计系统
+// 完整保留 NeuCard / NeuButton / NeuSwitch / NeuInsetField / NeuSegmentedControl /
+// NeuDropdown / NeuProgressBar 公开 API，并新增 NeuStatusBadge / StorageDonutRing /
+// BrandLogoMark / BrandLogoFull。
 
 import 'dart:math' as math;
 
@@ -9,28 +9,19 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
-/// Apple HIG 统一动效 Token：全项目禁止散落不一致的毫秒数或曲线。
+/// 统一动效 Token。
 abstract final class NeuMotion {
-  /// 按压、聚焦与轻触物理反馈时长。
   static const Duration pressDuration = Duration(milliseconds: 220);
-
-  /// 按压与聚焦 Apple 减速曲线。
   static const Curve pressCurve = Curves.linearToEaseOut;
 
-  /// 分段滑块、开关拨动、进度条变化与导航选中切换时长。
   static const Duration stateDuration = Duration(milliseconds: 280);
-
-  /// 状态切换 Apple 减速曲线。
   static const Curve stateCurve = Curves.linearToEaseOut;
 
-  /// 系统开启“减少动态效果”时的降级短淡入时长（绝不采用 0ms 生硬跳变）。
   static const Duration reducedDuration = Duration(milliseconds: 120);
-
-  /// 降动效模式的平滑曲线。
   static const Curve reducedCurve = Curves.easeOut;
 
-  /// 物理按压微缩放比例。
-  static const double pressedScale = 0.97;
+  static const double pressedScale = 0.968;
+  static const double cardPressedScale = 0.985;
 
   static bool isReduced(BuildContext context) {
     return MediaQuery.maybeDisableAnimationsOf(context) ?? false;
@@ -53,14 +44,13 @@ abstract final class NeuMotion {
   }
 }
 
-/// Apple 同心圆角 Token 与嵌套计算公式。
+/// 同心圆角 Token 与嵌套计算公式。
 abstract final class NeuRadius {
-  static const double card = 20.0;
-  static const double segmentedTrack = 14.0;
+  static const double card = 18.0;
+  static const double segmentedTrack = 12.0;
   static const double control = 12.0;
   static const double pill = 999.0;
 
-  /// Apple ConcentricRectangle 同心圆角公式：内圆角 = max(min, 外圆角 - 内边距)。
   static double concentric(double outer, double padding, {double min = 8.0}) {
     return math.max(min, outer - padding);
   }
@@ -75,89 +65,116 @@ abstract final class NeuSpace {
   static const double xl = 32.0;
 }
 
-/// EveryoneNAS 改良新拟态（Accessible Neumorphism）设计 Token。
+/// EveryoneNAS 柔冰蓝 / 纯白轻拟态玻璃卡片设计 Token。
 abstract final class NeuTokens {
-  /// 主画布与浮层表面基底色。
-  static const Color surface = Color(0xFFE6E9EF);
+  /// 全局页面画布底色：清透冰蓝白 `#F3F6FC`。
+  static const Color canvas = Color(0xFFF3F6FC);
 
-  /// 凹陷槽位底色（比主表面略深，确保与凸起组件可区分）。
-  static const Color insetSurface = Color(0xFFDCE1EA);
+  /// 卡片与浮层表面：纯白 `#FFFFFF`。
+  static const Color surface = Color(0xFFFFFFFF);
 
-  /// 悬停微提亮表面色（仅用于桌面指针辅助反馈，不承载唯一交互信息）。
-  static const Color hoverSurface = Color(0xFFECEFF4);
+  /// 凹陷槽位底色：`#EEF3FA`。
+  static const Color insetSurface = Color(0xFFEEF3FA);
 
-  /// 135° 光源亮阴影（左上）。
+  /// 悬停微冷蓝表面。
+  static const Color hoverSurface = Color(0xFFF6F9FF);
+
+  /// 亮阴影与冷蓝阴影。
   static const Color lightShadow = Color(0xFFFFFFFF);
+  static const Color darkShadow = Color(0x142563EB);
 
-  /// 135° 光源暗阴影（右下）。
-  static const Color darkShadow = Color(0xFFC5CCD8);
+  /// 1px 细腻冷蓝边框：`#E6ECF5`。
+  static const Color hairlineBorder = Color(0xFFE6ECF5);
 
-  /// 细描边，用于在浅色表面提供清晰物理边界。
-  static const Color hairlineBorder = Color(0xFFD1D7E2);
+  /// 控件清晰轮廓色。
+  static const Color controlOutline = Color(0xFFCBD5E1);
 
-  /// 高对比非文本控件边界色（与 #E6E9EF 对比度约 3.98:1，满足 WCAG 2.2 AA >= 3:1）。
-  static const Color controlOutline = Color(0xFF64748B);
+  /// 文字层级：主文字 `#0F172A`，次级文字 `#64748B`。
+  static const Color textPrimary = Color(0xFF0F172A);
+  static const Color textSecondary = Color(0xFF64748B);
 
-  /// 正文主色（与 #E6E9EF 对比度 > 10:1）。
-  static const Color textPrimary = Color(0xFF1E293B);
+  /// 明快科技蓝主强调色渐变 `#2563EB` -> `#3B82F6`。
+  static const Color accent = Color(0xFF2563EB);
+  static const Color accentLight = Color(0xFF3B82F6);
+  static const Color accentPressed = Color(0xFF1D4ED8);
+  static const Color accentSoft = Color(0xFFEFF6FF);
 
-  /// 次级文字色（与 #E6E9EF 对比度 > 5.7:1）。
-  static const Color textSecondary = Color(0xFF475569);
+  /// 健康绿 `#10B981` + 浅绿底 `#ECFDF5`。
+  static const Color healthy = Color(0xFF10B981);
+  static const Color healthyAlt = Color(0xFF059669);
+  static const Color healthySoft = Color(0xFFECFDF5);
 
-  /// 语义状态色（均满足 >= 3:1 非文本与 >= 4.5:1 文本对比度）。
-  static const Color healthy = Color(0xFF0F766E);
-  static const Color healthyAlt = Color(0xFF15803D);
-  static const Color warning = Color(0xFFB45309);
-  static const Color danger = Color(0xFFB91C1C);
-  static const Color accent = Color(0xFF1D4ED8);
-  static const Color accentPressed = Color(0xFF1E40AF);
+  /// 文件夹暖金 `#F59E0B` + 浅金底 `#FEF3C7`。
+  static const Color folderGold = Color(0xFFF59E0B);
+  static const Color folderGoldSoft = Color(0xFFFEF3C7);
 
-  /// 最小触控热区（桌面 >= 44pt，移动端 >= 48dp）。
-  static const double minTouchTarget = 44.0;
-  static const double minMobileTouchTarget = 48.0;
+  /// 警告与危险语义色。
+  static const Color warning = Color(0xFFD97706);
+  static const Color danger = Color(0xFFEF4444);
+  static const Color dangerSoft = Color(0xFFFEF2F2);
 
-  /// 兼容别名：指向 [NeuSpace] 4pt / 8pt 间距栅格。
+  /// 图表与时间线辅助语义色（全端统一收敛）。
+  static const Color chartSky = Color(0xFF38BDF8);
+  static const Color chartIndigo = Color(0xFF6366F1);
+  static const Color chartIndigoSoft = Color(0xFFEEF2FF);
+  static const Color slateMuted = Color(0xFF475569);
+  static const Color timelineInactive = Color(0xFFCBD5E1);
+  static const Color timelineHalo = Color(0xFFBFDBFE);
+  static const Color timelineLine = Color(0xFFD6E2F5);
+
+  /// 标准蓝渐变（导航激活胶囊、主按钮）。
+  static const LinearGradient primaryGradient = LinearGradient(
+    begin: Alignment.centerLeft,
+    end: Alignment.centerRight,
+    colors: <Color>[accent, accentLight],
+  );
+
+  static const double minTouchTarget = 42.0;
+  static const double minMobileTouchTarget = 46.0;
+
   static const double spaceXs = NeuSpace.xs;
   static const double spaceSm = NeuSpace.sm;
   static const double spaceMd = NeuSpace.md;
   static const double spaceLg = NeuSpace.lg;
 
+  /// 纯白轻拟态卡片柔和冷蓝阴影。
   static const List<BoxShadow> extrudedShadows = <BoxShadow>[
     BoxShadow(
-      color: lightShadow,
-      offset: Offset(-6, -6),
-      blurRadius: 12,
+      color: Color(0x0D1E3A8A),
+      offset: Offset(0, 6),
+      blurRadius: 20,
+      spreadRadius: -2,
     ),
     BoxShadow(
-      color: darkShadow,
-      offset: Offset(6, 6),
-      blurRadius: 12,
+      color: Color(0x080F172A),
+      offset: Offset(0, 2),
+      blurRadius: 6,
     ),
   ];
 
   static const List<BoxShadow> controlShadows = <BoxShadow>[
     BoxShadow(
-      color: lightShadow,
-      offset: Offset(-4, -4),
-      blurRadius: 9,
+      color: Color(0x101E3A8A),
+      offset: Offset(0, 3),
+      blurRadius: 10,
+      spreadRadius: -1,
     ),
+  ];
+
+  static const List<BoxShadow> primaryButtonShadows = <BoxShadow>[
     BoxShadow(
-      color: darkShadow,
-      offset: Offset(4, 4),
-      blurRadius: 9,
+      color: Color(0x332563EB),
+      offset: Offset(0, 6),
+      blurRadius: 14,
+      spreadRadius: -2,
     ),
   ];
 
   static const List<BoxShadow> pressedShadows = <BoxShadow>[
     BoxShadow(
-      color: lightShadow,
-      offset: Offset(-2, -2),
-      blurRadius: 4,
-    ),
-    BoxShadow(
-      color: darkShadow,
-      offset: Offset(2, 2),
-      blurRadius: 4,
+      color: Color(0x0A1E3A8A),
+      offset: Offset(0, 1),
+      blurRadius: 3,
     ),
   ];
 
@@ -260,20 +277,21 @@ ThemeData buildLanVaultTheme() {
   return ThemeData(
     useMaterial3: true,
     colorScheme: colorScheme,
-    scaffoldBackgroundColor: NeuTokens.surface,
-    canvasColor: NeuTokens.surface,
+    scaffoldBackgroundColor: NeuTokens.canvas,
+    canvasColor: NeuTokens.canvas,
     dividerColor: NeuTokens.hairlineBorder,
     textTheme: const TextTheme(
       headlineSmall: TextStyle(
         color: NeuTokens.textPrimary,
-        fontSize: 22,
+        fontSize: 24,
         fontWeight: FontWeight.w700,
-        letterSpacing: -0.3,
+        letterSpacing: -0.4,
       ),
       titleMedium: TextStyle(
         color: NeuTokens.textPrimary,
         fontSize: 16,
         fontWeight: FontWeight.w600,
+        letterSpacing: -0.2,
       ),
       titleSmall: TextStyle(
         color: NeuTokens.textPrimary,
@@ -307,56 +325,442 @@ ThemeData buildLanVaultTheme() {
   );
 }
 
-/// 120Hz 高刷优化新拟态卡片：支持凸起/凹陷与 [RepaintBoundary] 隔离光栅化，
-/// 仅使用 [BoxDecoration] 圆角，绝不使用 ClipPath / BackdropFilter。
-class NeuCard extends StatelessWidget {
+/// 品牌图标（加载 `assets/brand/logo_mark.png`）。
+class BrandLogoMark extends StatelessWidget {
+  const BrandLogoMark({
+    super.key,
+    this.size = 28,
+  });
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return Image.asset(
+      'assets/brand/logo_mark.png',
+      width: size,
+      height: size,
+      fit: BoxFit.contain,
+      filterQuality: FilterQuality.medium,
+      semanticLabel: 'EveryoneNAS Logo',
+    );
+  }
+}
+
+/// 完整品牌横幅 Logo（加载 `assets/brand/logo_full.png`）。
+class BrandLogoFull extends StatelessWidget {
+  const BrandLogoFull({
+    super.key,
+    this.height = 44,
+  });
+
+  final double height;
+
+  @override
+  Widget build(BuildContext context) {
+    return Image.asset(
+      'assets/brand/logo_full.png',
+      height: height,
+      fit: BoxFit.contain,
+      filterQuality: FilterQuality.medium,
+      semanticLabel: 'EveryoneNAS',
+    );
+  }
+}
+
+/// 环形存储占比图（设计稿总览页同款：蓝紫/天蓝渐变圆环 + 居中百分比）。
+class StorageDonutRing extends StatelessWidget {
+  const StorageDonutRing({
+    super.key,
+    required this.ratio,
+    this.size = 112,
+    this.strokeWidth = 11,
+    this.centerLabel = '已使用',
+  });
+
+  final double ratio;
+  final double size;
+  final double strokeWidth;
+  final String centerLabel;
+
+  @override
+  Widget build(BuildContext context) {
+    final clamped = ratio.clamp(0.0, 1.0);
+    final percent = (clamped * 100).round();
+    final isCompact = size < 84;
+
+    return RepaintBoundary(
+      child: Semantics(
+        label: '$centerLabel $percent%',
+        child: SizedBox(
+          width: size,
+          height: size,
+          child: TweenAnimationBuilder<double>(
+            tween: Tween<double>(end: clamped),
+            duration: NeuMotion.resolveState(context),
+            curve: NeuMotion.resolveStateCurve(context),
+            builder: (context, animatedValue, _) {
+              return CustomPaint(
+                painter: _StorageDonutPainter(
+                  progress: animatedValue,
+                  strokeWidth: strokeWidth,
+                ),
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: <Widget>[
+                      Text(
+                        '${(animatedValue * 100).round()}%',
+                        style: TextStyle(
+                          color: NeuTokens.textPrimary,
+                          fontSize: isCompact ? 15 : 22,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: -0.5,
+                          fontFeatures: const <FontFeature>[
+                            FontFeature.tabularFigures(),
+                          ],
+                        ),
+                      ),
+                      if (centerLabel.isNotEmpty)
+                        Text(
+                          centerLabel,
+                          style: TextStyle(
+                            color: NeuTokens.textSecondary,
+                            fontSize: isCompact ? 10 : 11.5,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _StorageDonutPainter extends CustomPainter {
+  const _StorageDonutPainter({
+    required this.progress,
+    required this.strokeWidth,
+  });
+
+  final double progress;
+  final double strokeWidth;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = (math.min(size.width, size.height) - strokeWidth) / 2;
+    if (radius <= 0) return;
+
+    final trackPaint = Paint()
+      ..color = const Color(0xFFE6EEF9)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round;
+    canvas.drawCircle(center, radius, trackPaint);
+
+    if (progress <= 0.001) return;
+
+    final rect = Rect.fromCircle(center: center, radius: radius);
+    const sweepGradient = SweepGradient(
+      startAngle: -math.pi / 2,
+      endAngle: math.pi * 1.5,
+      colors: <Color>[
+        Color(0xFF38BDF8),
+        Color(0xFF2563EB),
+        Color(0xFF6366F1),
+        Color(0xFF38BDF8),
+      ],
+      stops: <double>[0.0, 0.45, 0.8, 1.0],
+    );
+
+    final progressPaint = Paint()
+      ..shader = sweepGradient.createShader(rect)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth
+      ..strokeCap = StrokeCap.round;
+
+    canvas.drawArc(
+      rect,
+      -math.pi / 2,
+      math.pi * 2 * progress,
+      false,
+      progressPaint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _StorageDonutPainter oldDelegate) {
+    return oldDelegate.progress != progress ||
+        oldDelegate.strokeWidth != strokeWidth;
+  }
+}
+
+/// 语义状态徽章（圆点 + 柔色底胶囊）。
+enum NeuStatusTone { neutral, accent, healthy, warning, danger }
+
+class NeuStatusBadge extends StatelessWidget {
+  const NeuStatusBadge({
+    super.key,
+    required this.label,
+    this.tone = NeuStatusTone.neutral,
+    this.showDot = true,
+  });
+
+  final String label;
+  final NeuStatusTone tone;
+  final bool showDot;
+
+  (Color fg, Color bg) _resolveColors() {
+    return switch (tone) {
+      NeuStatusTone.neutral => (NeuTokens.textSecondary, NeuTokens.insetSurface),
+      NeuStatusTone.accent => (NeuTokens.accent, NeuTokens.accentSoft),
+      NeuStatusTone.healthy => (NeuTokens.healthyAlt, NeuTokens.healthySoft),
+      NeuStatusTone.warning => (NeuTokens.warning, NeuTokens.folderGoldSoft),
+      NeuStatusTone.danger => (NeuTokens.danger, NeuTokens.dangerSoft),
+    };
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final (fg, bg) = _resolveColors();
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: const BorderRadius.all(Radius.circular(NeuRadius.pill)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          if (showDot) ...<Widget>[
+            Container(
+              width: 7,
+              height: 7,
+              decoration: BoxDecoration(
+                color: fg,
+                shape: BoxShape.circle,
+              ),
+            ),
+            const SizedBox(width: 6),
+          ],
+          Text(
+            label,
+            style: TextStyle(
+              color: fg,
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 纯白轻拟态玻璃卡片：支持凸起 / 凹陷 / 浅色语义底色与可选触控按压物理反馈。
+class NeuCard extends StatefulWidget {
   const NeuCard({
     super.key,
     required this.child,
     this.padding = const EdgeInsets.all(NeuSpace.md),
     this.radius,
     this.inset = false,
+    this.backgroundColor,
+    this.borderColor,
     this.semanticLabel,
+    this.onTap,
   });
 
   final Widget child;
   final EdgeInsetsGeometry padding;
   final double? radius;
   final bool inset;
+  final Color? backgroundColor;
+  final Color? borderColor;
   final String? semanticLabel;
+  final VoidCallback? onTap;
+
+  @override
+  State<NeuCard> createState() => _NeuCardState();
+}
+
+class _NeuCardState extends State<NeuCard> {
+  bool _hovered = false;
+  bool _pressed = false;
 
   @override
   Widget build(BuildContext context) {
     final neu = NeuTheme.of(context);
-    final resolvedRadius = radius ?? neu.borderRadius;
-    final box = RepaintBoundary(
-      child: Container(
-        padding: padding,
-        decoration: BoxDecoration(
-          color: inset ? neu.insetColor : neu.surfaceColor,
-          borderRadius: BorderRadius.all(Radius.circular(resolvedRadius)),
-          border: Border.all(
-            color: inset
-                ? NeuTokens.darkShadow.withValues(alpha: 0.85)
-                : NeuTokens.lightShadow.withValues(alpha: 0.6),
-            width: 1,
-          ),
-          boxShadow: inset ? null : neu.extrudedShadows,
+    final resolvedRadius = widget.radius ?? neu.borderRadius;
+    final interactive = widget.onTap != null;
+    final reduced = NeuMotion.isReduced(context);
+    final pressDuration = NeuMotion.resolvePress(context);
+    final pressCurve = NeuMotion.resolvePressCurve(context);
+
+    final resolvedBg = widget.backgroundColor ??
+        (widget.inset
+            ? neu.insetColor
+            : (_hovered && interactive ? NeuTokens.hoverSurface : neu.surfaceColor));
+    final resolvedBorder = widget.borderColor ??
+        (widget.inset
+            ? const Color(0xFFE0E8F4)
+            : (_hovered && interactive
+                ? NeuTokens.accent.withValues(alpha: 0.35)
+                : NeuTokens.hairlineBorder));
+    final resolvedShadows = widget.inset
+        ? null
+        : (_pressed && interactive ? neu.pressedShadows : neu.extrudedShadows);
+
+    Widget box = AnimatedContainer(
+      duration: pressDuration,
+      curve: pressCurve,
+      padding: widget.padding,
+      decoration: BoxDecoration(
+        color: resolvedBg,
+        borderRadius: BorderRadius.all(Radius.circular(resolvedRadius)),
+        border: Border.all(
+          color: resolvedBorder,
+          width: 1,
         ),
-        child: child,
+        boxShadow: resolvedShadows,
       ),
+      child: widget.child,
     );
-    if (semanticLabel == null) return box;
-    return Semantics(container: true, label: semanticLabel, child: box);
+
+    if (interactive) {
+      final targetScale =
+          (_pressed && !reduced) ? NeuMotion.cardPressedScale : 1.0;
+      final targetOffsetY =
+          (_hovered && !_pressed && !reduced) ? -1.5 : (_pressed && !reduced ? 1.0 : 0.0);
+      box = MouseRegion(
+        cursor: SystemMouseCursors.click,
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() {
+          _hovered = false;
+          _pressed = false;
+        }),
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTapDown: (_) => setState(() => _pressed = true),
+          onTapUp: (_) => setState(() => _pressed = false),
+          onTapCancel: () => setState(() => _pressed = false),
+          onTap: widget.onTap,
+          child: TweenAnimationBuilder<double>(
+            tween: Tween<double>(end: targetScale),
+            duration: pressDuration,
+            curve: pressCurve,
+            builder: (context, scale, child) {
+              return Transform.translate(
+                offset: Offset(0, targetOffsetY),
+                child: Transform.scale(
+                  scale: scale,
+                  alignment: Alignment.center,
+                  child: child,
+                ),
+              );
+            },
+            child: box,
+          ),
+        ),
+      );
+    }
+
+    final wrapped = RepaintBoundary(child: box);
+    if (widget.semanticLabel == null) return wrapped;
+    return Semantics(
+      container: true,
+      button: interactive,
+      label: widget.semanticLabel,
+      child: wrapped,
+    );
+  }
+}
+
+/// 120Hz 顺滑展开/收起容器（`AnimatedSize` + 柔和缩放渐显）。
+class NeuAnimatedExpand extends StatelessWidget {
+  const NeuAnimatedExpand({
+    super.key,
+    required this.expanded,
+    required this.child,
+  });
+
+  final bool expanded;
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final duration = NeuMotion.resolveState(context);
+    final curve = NeuMotion.resolveStateCurve(context);
+    return AnimatedSize(
+      duration: duration,
+      curve: curve,
+      alignment: Alignment.topCenter,
+      child: expanded
+          ? TweenAnimationBuilder<double>(
+              tween: Tween<double>(begin: 0.0, end: 1.0),
+              duration: duration,
+              curve: curve,
+              builder: (context, t, inner) {
+                return Opacity(
+                  opacity: t,
+                  child: Transform.translate(
+                    offset: Offset(0, (1 - t) * -6),
+                    child: inner,
+                  ),
+                );
+              },
+              child: child,
+            )
+          : const SizedBox.shrink(),
+    );
+  }
+}
+
+/// 轻拟态内容切换器（`scale(0.96) + fade`，严禁 `scale(0)`）。
+class NeuMotionSwitcher extends StatelessWidget {
+  const NeuMotionSwitcher({
+    super.key,
+    required this.child,
+  });
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    final duration = NeuMotion.resolveState(context);
+    final curve = NeuMotion.resolveStateCurve(context);
+    final reduced = NeuMotion.isReduced(context);
+    return AnimatedSwitcher(
+      duration: duration,
+      switchInCurve: curve,
+      switchOutCurve: Curves.easeInToLinear,
+      transitionBuilder: (widget, animation) {
+        if (reduced) {
+          return FadeTransition(opacity: animation, child: widget);
+        }
+        final scale = Tween<double>(begin: 0.965, end: 1.0).animate(animation);
+        return FadeTransition(
+          opacity: animation,
+          child: ScaleTransition(
+            scale: scale,
+            child: widget,
+          ),
+        );
+      },
+      child: child,
+    );
   }
 }
 
 enum NeuButtonTone { neutral, primary, danger, healthy }
 
-/// 第一性原理新拟态按钮：
-/// 完整状态机（rest / hover / pressed / focused / disabled / loading）、
-/// 键盘 Enter/Space 激活、WCAG >= 3:1 焦点环、Transform.scale(0.97) + 220ms 物理按压、
-/// >= 44x44px（移动端 >= 48px）触控热区与 Semantics(button: true)。
+/// 轻拟态按钮：主按钮使用设计稿同款科技蓝渐变 + 柔和投影，中性按钮使用纯白 + 细腻冷蓝边框。
 class NeuButton extends StatefulWidget {
   const NeuButton({
     super.key,
@@ -387,27 +791,13 @@ class _NeuButtonState extends State<NeuButton> {
   final FocusNode _focusNode = FocusNode(debugLabel: 'NeuButton');
   bool _hovered = false;
   bool _pressed = false;
-  bool _focused = false;
 
   bool get _enabled => widget.onPressed != null && !widget.loading;
 
   @override
-  void initState() {
-    super.initState();
-    _focusNode.addListener(_handleFocusChange);
-  }
-
-  @override
   void dispose() {
-    _focusNode.removeListener(_handleFocusChange);
     _focusNode.dispose();
     super.dispose();
-  }
-
-  void _handleFocusChange() {
-    if (_focusNode.hasFocus != _focused) {
-      setState(() => _focused = _focusNode.hasFocus);
-    }
   }
 
   void _setPressed(bool value) {
@@ -443,37 +833,31 @@ class _NeuButtonState extends State<NeuButton> {
     };
   }
 
-  Color _resolveBackground(NeuTheme neu) {
+  Color? _resolveBackground(NeuTheme neu) {
     if (!_enabled) return neu.insetColor;
     return switch (widget.tone) {
       NeuButtonTone.neutral =>
         _hovered && !_pressed ? NeuTokens.hoverSurface : neu.surfaceColor,
-      NeuButtonTone.primary =>
-        _pressed ? NeuTokens.accentPressed : NeuTokens.accent,
+      NeuButtonTone.primary => _pressed ? NeuTokens.accentPressed : null,
       NeuButtonTone.danger => NeuTokens.danger,
       NeuButtonTone.healthy => NeuTokens.healthy,
     };
   }
 
-  List<BoxShadow>? _resolveShadows(NeuTheme neu) {
-    final base = !_enabled
-        ? const <BoxShadow>[]
-        : (_pressed ? neu.pressedShadows : NeuTokens.controlShadows);
-    if (!_focused) {
-      return base.isEmpty ? null : base;
+  Gradient? _resolveGradient() {
+    if (!_enabled || widget.tone != NeuButtonTone.primary || _pressed) {
+      return null;
     }
-    final ringColor = widget.tone == NeuButtonTone.primary
-        ? NeuTokens.textPrimary
-        : NeuTokens.accent;
-    return <BoxShadow>[
-      ...base,
-      BoxShadow(
-        color: ringColor,
-        offset: Offset.zero,
-        blurRadius: 0,
-        spreadRadius: 2.5,
-      ),
-    ];
+    return NeuTokens.primaryGradient;
+  }
+
+  List<BoxShadow>? _resolveShadows(NeuTheme neu) {
+    if (!_enabled) return null;
+    if (_pressed) return neu.pressedShadows;
+    if (widget.tone == NeuButtonTone.primary) {
+      return NeuTokens.primaryButtonShadows;
+    }
+    return NeuTokens.controlShadows;
   }
 
   @override
@@ -485,6 +869,7 @@ class _NeuButtonState extends State<NeuButton> {
     final minTouch = NeuTokens.resolveMinTouchTarget(context);
     final fg = _resolveForeground();
     final bg = _resolveBackground(neu);
+    final gradient = _resolveGradient();
     final targetScale =
         (_pressed && _enabled && !reduced) ? NeuMotion.pressedScale : 1.0;
 
@@ -503,8 +888,8 @@ class _NeuButtonState extends State<NeuButton> {
           ),
           const SizedBox(width: NeuSpace.sm),
         ] else if (widget.icon != null) ...<Widget>[
-          Icon(widget.icon, size: 18, color: fg),
-          const SizedBox(width: NeuSpace.sm),
+          Icon(widget.icon, size: 17, color: fg),
+          const SizedBox(width: 6),
         ],
         Flexible(
           child: Text(
@@ -524,24 +909,21 @@ class _NeuButtonState extends State<NeuButton> {
         minHeight: minTouch,
       ),
       padding: const EdgeInsets.symmetric(
-        horizontal: NeuSpace.md,
-        vertical: 12,
+        horizontal: 16,
+        vertical: 10,
       ),
       decoration: BoxDecoration(
-        color: bg,
+        color: gradient == null ? bg : null,
+        gradient: gradient,
         borderRadius: BorderRadius.all(Radius.circular(widget.radius)),
-        border: Border.all(
-          color: _focused
-              ? (widget.tone == NeuButtonTone.primary
-                  ? Colors.white
-                  : NeuTokens.accent)
-              : (widget.tone == NeuButtonTone.neutral
-                  ? (_enabled
-                      ? NeuTokens.controlOutline.withValues(alpha: 0.35)
-                      : NeuTokens.hairlineBorder)
-                  : bg),
-          width: _focused ? 1.5 : 1.0,
-        ),
+        border: widget.tone == NeuButtonTone.neutral || !_enabled
+            ? Border.all(
+                color: _hovered && _enabled
+                    ? NeuTokens.controlOutline
+                    : NeuTokens.hairlineBorder,
+                width: 1.0,
+              )
+            : null,
         boxShadow: _resolveShadows(neu),
       ),
       child: content,
@@ -567,12 +949,7 @@ class _NeuButtonState extends State<NeuButton> {
             },
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTapDown: _enabled
-                  ? (_) {
-                      _focusNode.requestFocus();
-                      _setPressed(true);
-                    }
-                  : null,
+              onTapDown: _enabled ? (_) => _setPressed(true) : null,
               onTapUp: _enabled ? (_) => _setPressed(false) : null,
               onTapCancel: _enabled ? () => _setPressed(false) : null,
               onTap: _enabled ? widget.onPressed : null,
@@ -597,9 +974,7 @@ class _NeuButtonState extends State<NeuButton> {
   }
 }
 
-/// 第一性原理新拟态开关（替代原生 Material SwitchListTile）：
-/// 凹陷轨道 + 凸起圆滑块、280ms Apple 曲线平滑位移、开启态 >= 3:1 对比度、
-/// 键盘/焦点环、Semantics(toggled: value) 与整行 >= 48px 触控区。
+/// 轻拟态开关（支持完整标题行或紧凑纯开关两种展示）。
 class NeuSwitch extends StatefulWidget {
   const NeuSwitch({
     super.key,
@@ -624,28 +999,14 @@ class NeuSwitch extends StatefulWidget {
 
 class _NeuSwitchState extends State<NeuSwitch> {
   final FocusNode _focusNode = FocusNode(debugLabel: 'NeuSwitch');
-  bool _focused = false;
   bool _pressed = false;
 
   bool get _enabled => widget.onChanged != null;
 
   @override
-  void initState() {
-    super.initState();
-    _focusNode.addListener(_handleFocusChange);
-  }
-
-  @override
   void dispose() {
-    _focusNode.removeListener(_handleFocusChange);
     _focusNode.dispose();
     super.dispose();
-  }
-
-  void _handleFocusChange() {
-    if (_focusNode.hasFocus != _focused) {
-      setState(() => _focused = _focusNode.hasFocus);
-    }
   }
 
   void _toggle() {
@@ -667,7 +1028,6 @@ class _NeuSwitchState extends State<NeuSwitch> {
 
   @override
   Widget build(BuildContext context) {
-    final neu = NeuTheme.of(context);
     final textTheme = Theme.of(context).textTheme;
     final stateDuration = NeuMotion.resolveState(context);
     final stateCurve = NeuMotion.resolveStateCurve(context);
@@ -675,21 +1035,63 @@ class _NeuSwitchState extends State<NeuSwitch> {
     final pressCurve = NeuMotion.resolvePressCurve(context);
     final reduced = NeuMotion.isReduced(context);
 
-    final trackColor = !_enabled
-        ? neu.insetColor
-        : (widget.value ? NeuTokens.accent : neu.insetColor);
-    final trackBorderColor = widget.value
-        ? NeuTokens.accent
-        : NeuTokens.controlOutline;
-
     final thumbScale =
         (_pressed && _enabled && !reduced) ? NeuMotion.pressedScale : 1.0;
+
+    final switchTrack = AnimatedContainer(
+      duration: stateDuration,
+      curve: stateCurve,
+      width: 48,
+      height: 28,
+      padding: const EdgeInsets.all(3),
+      decoration: BoxDecoration(
+        color: !_enabled
+            ? const Color(0xFFE2E8F0)
+            : (widget.value ? null : const Color(0xFFD6DFEE)),
+        gradient: _enabled && widget.value ? NeuTokens.primaryGradient : null,
+        borderRadius: const BorderRadius.all(Radius.circular(NeuRadius.pill)),
+      ),
+      child: AnimatedAlign(
+        alignment: widget.value ? Alignment.centerRight : Alignment.centerLeft,
+        duration: stateDuration,
+        curve: stateCurve,
+        child: TweenAnimationBuilder<double>(
+          tween: Tween<double>(end: thumbScale),
+          duration: pressDuration,
+          curve: pressCurve,
+          builder: (context, scale, child) {
+            return Transform.scale(
+              scale: scale,
+              child: child,
+            );
+          },
+          child: Container(
+            width: 22,
+            height: 22,
+            decoration: const BoxDecoration(
+              color: Colors.white,
+              shape: BoxShape.circle,
+              boxShadow: <BoxShadow>[
+                BoxShadow(
+                  color: Color(0x260F172A),
+                  offset: Offset(0, 2),
+                  blurRadius: 4,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+
+    final compactMode = widget.title.isEmpty && widget.subtitle == null;
 
     return RepaintBoundary(
       child: Semantics(
         toggled: widget.value,
         enabled: _enabled,
-        label: widget.semanticLabel ?? widget.title,
+        label: widget.semanticLabel ??
+            (widget.title.isEmpty ? '开关' : widget.title),
         hint: widget.subtitle,
         child: Focus(
           focusNode: _focusNode,
@@ -701,125 +1103,54 @@ class _NeuSwitchState extends State<NeuSwitch> {
                 : SystemMouseCursors.forbidden,
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTapDown: _enabled
-                  ? (_) {
-                      _focusNode.requestFocus();
-                      setState(() => _pressed = true);
-                    }
-                  : null,
+              onTapDown: _enabled ? (_) => setState(() => _pressed = true) : null,
               onTapUp: _enabled ? (_) => setState(() => _pressed = false) : null,
               onTapCancel:
                   _enabled ? () => setState(() => _pressed = false) : null,
               onTap: _enabled ? _toggle : null,
-              child: ConstrainedBox(
-                constraints: const BoxConstraints(
-                  minHeight: NeuTokens.minMobileTouchTarget,
-                ),
-                child: Padding(
-                  padding: widget.padding,
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: <Widget>[
-                      Expanded(
-                        child: Column(
-                          mainAxisSize: MainAxisSize.min,
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: <Widget>[
-                            Text(
-                              widget.title,
-                              style: textTheme.titleSmall?.copyWith(
-                                color: _enabled
-                                    ? NeuTokens.textPrimary
-                                    : NeuTokens.textSecondary,
-                              ),
-                            ),
-                            if (widget.subtitle != null) ...<Widget>[
-                              const SizedBox(height: 2),
-                              Text(
-                                widget.subtitle!,
-                                style: textTheme.bodySmall,
-                              ),
-                            ],
-                          ],
-                        ),
+              child: compactMode
+                  ? Padding(
+                      padding: const EdgeInsets.all(4),
+                      child: switchTrack,
+                    )
+                  : ConstrainedBox(
+                      constraints: const BoxConstraints(
+                        minHeight: NeuTokens.minMobileTouchTarget,
                       ),
-                      const SizedBox(width: NeuSpace.md),
-                      AnimatedContainer(
-                        duration: stateDuration,
-                        curve: stateCurve,
-                        width: 52,
-                        height: 30,
-                        padding: const EdgeInsets.all(3),
-                        decoration: BoxDecoration(
-                          color: trackColor,
-                          borderRadius: const BorderRadius.all(
-                            Radius.circular(NeuRadius.pill),
-                          ),
-                          border: Border.all(
-                            color: _focused
-                                ? (widget.value
-                                    ? NeuTokens.textPrimary
-                                    : NeuTokens.accent)
-                                : trackBorderColor,
-                            width: _focused ? 2.0 : 1.5,
-                          ),
-                          boxShadow: _focused
-                              ? <BoxShadow>[
-                                  BoxShadow(
-                                    color: widget.value
-                                        ? NeuTokens.textPrimary
-                                        : NeuTokens.accent,
-                                    offset: Offset.zero,
-                                    blurRadius: 0,
-                                    spreadRadius: 2.0,
+                      child: Padding(
+                        padding: widget.padding,
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: <Widget>[
+                            Expanded(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: <Widget>[
+                                  Text(
+                                    widget.title,
+                                    style: textTheme.titleSmall?.copyWith(
+                                      color: _enabled
+                                          ? NeuTokens.textPrimary
+                                          : NeuTokens.textSecondary,
+                                    ),
                                   ),
-                                ]
-                              : null,
-                        ),
-                        child: AnimatedAlign(
-                          alignment: widget.value
-                              ? Alignment.centerRight
-                              : Alignment.centerLeft,
-                          duration: stateDuration,
-                          curve: stateCurve,
-                          child: TweenAnimationBuilder<double>(
-                            tween: Tween<double>(end: thumbScale),
-                            duration: pressDuration,
-                            curve: pressCurve,
-                            builder: (context, scale, child) {
-                              return Transform.scale(
-                                scale: scale,
-                                child: child,
-                              );
-                            },
-                            child: Container(
-                              width: 22,
-                              height: 22,
-                              decoration: BoxDecoration(
-                                color: Colors.white,
-                                shape: BoxShape.circle,
-                                border: Border.all(
-                                  color: widget.value
-                                      ? Colors.white
-                                      : NeuTokens.hairlineBorder,
-                                  width: 1,
-                                ),
-                                boxShadow: const <BoxShadow>[
-                                  BoxShadow(
-                                    color: Color(0x331E293B),
-                                    offset: Offset(0, 2),
-                                    blurRadius: 4,
-                                  ),
+                                  if (widget.subtitle != null) ...<Widget>[
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      widget.subtitle!,
+                                      style: textTheme.bodySmall,
+                                    ),
+                                  ],
                                 ],
                               ),
                             ),
-                          ),
+                            const SizedBox(width: NeuSpace.md),
+                            switchTrack,
+                          ],
                         ),
                       ),
-                    ],
-                  ),
-                ),
-              ),
+                    ),
             ),
           ),
         ),
@@ -842,9 +1173,7 @@ class NeuSegment<T> {
   final String? semanticLabel;
 }
 
-/// 第一性原理新拟态分段切换器：
-/// 同心圆角（外 14.0、内边距 4.0、滑块 concentric(14, 4) = 10.0）、
-/// 280ms Apple 统一曲线、键盘左右方向键导航、WCAG >= 3:1 焦点环与 Semantics(selected)。
+/// 分段切换器（设计稿设备页/快照页同款：选中态蓝渐变胶囊白字 + 冰蓝凹陷底槽）。
 class NeuSegmentedControl<T> extends StatefulWidget {
   const NeuSegmentedControl({
     super.key,
@@ -853,7 +1182,10 @@ class NeuSegmentedControl<T> extends StatefulWidget {
     required this.onChanged,
     this.enabled = true,
     this.semanticLabel,
-  }) : assert(segments.length >= 2, 'NeuSegmentedControl requires at least 2 segments.');
+  }) : assert(
+          segments.length >= 2,
+          'NeuSegmentedControl requires at least 2 segments.',
+        );
 
   final List<NeuSegment<T>> segments;
   final T value;
@@ -867,25 +1199,11 @@ class NeuSegmentedControl<T> extends StatefulWidget {
 
 class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
   final FocusNode _focusNode = FocusNode(debugLabel: 'NeuSegmentedControl');
-  bool _focused = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _focusNode.addListener(_handleFocusChange);
-  }
 
   @override
   void dispose() {
-    _focusNode.removeListener(_handleFocusChange);
     _focusNode.dispose();
     super.dispose();
-  }
-
-  void _handleFocusChange() {
-    if (_focusNode.hasFocus != _focused) {
-      setState(() => _focused = _focusNode.hasFocus);
-    }
   }
 
   int get _selectedIndex {
@@ -934,10 +1252,9 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
     final neu = NeuTheme.of(context);
     final duration = NeuMotion.resolveState(context);
     final curve = NeuMotion.resolveStateCurve(context);
-    final minTouch = NeuTokens.resolveMinTouchTarget(context);
 
     const double outerRadius = NeuRadius.segmentedTrack;
-    const double trackPadding = NeuSpace.xs;
+    const double trackPadding = 3.0;
     final double thumbRadius = NeuRadius.concentric(outerRadius, trackPadding);
 
     return RepaintBoundary(
@@ -948,9 +1265,7 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
           focusNode: _focusNode,
           canRequestFocus: widget.enabled,
           onKeyEvent: _handleKey,
-          child: AnimatedContainer(
-            duration: NeuMotion.resolvePress(context),
-            curve: NeuMotion.resolvePressCurve(context),
+          child: Container(
             padding: const EdgeInsets.all(trackPadding),
             decoration: BoxDecoration(
               color: neu.insetColor,
@@ -958,24 +1273,12 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
                 Radius.circular(outerRadius),
               ),
               border: Border.all(
-                color: _focused
-                    ? NeuTokens.accent
-                    : NeuTokens.controlOutline.withValues(alpha: 0.45),
-                width: _focused ? 2.0 : 1.0,
+                color: NeuTokens.hairlineBorder,
+                width: 1.0,
               ),
-              boxShadow: _focused
-                  ? const <BoxShadow>[
-                      BoxShadow(
-                        color: NeuTokens.accent,
-                        offset: Offset.zero,
-                        blurRadius: 0,
-                        spreadRadius: 1.5,
-                      ),
-                    ]
-                  : null,
             ),
             child: SizedBox(
-              height: minTouch,
+              height: 38,
               child: Stack(
                 children: <Widget>[
                   Positioned.fill(
@@ -988,15 +1291,17 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
                         heightFactor: 1.0,
                         child: DecoratedBox(
                           decoration: BoxDecoration(
-                            color: neu.surfaceColor,
+                            gradient: NeuTokens.primaryGradient,
                             borderRadius: BorderRadius.all(
                               Radius.circular(thumbRadius),
                             ),
-                            border: Border.all(
-                              color: NeuTokens.lightShadow.withValues(alpha: 0.85),
-                              width: 1,
-                            ),
-                            boxShadow: NeuTokens.controlShadows,
+                            boxShadow: const <BoxShadow>[
+                              BoxShadow(
+                                color: Color(0x282563EB),
+                                offset: Offset(0, 3),
+                                blurRadius: 8,
+                              ),
+                            ],
                           ),
                         ),
                       ),
@@ -1018,17 +1323,13 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
                               child: GestureDetector(
                                 behavior: HitTestBehavior.opaque,
                                 onTap: widget.enabled
-                                    ? () {
-                                        _focusNode.requestFocus();
-                                        widget.onChanged(segment.value);
-                                      }
+                                    ? () => widget.onChanged(segment.value)
                                     : null,
-                                child: ConstrainedBox(
-                                  constraints: BoxConstraints(
-                                    minWidth: minTouch,
-                                    minHeight: minTouch,
-                                  ),
-                                  child: Center(
+                                child: Center(
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 8,
+                                    ),
                                     child: Text(
                                       segment.label,
                                       maxLines: 1,
@@ -1037,8 +1338,9 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
                                           .textTheme
                                           .labelLarge
                                           ?.copyWith(
+                                            fontSize: 13.5,
                                             color: segment.value == widget.value
-                                                ? NeuTokens.accent
+                                                ? Colors.white
                                                 : NeuTokens.textSecondary,
                                           ),
                                     ),
@@ -1060,8 +1362,7 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
   }
 }
 
-/// 凹陷输入框（诺曼物理隐喻：凹陷 = 可输入槽位）：
-/// >= 16px 字号防移动端缩放、220ms Apple 曲线焦点环（>= 3:1）、纯 BoxDecoration。
+/// 凹陷输入框（冰蓝槽 `#EEF3FA` + 聚焦科技蓝描边）。
 class NeuInsetField extends StatefulWidget {
   const NeuInsetField({
     super.key,
@@ -1126,9 +1427,7 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
     final hasError = widget.errorText != null;
     final borderColor = hasError
         ? NeuTokens.danger
-        : (_focused
-            ? NeuTokens.accent
-            : NeuTokens.controlOutline.withValues(alpha: 0.55));
+        : (_focused ? NeuTokens.accent : NeuTokens.hairlineBorder);
 
     return RepaintBoundary(
       child: Column(
@@ -1138,9 +1437,11 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
           if (widget.label != null) ...<Widget>[
             Text(
               widget.label!,
-              style: Theme.of(context).textTheme.labelMedium,
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: NeuTokens.textPrimary,
+                  ),
             ),
-            const SizedBox(height: NeuSpace.sm),
+            const SizedBox(height: 6),
           ],
           AnimatedContainer(
             duration: duration,
@@ -1148,29 +1449,23 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
             constraints: BoxConstraints(minHeight: minTouch),
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
             decoration: BoxDecoration(
-              color: neu.insetColor,
+              color: _focused ? NeuTokens.surface : neu.insetColor,
               borderRadius: const BorderRadius.all(
                 Radius.circular(NeuRadius.control),
               ),
               border: Border.all(
                 color: borderColor,
-                width: _focused || hasError ? 2.0 : 1.0,
+                width: _focused || hasError ? 1.4 : 1.0,
               ),
-              boxShadow: <BoxShadow>[
-                const BoxShadow(
-                  color: NeuTokens.lightShadow,
-                  offset: Offset(1, 1),
-                  blurRadius: 0,
-                ),
-                if (_focused)
-                  BoxShadow(
-                    color: (hasError ? NeuTokens.danger : NeuTokens.accent)
-                        .withValues(alpha: 0.22),
-                    offset: Offset.zero,
-                    blurRadius: 0,
-                    spreadRadius: 2.0,
-                  ),
-              ],
+              boxShadow: _focused
+                  ? const <BoxShadow>[
+                      BoxShadow(
+                        color: Color(0x1F2563EB),
+                        blurRadius: 8,
+                        spreadRadius: 0,
+                      ),
+                    ]
+                  : null,
             ),
             child: Row(
               crossAxisAlignment: widget.maxLines == 1
@@ -1183,7 +1478,8 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
                     child: Icon(
                       widget.prefixIcon,
                       size: 18,
-                      color: NeuTokens.textSecondary,
+                      color:
+                          _focused ? NeuTokens.accent : NeuTokens.textSecondary,
                     ),
                   ),
                   const SizedBox(width: NeuSpace.sm),
@@ -1199,7 +1495,7 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
                     onSubmitted: widget.onSubmitted,
                     cursorColor: NeuTokens.accent,
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          fontSize: 16,
+                          fontSize: 15,
                           height: 1.4,
                           color: widget.enabled
                               ? NeuTokens.textPrimary
@@ -1210,10 +1506,10 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
                       border: InputBorder.none,
                       hintText: widget.hint,
                       hintStyle: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            fontSize: 16,
+                            fontSize: 14.5,
                             color: NeuTokens.textSecondary,
                           ),
-                      contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                      contentPadding: const EdgeInsets.symmetric(vertical: 11),
                     ),
                   ),
                 ),
@@ -1240,13 +1536,12 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
   }
 }
 
-/// 凹陷槽容量/进度条：280ms Apple 曲线平滑过渡 + 等宽数字百分比 + Semantics 播报，
-/// 无 ClipPath / BackdropFilter。
+/// 轻拟态容量/进度条：设计稿同款圆角蓝渐变进度条 + 冰蓝槽底。
 class NeuProgressBar extends StatelessWidget {
   const NeuProgressBar({
     super.key,
     required this.value,
-    this.height = 12,
+    this.height = 8,
     this.fillColor = NeuTokens.accent,
     this.showPercentage = true,
     this.semanticLabel,
@@ -1263,18 +1558,15 @@ class NeuProgressBar extends StatelessWidget {
     final neu = NeuTheme.of(context);
     final duration = NeuMotion.resolveState(context);
     final curve = NeuMotion.resolveStateCurve(context);
-    final radius = const BorderRadius.all(Radius.circular(NeuRadius.pill));
+    const radius = BorderRadius.all(Radius.circular(NeuRadius.pill));
     final percent = (value * 100).round();
+    final usePrimaryGradient = fillColor == NeuTokens.accent;
 
     final track = Container(
       height: height,
       decoration: BoxDecoration(
         color: neu.insetColor,
         borderRadius: radius,
-        border: Border.all(
-          color: NeuTokens.controlOutline.withValues(alpha: 0.45),
-          width: 1,
-        ),
       ),
       child: Align(
         alignment: Alignment.centerLeft,
@@ -1285,7 +1577,8 @@ class NeuProgressBar extends StatelessWidget {
           heightFactor: 1.0,
           child: DecoratedBox(
             decoration: BoxDecoration(
-              color: fillColor,
+              color: usePrimaryGradient ? null : fillColor,
+              gradient: usePrimaryGradient ? NeuTokens.primaryGradient : null,
               borderRadius: radius,
             ),
           ),
@@ -1318,6 +1611,154 @@ class NeuProgressBar extends StatelessWidget {
                 ],
               )
             : track,
+      ),
+    );
+  }
+}
+
+/// 下拉选择项模型。
+@immutable
+class NeuDropdownOption<T> {
+  const NeuDropdownOption({
+    required this.value,
+    required this.label,
+    this.subtitle,
+  });
+
+  final T value;
+  final String label;
+  final String? subtitle;
+}
+
+/// 冰蓝槽下拉选择框。
+class NeuDropdown<T> extends StatelessWidget {
+  const NeuDropdown({
+    super.key,
+    required this.options,
+    required this.value,
+    required this.onChanged,
+    this.label,
+    this.emptyHint = '暂无可选项',
+    this.prefixIcon,
+    this.enabled = true,
+  });
+
+  final List<NeuDropdownOption<T>> options;
+  final T? value;
+  final ValueChanged<T?>? onChanged;
+  final String? label;
+  final String emptyHint;
+  final IconData? prefixIcon;
+  final bool enabled;
+
+  @override
+  Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
+    final minTouch = NeuTokens.resolveMinTouchTarget(context);
+    final isEmpty = options.isEmpty;
+    final canSelect = enabled && !isEmpty && onChanged != null;
+    final hasMatch = options.any((o) => o.value == value);
+    final effectiveValue = hasMatch ? value : null;
+
+    return RepaintBoundary(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          if (label != null) ...<Widget>[
+            Text(
+              label!,
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                    color: NeuTokens.textPrimary,
+                  ),
+            ),
+            const SizedBox(height: 6),
+          ],
+          Container(
+            constraints: BoxConstraints(minHeight: minTouch),
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
+            decoration: BoxDecoration(
+              color: neu.insetColor,
+              borderRadius: const BorderRadius.all(
+                Radius.circular(NeuRadius.control),
+              ),
+              border: Border.all(
+                color: NeuTokens.hairlineBorder,
+                width: 1.0,
+              ),
+            ),
+            child: Row(
+              children: <Widget>[
+                if (prefixIcon != null) ...<Widget>[
+                  Icon(prefixIcon, size: 18, color: NeuTokens.textSecondary),
+                  const SizedBox(width: NeuSpace.sm),
+                ],
+                Expanded(
+                  child: isEmpty
+                      ? Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 11),
+                          child: Text(
+                            emptyHint,
+                            style: Theme.of(context)
+                                .textTheme
+                                .bodyMedium
+                                ?.copyWith(
+                                  fontSize: 14.5,
+                                  color: NeuTokens.textSecondary,
+                                ),
+                          ),
+                        )
+                      : DropdownButtonHideUnderline(
+                          child: DropdownButton<T>(
+                            value: effectiveValue,
+                            isExpanded: true,
+                            dropdownColor: NeuTokens.surface,
+                            borderRadius: const BorderRadius.all(
+                              Radius.circular(NeuRadius.control),
+                            ),
+                            icon: Icon(
+                              Icons.keyboard_arrow_down_rounded,
+                              color: canSelect
+                                  ? NeuTokens.textPrimary
+                                  : NeuTokens.textSecondary,
+                            ),
+                            hint: Text(
+                              emptyHint,
+                              style: Theme.of(context)
+                                  .textTheme
+                                  .bodyMedium
+                                  ?.copyWith(
+                                    fontSize: 14.5,
+                                    color: NeuTokens.textSecondary,
+                                  ),
+                            ),
+                            style: Theme.of(context)
+                                .textTheme
+                                .bodyMedium
+                                ?.copyWith(
+                                  fontSize: 14.5,
+                                  color: NeuTokens.textPrimary,
+                                ),
+                            onChanged: canSelect ? onChanged : null,
+                            items: <DropdownMenuItem<T>>[
+                              for (final opt in options)
+                                DropdownMenuItem<T>(
+                                  value: opt.value,
+                                  child: Text(
+                                    opt.subtitle == null
+                                        ? opt.label
+                                        : '${opt.label} (${opt.subtitle})',
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

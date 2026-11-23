@@ -1,48 +1,72 @@
-// 参考依据:
-// - lanvault_complete_blueprint.md 第 3.5 / 5.1 节 (4+1 导航壳层与 HCI 认知负荷收敛)
-// - ARCHITECTURE_CONTRACTS.md 第 6 节 (改良新拟态设计 Token 与响应式触控热区)
-// - Apple HIG Motion / ConcentricRectangle / WCAG 2.2 AA
-
 import 'dart:async';
 import 'dart:ui';
 
-import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
+import 'package:material_ui/material_ui.dart';
 
 import 'bridge/lanvault_bridge.dart';
 import 'features/backup/backup_screen.dart';
 import 'features/clipboard/clipboard_screen.dart';
 import 'features/dashboard/dashboard_screen.dart';
 import 'features/pairing/pairing_screen.dart';
+import 'features/settings/settings_screen.dart';
+import 'features/snapshots/snapshots_screen.dart';
 import 'features/vault/vault_screen.dart';
 import 'theme/neu_theme.dart';
 
+bool _isReportingError = false;
+
+void _safeReportUnhandledError(
+  LanVaultBridge? bridge, {
+  required String level,
+  required String source,
+  required String message,
+  String? detail,
+}) {
+  if (bridge == null || _isReportingError) return;
+  _isReportingError = true;
+  unawaited(
+    bridge
+        .reportClientLog(
+          level: level,
+          source: source,
+          message: message,
+          detail: detail,
+        )
+        .catchError((Object _) {})
+        .whenComplete(() {
+      _isReportingError = false;
+    }),
+  );
+}
+
 void main() {
+  LanVaultBridge? appBridge;
+
   runZonedGuarded<void>(
     () {
       WidgetsFlutterBinding.ensureInitialized();
       final bridge = LanVaultBridge();
+      appBridge = bridge;
 
       FlutterError.onError = (FlutterErrorDetails details) {
         FlutterError.presentError(details);
-        unawaited(
-          bridge.reportClientLog(
-            level: 'ERROR',
-            source: 'flutter.framework',
-            message: details.exceptionAsString(),
-            detail: details.stack?.toString(),
-          ),
+        _safeReportUnhandledError(
+          bridge,
+          level: 'ERROR',
+          source: 'flutter.framework',
+          message: details.exceptionAsString(),
+          detail: details.stack?.toString(),
         );
       };
 
       PlatformDispatcher.instance.onError = (Object error, StackTrace stack) {
-        unawaited(
-          bridge.reportClientLog(
-            level: 'FATAL',
-            source: 'flutter.platform',
-            message: error.toString(),
-            detail: stack.toString(),
-          ),
+        _safeReportUnhandledError(
+          bridge,
+          level: 'FATAL',
+          source: 'flutter.platform',
+          message: error.toString(),
+          detail: stack.toString(),
         );
         return true;
       };
@@ -50,16 +74,33 @@ void main() {
       runApp(LanVaultApp(bridge: bridge));
     },
     (Object error, StackTrace stack) {
-      // Unhandled async zone errors are forwarded if native FFI is initialized.
-      debugPrint('LanVault ZoneError: $error\n$stack');
+      debugPrint('EveryoneNAS ZoneError: $error\n$stack');
+      _safeReportUnhandledError(
+        appBridge,
+        level: 'FATAL',
+        source: 'flutter.zone',
+        message: error.toString(),
+        detail: stack.toString(),
+      );
     },
   );
 }
 
-class LanVaultApp extends StatelessWidget {
+class LanVaultApp extends StatefulWidget {
   const LanVaultApp({super.key, required this.bridge});
 
   final LanVaultBridge bridge;
+
+  @override
+  State<LanVaultApp> createState() => _LanVaultAppState();
+}
+
+class _LanVaultAppState extends State<LanVaultApp> {
+  @override
+  void dispose() {
+    widget.bridge.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -67,18 +108,20 @@ class LanVaultApp extends StatelessWidget {
       title: 'EveryoneNAS',
       debugShowCheckedModeBanner: false,
       theme: buildLanVaultTheme(),
-      home: LanVaultShell(bridge: bridge),
+      home: LanVaultShell(bridge: widget.bridge),
     );
   }
 }
 
-/// 固定顺序的 5 个功能页签，索引与 [IndexedStack] 子页严格一一对应。
+/// 严格对齐设计稿顺序的 7 个功能页签。
 enum _ShellTab {
   dashboard,
-  pairing,
+  devices,
   backup,
-  vault,
-  clipboard,
+  storage,
+  snapshots,
+  transfer,
+  settings,
 }
 
 class _NavItem {
@@ -96,8 +139,8 @@ class _NavItem {
 }
 
 /// 跨平台自适应主导航壳层：
-/// 监听 [LanVaultBridge.roleModeNotifier] 动态裁剪桌面侧边栏与移动底栏可见页签，
-/// 同时以固定顺序的 [IndexedStack] + [GlobalKey] 保持各页面状态不丢失。
+/// - 桌面端（>= 840px）：左侧 216px 固定导航栏，7 个导航项依次排布，激活项为实心蓝渐变胶囊。
+/// - 移动端（< 840px）：顶部标题栏 + 右上角一键进入“设置”齿轮按钮；底部 6 项紧凑导航栏。
 class LanVaultShell extends StatefulWidget {
   const LanVaultShell({super.key, required this.bridge});
 
@@ -108,147 +151,283 @@ class LanVaultShell extends StatefulWidget {
 }
 
 class _LanVaultShellState extends State<LanVaultShell> {
-  static const Map<_ShellTab, _NavItem> _allDestinations =
-      <_ShellTab, _NavItem>{
-    _ShellTab.dashboard: _NavItem(
+  static const List<_NavItem> _desktopDestinations = <_NavItem>[
+    _NavItem(
       tab: _ShellTab.dashboard,
-      label: '概览',
-      icon: Icons.monitor_heart_outlined,
-      selectedIcon: Icons.monitor_heart,
+      label: '总览',
+      icon: Icons.home_outlined,
+      selectedIcon: Icons.home_rounded,
     ),
-    _ShellTab.pairing: _NavItem(
-      tab: _ShellTab.pairing,
-      label: '配对',
+    _NavItem(
+      tab: _ShellTab.devices,
+      label: '设备',
       icon: Icons.devices_outlined,
-      selectedIcon: Icons.devices,
+      selectedIcon: Icons.devices_rounded,
     ),
-    _ShellTab.backup: _NavItem(
+    _NavItem(
       tab: _ShellTab.backup,
       label: '备份',
-      icon: Icons.sync_outlined,
-      selectedIcon: Icons.sync,
+      icon: Icons.cloud_sync_outlined,
+      selectedIcon: Icons.cloud_sync_rounded,
     ),
-    _ShellTab.vault: _NavItem(
-      tab: _ShellTab.vault,
-      label: '空间',
-      icon: Icons.storage_outlined,
-      selectedIcon: Icons.storage,
+    _NavItem(
+      tab: _ShellTab.storage,
+      label: '存储',
+      icon: Icons.layers_outlined,
+      selectedIcon: Icons.layers_rounded,
     ),
-    _ShellTab.clipboard: _NavItem(
-      tab: _ShellTab.clipboard,
-      label: '快传',
-      icon: Icons.content_paste_outlined,
-      selectedIcon: Icons.content_paste,
+    _NavItem(
+      tab: _ShellTab.snapshots,
+      label: '快照',
+      icon: Icons.history_rounded,
+      selectedIcon: Icons.history_rounded,
     ),
-  };
+    _NavItem(
+      tab: _ShellTab.transfer,
+      label: '传输',
+      icon: Icons.send_outlined,
+      selectedIcon: Icons.send_rounded,
+    ),
+    _NavItem(
+      tab: _ShellTab.settings,
+      label: '设置',
+      icon: Icons.settings_outlined,
+      selectedIcon: Icons.settings_rounded,
+    ),
+  ];
+
+  static const List<_NavItem> _mobileDestinations = <_NavItem>[
+    _NavItem(
+      tab: _ShellTab.dashboard,
+      label: '总览',
+      icon: Icons.home_outlined,
+      selectedIcon: Icons.home_rounded,
+    ),
+    _NavItem(
+      tab: _ShellTab.devices,
+      label: '设备',
+      icon: Icons.devices_outlined,
+      selectedIcon: Icons.devices_rounded,
+    ),
+    _NavItem(
+      tab: _ShellTab.backup,
+      label: '备份',
+      icon: Icons.cloud_sync_outlined,
+      selectedIcon: Icons.cloud_sync_rounded,
+    ),
+    _NavItem(
+      tab: _ShellTab.storage,
+      label: '存储',
+      icon: Icons.layers_outlined,
+      selectedIcon: Icons.layers_rounded,
+    ),
+    _NavItem(
+      tab: _ShellTab.snapshots,
+      label: '快照',
+      icon: Icons.history_rounded,
+      selectedIcon: Icons.history_rounded,
+    ),
+    _NavItem(
+      tab: _ShellTab.transfer,
+      label: '传输',
+      icon: Icons.send_outlined,
+      selectedIcon: Icons.send_rounded,
+    ),
+  ];
 
   final GlobalKey _pagesStackKey = GlobalKey();
-  late final List<Widget> _pages;
+  late List<Widget> _pages;
   _ShellTab _selectedTab = _ShellTab.dashboard;
+
+  List<Widget> _buildPages(LanVaultBridge bridge) {
+    return <Widget>[
+      DashboardScreen(
+        bridge: bridge,
+        onOpenSnapshots: () => setState(() => _selectedTab = _ShellTab.snapshots),
+      ),
+      PairingScreen(bridge: bridge),
+      BackupScreen(bridge: bridge),
+      VaultScreen(bridge: bridge),
+      SnapshotsScreen(bridge: bridge),
+      ClipboardScreen(bridge: bridge),
+      SettingsScreen(bridge: bridge),
+    ];
+  }
 
   @override
   void initState() {
     super.initState();
-    _pages = <Widget>[
-      DashboardScreen(bridge: widget.bridge),
-      PairingScreen(bridge: widget.bridge),
-      BackupScreen(bridge: widget.bridge),
-      VaultScreen(bridge: widget.bridge),
-      ClipboardScreen(bridge: widget.bridge),
-    ];
-    widget.bridge.roleModeNotifier.addListener(_handleRoleModeChanged);
+    _pages = _buildPages(widget.bridge);
   }
 
   @override
   void didUpdateWidget(covariant LanVaultShell oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.bridge != widget.bridge) {
-      oldWidget.bridge.roleModeNotifier.removeListener(_handleRoleModeChanged);
-      widget.bridge.roleModeNotifier.addListener(_handleRoleModeChanged);
-      _handleRoleModeChanged();
+      _pages = _buildPages(widget.bridge);
     }
   }
 
-  @override
-  void dispose() {
-    widget.bridge.roleModeNotifier.removeListener(_handleRoleModeChanged);
-    super.dispose();
-  }
-
-  static List<_NavItem> _visibleDestinationsFor(RoleMode mode) {
-    final tabs = switch (mode) {
-      RoleMode.clientOnly => const <_ShellTab>[
-          _ShellTab.dashboard,
-          _ShellTab.pairing,
-          _ShellTab.backup,
-          _ShellTab.clipboard,
-        ],
-      RoleMode.serverOnly => const <_ShellTab>[
-          _ShellTab.dashboard,
-          _ShellTab.vault,
-          _ShellTab.pairing,
-          _ShellTab.clipboard,
-        ],
-      RoleMode.dual => const <_ShellTab>[
-          _ShellTab.dashboard,
-          _ShellTab.pairing,
-          _ShellTab.backup,
-          _ShellTab.vault,
-          _ShellTab.clipboard,
-        ],
-    };
-    return tabs.map((t) => _allDestinations[t]!).toList(growable: false);
-  }
-
-  void _handleRoleModeChanged() {
-    final visible = _visibleDestinationsFor(widget.bridge.currentRoleMode);
-    final isStillVisible = visible.any((item) => item.tab == _selectedTab);
-    setState(() {
-      if (!isStillVisible) {
-        _selectedTab = _ShellTab.dashboard;
-      }
-    });
+  String _titleForTab(_ShellTab tab) {
+    return _desktopDestinations
+        .firstWhere((item) => item.tab == tab)
+        .label;
   }
 
   @override
   Widget build(BuildContext context) {
     final isWide = MediaQuery.sizeOf(context).width >= 840;
-    final visibleDestinations =
-        _visibleDestinationsFor(widget.bridge.currentRoleMode);
-    final visibleIndex =
-        visibleDestinations.indexWhere((item) => item.tab == _selectedTab);
-    final safeVisibleIndex = visibleIndex >= 0 ? visibleIndex : 0;
-    final activeTab = visibleDestinations[safeVisibleIndex].tab;
 
     return Scaffold(
+      backgroundColor: NeuTokens.canvas,
       body: SafeArea(
-        child: Row(
-          children: <Widget>[
-            if (isWide)
-              _DesktopNavRail(
-                destinations: visibleDestinations,
-                selectedIndex: safeVisibleIndex,
-                onSelected: (index) =>
-                    setState(() => _selectedTab = visibleDestinations[index].tab),
+        child: isWide
+            ? Row(
+                children: <Widget>[
+                  _DesktopNavRail(
+                    destinations: _desktopDestinations,
+                    selectedTab: _selectedTab,
+                    onSelected: (tab) => setState(() => _selectedTab = tab),
+                  ),
+                  Expanded(
+                    child: RepaintBoundary(
+                      child: TweenAnimationBuilder<double>(
+                        key: ValueKey<_ShellTab>(_selectedTab),
+                        tween: Tween<double>(begin: 0.0, end: 1.0),
+                        duration: NeuMotion.resolveState(context),
+                        curve: NeuMotion.resolveStateCurve(context),
+                        builder: (context, t, child) {
+                          final reduced = NeuMotion.isReduced(context);
+                          return Opacity(
+                            opacity: t,
+                            child: Transform.translate(
+                              offset: Offset(0, reduced ? 0 : (1 - t) * 10),
+                              child: child,
+                            ),
+                          );
+                        },
+                        child: IndexedStack(
+                          key: _pagesStackKey,
+                          index: _selectedTab.index,
+                          children: _pages,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              )
+            : Column(
+                children: <Widget>[
+                  _MobileTopBar(
+                    title: _titleForTab(_selectedTab),
+                    inSettings: _selectedTab == _ShellTab.settings,
+                    onToggleSettings: () {
+                      setState(() {
+                        _selectedTab = _selectedTab == _ShellTab.settings
+                            ? _ShellTab.dashboard
+                            : _ShellTab.settings;
+                      });
+                    },
+                  ),
+                  Expanded(
+                    child: RepaintBoundary(
+                      child: TweenAnimationBuilder<double>(
+                        key: ValueKey<_ShellTab>(_selectedTab),
+                        tween: Tween<double>(begin: 0.0, end: 1.0),
+                        duration: NeuMotion.resolveState(context),
+                        curve: NeuMotion.resolveStateCurve(context),
+                        builder: (context, t, child) {
+                          final reduced = NeuMotion.isReduced(context);
+                          return Opacity(
+                            opacity: t,
+                            child: Transform.translate(
+                              offset: Offset(0, reduced ? 0 : (1 - t) * 10),
+                              child: child,
+                            ),
+                          );
+                        },
+                        child: IndexedStack(
+                          key: _pagesStackKey,
+                          index: _selectedTab.index,
+                          children: _pages,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
-            Expanded(
-              child: IndexedStack(
-                key: _pagesStackKey,
-                index: activeTab.index,
-                children: _pages,
-              ),
-            ),
-          ],
-        ),
       ),
       bottomNavigationBar: isWide
           ? null
           : _MobileNavBar(
-              destinations: visibleDestinations,
-              selectedIndex: safeVisibleIndex,
-              onSelected: (index) =>
-                  setState(() => _selectedTab = visibleDestinations[index].tab),
+              destinations: _mobileDestinations,
+              selectedTab: _selectedTab,
+              onSelected: (tab) => setState(() => _selectedTab = tab),
             ),
+    );
+  }
+}
+
+class _MobileTopBar extends StatelessWidget {
+  const _MobileTopBar({
+    required this.title,
+    required this.inSettings,
+    required this.onToggleSettings,
+  });
+
+  final String title;
+  final bool inSettings;
+  final VoidCallback onToggleSettings;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 12, 14, 8),
+      color: NeuTokens.canvas,
+      child: Row(
+        children: <Widget>[
+          const BrandLogoMark(size: 26),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              title,
+              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                    fontSize: 22,
+                  ),
+            ),
+          ),
+          Semantics(
+            button: true,
+            label: inSettings ? '返回总览' : '打开设置',
+            child: InkWell(
+              onTap: onToggleSettings,
+              borderRadius: const BorderRadius.all(Radius.circular(12)),
+              child: Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(
+                  color: inSettings ? NeuTokens.accentSoft : NeuTokens.surface,
+                  borderRadius: const BorderRadius.all(Radius.circular(12)),
+                  border: Border.all(
+                    color: inSettings
+                        ? NeuTokens.accent.withValues(alpha: 0.35)
+                        : NeuTokens.hairlineBorder,
+                  ),
+                ),
+                child: Icon(
+                  inSettings
+                      ? Icons.close_rounded
+                      : Icons.settings_outlined,
+                  size: 20,
+                  color: inSettings
+                      ? NeuTokens.accent
+                      : NeuTokens.textPrimary,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -256,21 +435,21 @@ class _LanVaultShellState extends State<LanVaultShell> {
 class _DesktopNavRail extends StatelessWidget {
   const _DesktopNavRail({
     required this.destinations,
-    required this.selectedIndex,
+    required this.selectedTab,
     required this.onSelected,
   });
 
   final List<_NavItem> destinations;
-  final int selectedIndex;
-  final ValueChanged<int> onSelected;
+  final _ShellTab selectedTab;
+  final ValueChanged<_ShellTab> onSelected;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 212,
-      padding: const EdgeInsets.all(NeuSpace.md),
+      width: 216,
+      padding: const EdgeInsets.fromLTRB(16, 20, 16, 18),
       decoration: const BoxDecoration(
-        color: NeuTokens.surface,
+        color: Color(0xFFFAFBFD),
         border: Border(
           right: BorderSide(color: NeuTokens.hairlineBorder, width: 1),
         ),
@@ -279,30 +458,74 @@ class _DesktopNavRail extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
           Padding(
-            padding: const EdgeInsets.symmetric(
-              horizontal: NeuSpace.sm,
-              vertical: NeuSpace.sm,
-            ),
-            child: Text(
-              'EveryoneNAS',
-              style: Theme.of(context).textTheme.headlineSmall,
+            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+            child: Row(
+              children: <Widget>[
+                const BrandLogoMark(size: 30),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      Text(
+                        'EveryoneNAS',
+                        overflow: TextOverflow.ellipsis,
+                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: -0.3,
+                            ),
+                      ),
+                      Text(
+                        'v${LanVaultBridge.appVersion}',
+                        style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                              fontSize: 11,
+                              color: NeuTokens.textSecondary,
+                            ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: NeuSpace.md),
-          for (var i = 0; i < destinations.length; i++) ...<Widget>[
-            if (destinations[i].tab == _ShellTab.clipboard) ...<Widget>[
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: NeuSpace.sm),
-                child: Divider(height: 1),
-              ),
-            ],
+          const SizedBox(height: 22),
+          for (final item in destinations) ...<Widget>[
             _NavRailButton(
-              item: destinations[i],
-              selected: i == selectedIndex,
-              onTap: () => onSelected(i),
+              item: item,
+              selected: item.tab == selectedTab,
+              onTap: () => onSelected(item.tab),
             ),
-            const SizedBox(height: NeuSpace.sm),
+            const SizedBox(height: 6),
           ],
+          const Spacer(),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: NeuTokens.insetSurface,
+              borderRadius: const BorderRadius.all(Radius.circular(12)),
+              border: Border.all(color: NeuTokens.hairlineBorder),
+            ),
+            child: Row(
+              children: <Widget>[
+                const Icon(
+                  Icons.verified_user_outlined,
+                  size: 16,
+                  color: NeuTokens.healthy,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    '局域网零知识加密',
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                          color: NeuTokens.textSecondary,
+                          fontSize: 11.5,
+                        ),
+                  ),
+                ),
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -328,25 +551,11 @@ class _NavRailButtonState extends State<_NavRailButton> {
   final FocusNode _focusNode = FocusNode(debugLabel: 'NavRailButton');
   bool _hovered = false;
   bool _pressed = false;
-  bool _focused = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _focusNode.addListener(_handleFocusChange);
-  }
 
   @override
   void dispose() {
-    _focusNode.removeListener(_handleFocusChange);
     _focusNode.dispose();
     super.dispose();
-  }
-
-  void _handleFocusChange() {
-    if (_focusNode.hasFocus != _focused) {
-      setState(() => _focused = _focusNode.hasFocus);
-    }
   }
 
   KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
@@ -362,32 +571,15 @@ class _NavRailButtonState extends State<_NavRailButton> {
 
   @override
   Widget build(BuildContext context) {
-    final fg = widget.selected ? NeuTokens.accent : NeuTokens.textPrimary;
+    final fg = widget.selected
+        ? Colors.white
+        : (_hovered ? NeuTokens.textPrimary : NeuTokens.textSecondary);
     final stateDuration = NeuMotion.resolveState(context);
     final stateCurve = NeuMotion.resolveStateCurve(context);
     final pressDuration = NeuMotion.resolvePress(context);
     final pressCurve = NeuMotion.resolvePressCurve(context);
     final reduced = NeuMotion.isReduced(context);
-    final itemRadius = NeuRadius.concentric(NeuRadius.card, NeuSpace.sm);
     final targetScale = (_pressed && !reduced) ? NeuMotion.pressedScale : 1.0;
-
-    final bgColor = widget.selected
-        ? NeuTokens.insetSurface
-        : (_hovered ? NeuTokens.hoverSurface : NeuTokens.surface);
-
-    final baseShadows =
-        widget.selected ? const <BoxShadow>[] : NeuTokens.controlShadows;
-    final shadows = _focused
-        ? <BoxShadow>[
-            ...baseShadows,
-            const BoxShadow(
-              color: NeuTokens.accent,
-              offset: Offset.zero,
-              blurRadius: 0,
-              spreadRadius: 2.0,
-            ),
-          ]
-        : (baseShadows.isEmpty ? null : baseShadows);
 
     return RepaintBoundary(
       child: Semantics(
@@ -406,10 +598,7 @@ class _NavRailButtonState extends State<_NavRailButton> {
             }),
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTapDown: (_) {
-                _focusNode.requestFocus();
-                setState(() => _pressed = true);
-              },
+              onTapDown: (_) => setState(() => _pressed = true),
               onTapUp: (_) => setState(() => _pressed = false),
               onTapCancel: () => setState(() => _pressed = false),
               onTap: widget.onTap,
@@ -427,25 +616,23 @@ class _NavRailButtonState extends State<_NavRailButton> {
                 child: AnimatedContainer(
                   duration: stateDuration,
                   curve: stateCurve,
-                  constraints: const BoxConstraints(
-                    minHeight: NeuTokens.minTouchTarget,
-                  ),
+                  constraints: const BoxConstraints(minHeight: 42),
                   padding: const EdgeInsets.symmetric(
                     horizontal: 14,
                     vertical: 10,
                   ),
                   decoration: BoxDecoration(
-                    color: bgColor,
-                    borderRadius: BorderRadius.all(Radius.circular(itemRadius)),
-                    border: Border.all(
-                      color: _focused
-                          ? NeuTokens.accent
-                          : (widget.selected
-                              ? NeuTokens.accent.withValues(alpha: 0.45)
-                              : Colors.transparent),
-                      width: _focused ? 1.5 : 1.0,
-                    ),
-                    boxShadow: shadows,
+                    color: widget.selected
+                        ? null
+                        : (_hovered
+                            ? NeuTokens.insetSurface
+                            : Colors.transparent),
+                    gradient:
+                        widget.selected ? NeuTokens.primaryGradient : null,
+                    borderRadius: const BorderRadius.all(Radius.circular(12)),
+                    boxShadow: widget.selected
+                        ? NeuTokens.primaryButtonShadows
+                        : null,
                   ),
                   child: Row(
                     children: <Widget>[
@@ -453,16 +640,18 @@ class _NavRailButtonState extends State<_NavRailButton> {
                         widget.selected
                             ? widget.item.selectedIcon
                             : widget.item.icon,
-                        size: 20,
+                        size: 19,
                         color: fg,
                       ),
-                      const SizedBox(width: 12),
+                      const SizedBox(width: 11),
                       Text(
                         widget.item.label,
-                        style: Theme.of(context)
-                            .textTheme
-                            .labelLarge
-                            ?.copyWith(color: fg),
+                        style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                              color: fg,
+                              fontWeight: widget.selected
+                                  ? FontWeight.w600
+                                  : FontWeight.w500,
+                            ),
                       ),
                     ],
                   ),
@@ -479,96 +668,80 @@ class _NavRailButtonState extends State<_NavRailButton> {
 class _MobileNavBar extends StatelessWidget {
   const _MobileNavBar({
     required this.destinations,
-    required this.selectedIndex,
+    required this.selectedTab,
     required this.onSelected,
   });
 
   final List<_NavItem> destinations;
-  final int selectedIndex;
-  final ValueChanged<int> onSelected;
+  final _ShellTab selectedTab;
+  final ValueChanged<_ShellTab> onSelected;
 
   @override
   Widget build(BuildContext context) {
-    final stateDuration = NeuMotion.resolveState(context);
-    final stateCurve = NeuMotion.resolveStateCurve(context);
-    final itemRadius = NeuRadius.concentric(NeuRadius.card, NeuSpace.sm);
-
     return Container(
       decoration: const BoxDecoration(
         color: NeuTokens.surface,
         border: Border(
           top: BorderSide(color: NeuTokens.hairlineBorder, width: 1),
         ),
+        boxShadow: <BoxShadow>[
+          BoxShadow(
+            color: Color(0x0A0F172A),
+            offset: Offset(0, -4),
+            blurRadius: 12,
+          ),
+        ],
       ),
       child: SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsets.symmetric(
-            horizontal: NeuSpace.sm,
-            vertical: NeuSpace.xs,
-          ),
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
           child: Row(
             children: <Widget>[
-              for (var i = 0; i < destinations.length; i++)
+              for (final item in destinations)
                 Expanded(
                   child: RepaintBoundary(
                     child: Semantics(
                       button: true,
-                      selected: i == selectedIndex,
-                      label: destinations[i].label,
+                      selected: item.tab == selectedTab,
+                      label: item.label,
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
-                        onTap: () => onSelected(i),
-                        child: AnimatedContainer(
-                          duration: stateDuration,
-                          curve: stateCurve,
-                          constraints: const BoxConstraints(
-                            minHeight: NeuTokens.minMobileTouchTarget,
-                          ),
-                          margin: const EdgeInsets.symmetric(
-                            horizontal: 2,
-                            vertical: 2,
-                          ),
-                          padding: const EdgeInsets.symmetric(
-                            vertical: NeuSpace.xs,
-                          ),
-                          decoration: BoxDecoration(
-                            color: i == selectedIndex
-                                ? NeuTokens.insetSurface
-                                : Colors.transparent,
-                            borderRadius: BorderRadius.all(
-                              Radius.circular(itemRadius),
-                            ),
-                            border: Border.all(
-                              color: i == selectedIndex
-                                  ? NeuTokens.accent.withValues(alpha: 0.35)
-                                  : Colors.transparent,
-                            ),
-                          ),
+                        onTap: () => onSelected(item.tab),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
                           child: Column(
                             mainAxisSize: MainAxisSize.min,
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: <Widget>[
-                              Icon(
-                                i == selectedIndex
-                                    ? destinations[i].selectedIcon
-                                    : destinations[i].icon,
-                                size: 22,
-                                color: i == selectedIndex
-                                    ? NeuTokens.accent
-                                    : NeuTokens.textSecondary,
+                              AnimatedScale(
+                                scale: item.tab == selectedTab ? 1.12 : 1.0,
+                                duration: NeuMotion.resolvePress(context),
+                                curve: NeuMotion.resolvePressCurve(context),
+                                child: Icon(
+                                  item.tab == selectedTab
+                                      ? item.selectedIcon
+                                      : item.icon,
+                                  size: 22,
+                                  color: item.tab == selectedTab
+                                      ? NeuTokens.accent
+                                      : NeuTokens.textSecondary,
+                                ),
                               ),
-                              const SizedBox(height: 2),
+                              const SizedBox(height: 3),
                               Text(
-                                destinations[i].label,
-                                style: Theme.of(context)
-                                    .textTheme
-                                    .labelMedium
-                                    ?.copyWith(
-                                      color: i == selectedIndex
-                                          ? NeuTokens.accent
-                                          : NeuTokens.textSecondary,
-                                    ),
+                                item.label,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: item.tab == selectedTab
+                                      ? FontWeight.w700
+                                      : FontWeight.w500,
+                                  color: item.tab == selectedTab
+                                      ? NeuTokens.accent
+                                      : NeuTokens.textSecondary,
+                                ),
                               ),
                             ],
                           ),

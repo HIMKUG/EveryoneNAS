@@ -8,10 +8,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use notify::{Config, ErrorKind, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, Notify};
 use tokio::time::{self, Instant};
 use tracing::{error, info, warn};
 
@@ -76,6 +79,10 @@ impl DirectoryWatcher {
         }
 
         let (raw_tx, raw_rx) = mpsc::channel::<RawSignal>(4096);
+        let rescan_overflow = Arc::new(AtomicBool::new(false));
+        let rescan_notify = Arc::new(Notify::new());
+        let rescan_overflow_cb = Arc::clone(&rescan_overflow);
+        let rescan_notify_cb = Arc::clone(&rescan_notify);
         let rule_id_cb = rule_id.clone();
 
         let mut watcher = RecommendedWatcher::new(
@@ -86,7 +93,13 @@ impl DirectoryWatcher {
                             rule_id = %rule_id_cb,
                             "notify reported Flag::Rescan (queue overflow); triggering metadata diff reconciliation"
                         );
-                        let _ = raw_tx.try_send(RawSignal::Rescan(RescanReason::NotifyFlagRescan));
+                        if matches!(
+                            raw_tx.try_send(RawSignal::Rescan(RescanReason::NotifyFlagRescan)),
+                            Err(TrySendError::Full(_))
+                        ) {
+                            rescan_overflow_cb.store(true, Ordering::Release);
+                            rescan_notify_cb.notify_one();
+                        }
                         return;
                     }
 
@@ -95,8 +108,18 @@ impl DirectoryWatcher {
                         return;
                     }
 
-                    if !event.paths.is_empty() {
-                        let _ = raw_tx.try_send(RawSignal::Paths(event.paths));
+                    if !event.paths.is_empty()
+                        && matches!(
+                            raw_tx.try_send(RawSignal::Paths(event.paths)),
+                            Err(TrySendError::Full(_))
+                        )
+                    {
+                        warn!(
+                            rule_id = %rule_id_cb,
+                            "watcher raw event queue full; escalating to metadata diff rescan"
+                        );
+                        rescan_overflow_cb.store(true, Ordering::Release);
+                        rescan_notify_cb.notify_one();
                     }
                 }
                 Err(err) => {
@@ -105,8 +128,13 @@ impl DirectoryWatcher {
                             rule_id = %rule_id_cb,
                             "caught Win32 ERROR_NOTIFY_ENUM_DIR (1022); triggering metadata diff reconciliation"
                         );
-                        let _ =
-                            raw_tx.try_send(RawSignal::Rescan(RescanReason::Win32NotifyEnumDir));
+                        if matches!(
+                            raw_tx.try_send(RawSignal::Rescan(RescanReason::Win32NotifyEnumDir)),
+                            Err(TrySendError::Full(_))
+                        ) {
+                            rescan_overflow_cb.store(true, Ordering::Release);
+                            rescan_notify_cb.notify_one();
+                        }
                     } else {
                         error!(rule_id = %rule_id_cb, error = %err, "filesystem watcher error");
                     }
@@ -118,12 +146,25 @@ impl DirectoryWatcher {
         watcher.watch(&root_dir, RecursiveMode::Recursive)?;
         info!(rule_id = %rule_id, root = %root_dir.display(), "directory watcher started (500ms debounce)");
 
-        let debounce_task = tokio::spawn(run_debounce_loop(rule_id, root_dir, raw_rx, event_tx));
+        let debounce_task = tokio::spawn(run_debounce_loop(
+            rule_id,
+            root_dir,
+            raw_rx,
+            event_tx,
+            rescan_overflow,
+            rescan_notify,
+        ));
 
         Ok(Self {
             _watcher: watcher,
             _debounce_task: debounce_task,
         })
+    }
+}
+
+impl Drop for DirectoryWatcher {
+    fn drop(&mut self) {
+        self._debounce_task.abort();
     }
 }
 
@@ -139,13 +180,35 @@ async fn run_debounce_loop(
     root_dir: PathBuf,
     mut raw_rx: mpsc::Receiver<RawSignal>,
     event_tx: mpsc::Sender<WatchEvent>,
+    rescan_overflow: Arc<AtomicBool>,
+    rescan_notify: Arc<Notify>,
 ) {
     let mut pending: HashMap<PathBuf, Instant> = HashMap::new();
     let mut tick = time::interval(Duration::from_millis(100));
     tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
     loop {
+        if rescan_overflow.swap(false, Ordering::AcqRel) {
+            pending.clear();
+            while raw_rx.try_recv().is_ok() {}
+            if event_tx
+                .send(WatchEvent::RescanRequired {
+                    rule_id: rule_id.clone(),
+                    root_dir: root_dir.clone(),
+                    reason: RescanReason::NotifyFlagRescan,
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+            continue;
+        }
+
         tokio::select! {
+            _ = rescan_notify.notified() => {
+                continue;
+            }
             signal = raw_rx.recv() => {
                 let Some(signal) = signal else {
                     break;
@@ -210,5 +273,16 @@ pub fn canonicalize_watch_root(path: &Path) -> Result<PathBuf, ClientError> {
             reason: "path does not exist or is not a directory".to_string(),
         });
     }
-    std::fs::canonicalize(path).map_err(ClientError::Io)
+    let canonical = std::fs::canonicalize(path).map_err(ClientError::Io)?;
+    #[cfg(windows)]
+    {
+        let raw = canonical.to_string_lossy();
+        if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{unc}")));
+        }
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(stripped));
+        }
+    }
+    Ok(canonical)
 }

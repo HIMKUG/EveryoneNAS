@@ -54,6 +54,11 @@ impl MdnsRegistrar {
     /// Registers this node on `_lanvault._tcp.local.` with TXT keys `id`, `os`, `name`, `fp`
     /// and starts a periodic `255.255.255.255` UDP broadcast fallback beacon.
     pub fn register(announcement: DiscoveryAnnouncement) -> Result<Self> {
+        let _probe = crate::debug_telemetry::ProbeGuard::start(
+            "core.discovery",
+            "discovery.mdns_register",
+            Some(format!("id={} port={}", announcement.id, announcement.port)),
+        );
         let udp_beacon_task = Some(spawn_udp_beacon_sender(announcement.clone()));
         let daemon = match ServiceDaemon::new() {
             Ok(daemon) => daemon,
@@ -109,13 +114,27 @@ impl MdnsRegistrar {
         if let Some(handle) = self.udp_beacon_task.take() {
             handle.abort();
         }
-        if let (Some(daemon), Some(fullname)) = (self.daemon, self.fullname) {
+        if let (Some(daemon), Some(fullname)) = (self.daemon.take(), self.fullname.take()) {
             let _ = daemon.unregister(&fullname);
             daemon
                 .shutdown()
                 .map_err(|e| LanVaultError::Discovery(format!("mDNS shutdown failed: {e}")))?;
         }
         Ok(())
+    }
+}
+
+impl Drop for MdnsRegistrar {
+    fn drop(&mut self) {
+        if let Some(handle) = self.udp_beacon_task.take() {
+            handle.abort();
+        }
+        if let Some(daemon) = self.daemon.take() {
+            if let Some(fullname) = self.fullname.take() {
+                let _ = daemon.unregister(&fullname);
+            }
+            let _ = daemon.shutdown();
+        }
     }
 }
 
@@ -129,6 +148,11 @@ impl DiscoveryBrowser {
     /// Starts browsing `_lanvault._tcp.local.` and listening on UDP `UDP_FALLBACK_PORT`,
     /// forwarding discovered peers into `tx`. Own `local_device_id` is filtered out.
     pub fn start(local_device_id: String, tx: mpsc::Sender<DiscoveredPeerInfo>) -> Result<Self> {
+        let _probe = crate::debug_telemetry::ProbeGuard::start(
+            "core.discovery",
+            "discovery.browser_start",
+            Some(format!("local_id={local_device_id}")),
+        );
         let daemon = ServiceDaemon::new().ok();
         let receiver = daemon.as_ref().and_then(|daemon| {
             daemon.browse(MDNS_SERVICE_TYPE).ok()
@@ -167,6 +191,13 @@ impl DiscoveryBrowser {
                         port: info.get_port(),
                         via_mdns: true,
                     };
+                    crate::debug_telemetry::record_debug(
+                        "core.discovery",
+                        Some("discovery.peer_found"),
+                        None,
+                        || format!("mDNS resolved peer {} ({}:{})", peer.device_id, peer.ip, peer.port),
+                        Some(format!("os={} name={}", peer.os_type, peer.device_name)),
+                    );
                     if mdns_tx.send(peer).await.is_err() {
                         break;
                     }
@@ -187,16 +218,27 @@ impl DiscoveryBrowser {
     }
 
     /// Stops browsing and shuts down background listeners.
-    pub fn shutdown(self) -> Result<()> {
-        for task in self.tasks {
+    pub fn shutdown(mut self) -> Result<()> {
+        for task in self.tasks.drain(..) {
             task.abort();
         }
-        if let Some(daemon) = self.daemon {
+        if let Some(daemon) = self.daemon.take() {
             daemon
                 .shutdown()
                 .map_err(|e| LanVaultError::Discovery(format!("mDNS browser shutdown failed: {e}")))?;
         }
         Ok(())
+    }
+}
+
+impl Drop for DiscoveryBrowser {
+    fn drop(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+        if let Some(daemon) = self.daemon.take() {
+            let _ = daemon.shutdown();
+        }
     }
 }
 
@@ -254,6 +296,13 @@ fn spawn_udp_beacon_listener(
                 port: beacon.port,
                 via_mdns: false,
             };
+            crate::debug_telemetry::record_debug(
+                "core.discovery",
+                Some("discovery.peer_found"),
+                None,
+                || format!("UDP beacon discovered peer {} ({}:{})", peer.device_id, peer.ip, peer.port),
+                Some(format!("os={} name={}", peer.os_type, peer.device_name)),
+            );
             if tx.send(peer).await.is_err() {
                 break;
             }

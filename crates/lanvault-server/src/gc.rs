@@ -141,26 +141,34 @@ impl GarbageCollector {
             }
         }
 
-        let orphans = self.db.list_orphan_chunks(vault_id)?;
-        let mut reclaimed_bytes = 0u64;
-        let mut deleted_chunks = 0u64;
+        let (deleted_chunks, reclaimed_bytes) = self.vault_store.with_write_lock(|| {
+            let orphans = self.db.list_orphan_chunks(vault_id)?;
+            let orphan_hashes: Vec<[u8; 32]> = orphans.iter().map(|o| o.hash_blake3).collect();
+            let batch_deleted = self.db.delete_chunks_batch(vault_id, &orphan_hashes)? as u64;
 
-        for orphan in &orphans {
-            if self
-                .db
-                .delete_chunk(vault_id, &orphan.hash_blake3)?
-            {
-                self.vault_store
-                    .delete_chunk_files(vault_id, &orphan.hash_blake3)?;
-                deleted_chunks += 1;
-                reclaimed_bytes = reclaimed_bytes.saturating_add(orphan.stored_size);
+            let mut reclaimed = 0u64;
+            let mut deleted = 0u64;
+            if batch_deleted > 0 {
+                let all_deleted = batch_deleted == orphans.len() as u64;
+                for orphan in &orphans {
+                    if all_deleted || self.db.get_chunk(vault_id, &orphan.hash_blake3)?.is_none() {
+                        self.vault_store
+                            .delete_chunk_files(vault_id, &orphan.hash_blake3)?;
+                        deleted += 1;
+                        reclaimed = reclaimed.saturating_add(orphan.stored_size);
+                    }
+                }
             }
-        }
 
-        if reclaimed_bytes > 0 {
-            self.db
-                .update_vault_used_bytes(vault_id, -(reclaimed_bytes as i64))?;
-        }
+            if reclaimed > 0 {
+                self.db
+                    .update_vault_used_bytes(vault_id, -(reclaimed as i64))?;
+            }
+
+            Ok((deleted, reclaimed))
+        })?;
+
+        self.db.prune_revoked_sessions(now_unix_secs)?;
 
         Ok(GcReport {
             evaluated_snapshots,

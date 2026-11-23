@@ -220,6 +220,19 @@ pub struct LocalFileStateRecord {
     pub chunk_hashes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferHistoryRecord {
+    pub id: i64,
+    pub direction: String,
+    pub kind: String,
+    pub title: String,
+    pub subtitle: String,
+    pub peer_name: String,
+    pub content: Option<String>,
+    pub size_bytes: u64,
+    pub created_at: i64,
+}
+
 /// Result of `PRAGMA wal_checkpoint(TRUNCATE)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WalCheckpointReport {
@@ -261,15 +274,20 @@ impl Database {
 
     fn configure_and_migrate(&self) -> Result<()> {
         let conn = self.lock_conn();
+        #[cfg(target_os = "android")]
+        const MEMORY_PRAGMAS: &str = "PRAGMA cache_size = -16384;
+PRAGMA mmap_size = 0;";
+        #[cfg(not(target_os = "android"))]
+        const MEMORY_PRAGMAS: &str = "PRAGMA cache_size = -65536;
+PRAGMA mmap_size = 268435456;";
+        conn.execute_batch(MEMORY_PRAGMAS)?;
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = FULL;
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
-            PRAGMA cache_size = -65536;
             PRAGMA temp_store = MEMORY;
-            PRAGMA mmap_size = 268435456;
             PRAGMA wal_autocheckpoint = 4000;
 
             CREATE TABLE IF NOT EXISTS trusted_peers (
@@ -365,6 +383,18 @@ impl Database {
                 expires_at INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS transfer_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                direction   TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                title       TEXT NOT NULL,
+                subtitle    TEXT NOT NULL,
+                peer_name   TEXT NOT NULL,
+                content     TEXT,
+                size_bytes  INTEGER NOT NULL DEFAULT 0,
+                created_at  INTEGER NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_vault_volumes_vault_id ON vault_volumes(vault_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_scrub_status ON chunks(scrub_status);
             CREATE INDEX IF NOT EXISTS idx_chunks_vault_scrub_status ON chunks(vault_id, scrub_status);
@@ -432,8 +462,8 @@ impl Database {
             r#"
             INSERT INTO trusted_peers (
                 device_id, device_name, os_type, ed25519_pubkey,
-                last_ip, last_port, auto_connect, paired_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                last_ip, last_port, auto_connect, paired_at, revoked_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(device_id) DO UPDATE SET
                 device_name = excluded.device_name,
                 os_type = excluded.os_type,
@@ -452,6 +482,7 @@ impl Database {
                 peer.last_port.map(i64::from),
                 i64::from(peer.auto_connect),
                 peer.paired_at,
+                peer.revoked_at,
             ],
         )?;
         Ok(())
@@ -900,22 +931,24 @@ impl Database {
             ],
         )?;
         for hash in chunk_hashes {
-            tx.execute(
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO snapshot_chunks (snapshot_id, vault_id, chunk_hash)
                  VALUES (?1, ?2, ?3)",
                 params![snap.snapshot_id, snap.vault_id, hash.as_slice()],
             )?;
-            let affected = tx.execute(
-                "UPDATE chunks SET ref_count = ref_count + 1
-                 WHERE vault_id = ?1 AND hash_blake3 = ?2",
-                params![snap.vault_id, hash.as_slice()],
-            )?;
-            if affected != 1 {
-                return Err(LanVaultError::NotFound(format!(
-                    "chunk {} for snapshot {}",
-                    hex::encode(hash),
-                    snap.snapshot_id
-                )));
+            if inserted == 1 {
+                let affected = tx.execute(
+                    "UPDATE chunks SET ref_count = ref_count + 1
+                     WHERE vault_id = ?1 AND hash_blake3 = ?2",
+                    params![snap.vault_id, hash.as_slice()],
+                )?;
+                if affected != 1 {
+                    return Err(LanVaultError::NotFound(format!(
+                        "chunk {} for snapshot {}",
+                        hex::encode(hash),
+                        snap.snapshot_id
+                    )));
+                }
             }
         }
         tx.commit()?;
@@ -1362,18 +1395,116 @@ impl Database {
 
     pub fn is_session_revoked(&self, token_hash: &str, now: i64) -> Result<bool> {
         let conn = self.lock_conn();
-        conn.execute(
-            "DELETE FROM revoked_sessions WHERE expires_at <= ?1",
-            params![now],
-        )?;
         let found: Option<i64> = conn
             .query_row(
-                "SELECT 1 FROM revoked_sessions WHERE token_hash = ?1",
-                params![token_hash],
+                "SELECT 1 FROM revoked_sessions WHERE token_hash = ?1 AND expires_at > ?2",
+                params![token_hash, now],
                 |row| row.get(0),
             )
             .optional()?;
         Ok(found.is_some())
+    }
+
+    pub fn list_snapshot_chunks(&self, snapshot_id: &str) -> Result<Vec<[u8; 32]>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT chunk_hash FROM snapshot_chunks WHERE snapshot_id = ?1 ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![snapshot_id], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut hashes = Vec::new();
+        for item in rows {
+            let bytes = item?;
+            let arr: [u8; 32] = bytes.try_into().map_err(|_| {
+                LanVaultError::Corrupted("invalid 32-byte chunk hash in snapshot_chunks".into())
+            })?;
+            hashes.push(arr);
+        }
+        Ok(hashes)
+    }
+
+    /// Returns `(unique_raw_bytes, unique_stored_bytes, logical_referenced_bytes)` across all vaults.
+    pub fn get_chunk_storage_stats(&self) -> Result<(u64, u64, u64)> {
+        let conn = self.lock_conn();
+        let (raw_sum, stored_sum, logical_sum): (i64, i64, i64) = conn.query_row(
+            "SELECT
+                COALESCE(SUM(raw_size), 0),
+                COALESCE(SUM(stored_size), 0),
+                COALESCE(SUM(raw_size * MAX(1, ref_count)), 0)
+             FROM chunks",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok((
+            raw_sum.max(0) as u64,
+            stored_sum.max(0) as u64,
+            logical_sum.max(0) as u64,
+        ))
+    }
+
+    pub fn insert_transfer_record(
+        &self,
+        direction: &str,
+        kind: &str,
+        title: &str,
+        subtitle: &str,
+        peer_name: &str,
+        content: Option<&str>,
+        size_bytes: u64,
+        created_at: i64,
+    ) -> Result<i64> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT INTO transfer_history (
+                direction, kind, title, subtitle, peer_name, content, size_bytes, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                direction,
+                kind,
+                title,
+                subtitle,
+                peer_name,
+                content,
+                size_bytes as i64,
+                created_at
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn list_transfer_records(&self, limit: usize) -> Result<Vec<TransferHistoryRecord>> {
+        let conn = self.lock_conn();
+        let capped = limit.clamp(1, 200) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, direction, kind, title, subtitle, peer_name, content, size_bytes, created_at
+             FROM transfer_history
+             ORDER BY id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![capped], |row| {
+                Ok(TransferHistoryRecord {
+                    id: row.get(0)?,
+                    direction: row.get(1)?,
+                    kind: row.get(2)?,
+                    title: row.get(3)?,
+                    subtitle: row.get(4)?,
+                    peer_name: row.get(5)?,
+                    content: row.get(6)?,
+                    size_bytes: row.get::<_, i64>(7)?.max(0) as u64,
+                    created_at: row.get(8)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn prune_revoked_sessions(&self, now: i64) -> Result<usize> {
+        let conn = self.lock_conn();
+        let deleted = conn.execute(
+            "DELETE FROM revoked_sessions WHERE expires_at <= ?1",
+            params![now],
+        )?;
+        Ok(deleted)
     }
 }
 

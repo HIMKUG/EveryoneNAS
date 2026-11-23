@@ -1,4 +1,4 @@
-# LanVault Windows Desktop CMake 极限性能 Release 构建配置（8C16T / MSVC AVX2 + LTCG）
+# EveryoneNAS Windows Desktop CMake 构建配置（MSVC Release 优化 + 可选 AVX2）
 cmake_minimum_required(VERSION 3.14)
 project(lanvault_app LANGUAGES CXX)
 
@@ -7,6 +7,9 @@ set(BINARY_NAME "lanvault_app")
 
 # 显式启用现代策略，确保多配置生成器（MSVC）行为一致
 cmake_policy(VERSION 3.14...3.25)
+
+# 可选开启 AVX2 指令集（默认关闭，避免不支持 AVX2 的旧 CPU / 虚拟机触发非法指令崩溃）
+option(EVERYONENAS_ENABLE_AVX2 "Enable /arch:AVX2 on MSVC Release builds" OFF)
 
 # 定义构建类型（默认 Release）
 get_property(IS_MULTICONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -29,20 +32,19 @@ set(CMAKE_C_FLAGS_PROFILE "${CMAKE_C_FLAGS_RELEASE}")
 set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
 
 # ---------------------------------------------------------------------------
-# MSVC 极限性能 Release 编译器与链接器标志（8C16T + AVX2 + 全程序优化 LTCG）
+# MSVC Release 编译器与链接器标志（统一在全局 Release 标志注入一次，避免重复）
 # ---------------------------------------------------------------------------
 if(MSVC)
-  # 编译器最高优化：/O2 /Ob2 /Oi /Ot /GL /arch:AVX2 /MP16
-  set(LANVAULT_MSVC_RELEASE_COMPILE_FLAGS
-    "/O2 /Ob2 /Oi /Ot /GL /arch:AVX2 /MP16")
-  # 链接器全程序优化与死代码/重复 COMDAT 折叠：/LTCG /OPT:REF /OPT:ICF
-  set(LANVAULT_MSVC_RELEASE_LINK_FLAGS
-    "/LTCG /OPT:REF /OPT:ICF")
+  set(EVERYONENAS_MSVC_RELEASE_COMPILE_FLAGS "/O2 /Ob2 /Oi /Ot /GL /MP16")
+  if(EVERYONENAS_ENABLE_AVX2)
+    string(APPEND EVERYONENAS_MSVC_RELEASE_COMPILE_FLAGS " /arch:AVX2")
+  endif()
+  set(EVERYONENAS_MSVC_RELEASE_LINK_FLAGS "/LTCG /OPT:REF /OPT:ICF")
 
-  string(APPEND CMAKE_C_FLAGS_RELEASE " ${LANVAULT_MSVC_RELEASE_COMPILE_FLAGS}")
-  string(APPEND CMAKE_CXX_FLAGS_RELEASE " ${LANVAULT_MSVC_RELEASE_COMPILE_FLAGS}")
-  string(APPEND CMAKE_EXE_LINKER_FLAGS_RELEASE " ${LANVAULT_MSVC_RELEASE_LINK_FLAGS}")
-  string(APPEND CMAKE_SHARED_LINKER_FLAGS_RELEASE " ${LANVAULT_MSVC_RELEASE_LINK_FLAGS}")
+  string(APPEND CMAKE_C_FLAGS_RELEASE " ${EVERYONENAS_MSVC_RELEASE_COMPILE_FLAGS}")
+  string(APPEND CMAKE_CXX_FLAGS_RELEASE " ${EVERYONENAS_MSVC_RELEASE_COMPILE_FLAGS}")
+  string(APPEND CMAKE_EXE_LINKER_FLAGS_RELEASE " ${EVERYONENAS_MSVC_RELEASE_LINK_FLAGS}")
+  string(APPEND CMAKE_SHARED_LINKER_FLAGS_RELEASE " ${EVERYONENAS_MSVC_RELEASE_LINK_FLAGS}")
   string(APPEND CMAKE_STATIC_LINKER_FLAGS_RELEASE " /LTCG")
 endif()
 
@@ -56,12 +58,6 @@ function(APPLY_STANDARD_SETTINGS TARGET)
   target_compile_options(${TARGET} PRIVATE /EHsc)
   target_compile_definitions(${TARGET} PRIVATE "_HAS_EXCEPTIONS=0")
   target_compile_definitions(${TARGET} PRIVATE "$<$<CONFIG:Debug>:_DEBUG>")
-  if(MSVC)
-    target_compile_options(${TARGET} PRIVATE
-      "$<$<CONFIG:Release>:/O2;/Ob2;/Oi;/Ot;/GL;/arch:AVX2;/MP16>")
-    target_link_options(${TARGET} PRIVATE
-      "$<$<CONFIG:Release>:/LTCG;/OPT:REF;/OPT:ICF>")
-  endif()
 endfunction()
 
 # Flutter 引擎与包装库构建
@@ -77,25 +73,36 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/flutter/generated_plugins.cmake")
 endif()
 
 # ---------------------------------------------------------------------------
-# Rust 原生 FFI 动态库 (lanvault_ffi.dll) 自动定位与 Release 产物拷贝
-# 优先匹配 target/x86_64-pc-windows-msvc/release/lanvault_ffi.dll，
-# 次选 target/release/lanvault_ffi.dll
+# Rust 原生 FFI 动态库 (lanvault_ffi.dll) 自动定位与拷贝
+# 按优先级兼容：
+# 1. target/x86_64-pc-windows-msvc/release/lanvault_ffi.dll
+# 2. target/release/lanvault_ffi.dll
+# 3. target/x86_64-pc-windows-msvc/debug/lanvault_ffi.dll
+# 4. target/debug/lanvault_ffi.dll
 # ---------------------------------------------------------------------------
 get_filename_component(LANVAULT_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-set(LANVAULT_FFI_DLL_TRIPLE
+set(LANVAULT_FFI_DLL_TRIPLE_RELEASE
   "${LANVAULT_REPO_ROOT}/target/x86_64-pc-windows-msvc/release/lanvault_ffi.dll")
-set(LANVAULT_FFI_DLL_DEFAULT
+set(LANVAULT_FFI_DLL_RELEASE
   "${LANVAULT_REPO_ROOT}/target/release/lanvault_ffi.dll")
+set(LANVAULT_FFI_DLL_TRIPLE_DEBUG
+  "${LANVAULT_REPO_ROOT}/target/x86_64-pc-windows-msvc/debug/lanvault_ffi.dll")
+set(LANVAULT_FFI_DLL_DEBUG
+  "${LANVAULT_REPO_ROOT}/target/debug/lanvault_ffi.dll")
 
 set(LANVAULT_FFI_DLL "")
-if(EXISTS "${LANVAULT_FFI_DLL_TRIPLE}")
-  set(LANVAULT_FFI_DLL "${LANVAULT_FFI_DLL_TRIPLE}")
-elseif(EXISTS "${LANVAULT_FFI_DLL_DEFAULT}")
-  set(LANVAULT_FFI_DLL "${LANVAULT_FFI_DLL_DEFAULT}")
+if(EXISTS "${LANVAULT_FFI_DLL_TRIPLE_RELEASE}")
+  set(LANVAULT_FFI_DLL "${LANVAULT_FFI_DLL_TRIPLE_RELEASE}")
+elseif(EXISTS "${LANVAULT_FFI_DLL_RELEASE}")
+  set(LANVAULT_FFI_DLL "${LANVAULT_FFI_DLL_RELEASE}")
+elseif(EXISTS "${LANVAULT_FFI_DLL_TRIPLE_DEBUG}")
+  set(LANVAULT_FFI_DLL "${LANVAULT_FFI_DLL_TRIPLE_DEBUG}")
+elseif(EXISTS "${LANVAULT_FFI_DLL_DEBUG}")
+  set(LANVAULT_FFI_DLL "${LANVAULT_FFI_DLL_DEBUG}")
 endif()
 
 if(LANVAULT_FFI_DLL)
-  message(STATUS "[LanVault] Found native FFI library: ${LANVAULT_FFI_DLL}")
+  message(STATUS "[EveryoneNAS] Found native FFI library: ${LANVAULT_FFI_DLL}")
   # `runner` is a separate CMake sub-project, so a POST_BUILD hook on its target
   # cannot be attached from this directory; a custom target keeps the copy step
   # here and orders it after the executable.
@@ -104,13 +111,15 @@ if(LANVAULT_FFI_DLL)
       "${LANVAULT_FFI_DLL}"
       "$<TARGET_FILE_DIR:${BINARY_NAME}>/lanvault_ffi.dll"
     DEPENDS ${BINARY_NAME}
-    COMMENT "[LanVault] Copying lanvault_ffi.dll to Windows output directory"
+    COMMENT "[EveryoneNAS] Copying lanvault_ffi.dll to Windows output directory"
   )
 else()
   message(WARNING
-    "[LanVault] lanvault_ffi.dll not found at:\n"
-    "  - ${LANVAULT_FFI_DLL_TRIPLE}\n"
-    "  - ${LANVAULT_FFI_DLL_DEFAULT}\n"
+    "[EveryoneNAS] lanvault_ffi.dll not found at:\n"
+    "  - ${LANVAULT_FFI_DLL_TRIPLE_RELEASE}\n"
+    "  - ${LANVAULT_FFI_DLL_RELEASE}\n"
+    "  - ${LANVAULT_FFI_DLL_TRIPLE_DEBUG}\n"
+    "  - ${LANVAULT_FFI_DLL_DEBUG}\n"
     "Run `cargo build --release -p lanvault-ffi --target x86_64-pc-windows-msvc -j 16` before packaging.")
 endif()
 

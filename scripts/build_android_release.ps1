@@ -1,9 +1,9 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    LanVault Android (arm64-v8a) 8C16T 极限性能发行版一键构建脚本。
+    EveryoneNAS Android (arm64-v8a) 8C16T 极限性能发行版一键构建脚本。
 .DESCRIPTION
-    以 16 并发线程通过 cargo-ndk 编译 ARM64 NEON/AES/SHA2 优化的 liblanvault_ffi.so，
+    以 16 并发线程通过 cargo-ndk 编译 ARM64 NEON/AES/SHA2/CRC 优化且满足 Android 15 16KB 页对齐的 liblanvault_ffi.so，
     随后执行 R8 Full Mode + Dart 混淆与符号剥离的 Flutter Android Release 构建，
     并将最终 APK（及可选 AAB）归档至 dist/android-release/。
 .PARAMETER BuildAab
@@ -20,15 +20,23 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# 1. 锁定 8 核 16 线程并发与 ARM64 NEON/Crypto 指令集优化
+$AppVersion = "0.2.0"
+
+# 1. 锁定 8 核 16 线程并发、ARM64 NEON/Crypto/CRC 指令集优化与 Android 15 16KB 页对齐链接标志
 $env:CARGO_BUILD_JOBS = "16"
 
-$Arm64OptFlags = "-C target-feature=+neon,+aes,+sha2"
+$Arm64FeatureFlag = "-C target-feature=+neon,+aes,+sha2,+crc"
+$Arm64PageSizeFlag = "-C link-arg=-Wl,-z,max-page-size=16384"
 if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS)) {
-    $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS = $Arm64OptFlags
+    $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS = "$Arm64FeatureFlag $Arm64PageSizeFlag"
 }
-elseif ($env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS -notlike "*+neon*") {
-    $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS = "$($env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS) $Arm64OptFlags"
+else {
+    if ($env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS -notlike "*+crc*") {
+        $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS = "$($env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS) $Arm64FeatureFlag"
+    }
+    if ($env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS -notlike "*max-page-size=16384*") {
+        $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS = "$($env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS) $Arm64PageSizeFlag"
+    }
 }
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -43,7 +51,7 @@ function Assert-Command {
     }
 }
 
-Write-Host "[LanVault][Android] 校验构建工具链..." -ForegroundColor Cyan
+Write-Host "[EveryoneNAS][Android] 校验构建工具链..." -ForegroundColor Cyan
 Assert-Command "cargo"
 Assert-Command "flutter"
 
@@ -58,7 +66,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 if ($Clean -and (Test-Path $DistDir)) {
-    Write-Host "[LanVault][Android] 清理历史归档目录: $DistDir" -ForegroundColor Yellow
+    Write-Host "[EveryoneNAS][Android] 清理历史归档目录: $DistDir" -ForegroundColor Yellow
     Remove-Item -Path $DistDir -Recurse -Force
 }
 
@@ -74,8 +82,8 @@ try {
         "-p", "lanvault-ffi",
         "-j", "16"
     )
-    Write-Host "[LanVault][Android] 执行: cargo $($CargoNdkArgs -join ' ')" -ForegroundColor Cyan
-    Write-Host "[LanVault][Android] RUSTFLAGS (aarch64-linux-android): $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS" -ForegroundColor DarkCyan
+    Write-Host "[EveryoneNAS][Android] 执行: cargo $($CargoNdkArgs -join ' ')" -ForegroundColor Cyan
+    Write-Host "[EveryoneNAS][Android] RUSTFLAGS (aarch64-linux-android): $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS" -ForegroundColor DarkCyan
     & cargo @CargoNdkArgs
     if ($LASTEXITCODE -ne 0) {
         throw "cargo-ndk 编译 arm64-v8a 失败，退出码: $LASTEXITCODE"
@@ -102,7 +110,7 @@ try {
         "--obfuscate",
         "--split-debug-info=$SymbolsDir"
     )
-    Write-Host "[LanVault][Android] 执行: flutter $($ApkArgs -join ' ')" -ForegroundColor Cyan
+    Write-Host "[EveryoneNAS][Android] 执行: flutter $($ApkArgs -join ' ')" -ForegroundColor Cyan
     & flutter @ApkArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Flutter Android APK Release 构建失败，退出码: $LASTEXITCODE"
@@ -116,7 +124,7 @@ try {
             "--obfuscate",
             "--split-debug-info=$SymbolsDir"
         )
-        Write-Host "[LanVault][Android] 执行: flutter $($AabArgs -join ' ')" -ForegroundColor Cyan
+        Write-Host "[EveryoneNAS][Android] 执行: flutter $($AabArgs -join ' ')" -ForegroundColor Cyan
         & flutter @AabArgs
         if ($LASTEXITCODE -ne 0) {
             throw "Flutter Android AAB Release 构建失败，退出码: $LASTEXITCODE"
@@ -136,7 +144,7 @@ if (-not (Test-Path $Arm64Apk)) {
     throw "未找到构建产物: $Arm64Apk"
 }
 
-$TargetApk = Join-Path $DistDir "lanvault-arm64-v8a-release.apk"
+$TargetApk = Join-Path $DistDir "EveryoneNAS-$AppVersion-arm64-v8a-release.apk"
 Copy-Item -Path $Arm64Apk -Destination $TargetApk -Force
 
 if ($BuildAab) {
@@ -144,11 +152,11 @@ if ($BuildAab) {
     if (-not (Test-Path $AabSource)) {
         throw "未找到 AAB 构建产物: $AabSource"
     }
-    $TargetAab = Join-Path $DistDir "lanvault-arm64-v8a-release.aab"
+    $TargetAab = Join-Path $DistDir "EveryoneNAS-$AppVersion-arm64-v8a-release.aab"
     Copy-Item -Path $AabSource -Destination $TargetAab -Force
 }
 
 Write-Host ""
-Write-Host "[LanVault][Android] 发行版构建完成，归档清单:" -ForegroundColor Green
+Write-Host "[EveryoneNAS][Android] 发行版构建完成，归档清单:" -ForegroundColor Green
 Get-ChildItem -Path $DistDir -File | Format-Table Name, @{Label = "Size(MB)"; Expression = { [math]::Round($_.Length / 1MB, 2) } }, LastWriteTime -AutoSize
 Write-Host "调试符号已剥离至: $(Join-Path $FlutterDir 'build\symbols\android')" -ForegroundColor DarkGray

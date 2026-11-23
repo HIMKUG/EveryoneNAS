@@ -1,6 +1,6 @@
 id=lanvault_daemon
-name=LanVault Native Rust Daemon (Level 3)
-version=v1.0.0
-versionCode=10000
-author=LanVault Engineering
+name=EveryoneNAS Daemon (Magisk)
+version=v0.2.0
+versionCode=200
+author=EveryoneNAS Engineering
 description=Runs pure Rust lanvault-server static binary at late_start with watchdog and oom_score_adj=-1000 protection, completely independent of Android ART.

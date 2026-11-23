@@ -6,7 +6,7 @@
 
 **把每一台设备，变成你自己的私有云。**
 
-跨端. 零知识. 增量. 抗比特腐烂.
+跨端 · 零知识 · 增量 · 抗比特腐烂
 
 `Windows` · `Android` · `Web` — 一个仓库，三种形态，任意组合。
 
@@ -15,12 +15,14 @@
 [![Axum](https://img.shields.io/badge/Axum-0.8-6C7BFF?style=flat-square)](https://github.com/tokio-rs/axum)
 [![License](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-3DA639?style=flat-square)](#-许可证)
 [![Clippy](https://img.shields.io/badge/clippy-0%20warning-3DA639?style=flat-square)](#-质量与验证)
-[![Tests](https://img.shields.io/badge/tests-11%20passing-3DA639?style=flat-square)](#-质量与验证)
-[![Build](https://img.shields.io/badge/release%20build-verified-3DA639?style=flat-square)](#-质量与验证)
+[![Tests](https://img.shields.io/badge/tests-12%20passing-3DA639?style=flat-square)](#-质量与验证)
+[![Binary](https://img.shields.io/badge/server-4.8%20MB-6C7BFF?style=flat-square)](#-性能设计)
 
 </div>
 
----
+<div align="center">
+<img src="docs/promo/01-hero-devices.png" alt="EveryoneNAS：一台笔记本、一部手机、一台迷你主机，由同一层加密环连成一个私有存储平面" />
+</div>
 
 <div align="center">
 
@@ -35,7 +37,6 @@
 ## 目录
 
 - [为什么是 EveryoneNAS](#-为什么是-everyonenas)
-- [商业价值](#-商业价值)
 - [核心能力一览](#-核心能力一览)
 - [系统架构](#-系统架构)
 - [安全设计](#-安全设计)
@@ -50,8 +51,10 @@
 - [构建与运行](#-构建与运行)
 - [项目结构](#-项目结构)
 - [质量与验证](#-质量与验证)
+- [已知限制](#-已知限制)
 - [路线图](#-路线图)
 - [许可证](#-许可证)
+- [商业价值](#-商业价值)
 
 ---
 
@@ -65,46 +68,11 @@
 | 商业 NAS 硬件 | 一次性硬件 + 硬盘 | ⚠️ 厂商固件黑盒 | ✅ 局域网 | ✅ |
 | 自己拼 rsync + 脚本 | 时间成本高 | ✅ | ✅ | ✅ |
 
-EveryoneNAS 走的是第四条路：**用你已有的设备做存储，用零知识加密保护数据，用内容定义分块把每一份备份做到最小增量，并且把服务端、客户端、管理台同时装进一个 12 MB 的二进制里。**
+EveryoneNAS 走的是第四条路：**用你已有的设备做存储，用零知识加密保护数据，用内容定义分块把每一份备份做到最小增量，并且把服务端、客户端、管理台同时装进一个 4.8 MB 的二进制里。**
 
 它不是网盘的替代品——它是一个**可以自我托管、自我修复、自我发现的私有存储平面**。
 
----
-
-## 商业价值
-
-### 1. 零边际成本的存储业务
-
-服务端是单个 `lanvault-server.exe`（发布构建 4.7 MB），内存占用低、无 JVM、无运行时依赖。任何一台闲置的旧笔记本、迷你主机、软路由、Android 电视盒子，都可以在五分钟内变成一台可被授权的 NAS 节点。
-
-对于增值服务商，这意味着：
-
-- **没有对象存储账单**——存储成本归用户自己的硬件；
-- **没有带宽账单**——数据在局域网内点对点流动，只有跨网段才回到中心节点；
-- **没有合规迁移成本**——数据物理归属用户，GDPR / 数据出境问题从根上消失。
-
-### 2. 可售卖的"私有云"SKU
-
-EveryoneNAS 的能力边界天然切分成清晰的商业分层：
-
-| 层级 | 能力 | 目标客户 |
-| :--- | :--- | :--- |
-| **个人版** | 单机回环备份、剪贴板同步、Web 管理台 | 个人用户、摄影爱好者 |
-| **家庭版** | 多设备配对、镜像池（Mirror RAID-1）、跨设备剪贴板 | 家庭、多机用户 |
-| **小型团队版** | 多 Vault、GFS 保留策略、Bit-Rot 巡检、审计日志 | 工作室、20 人以内团队 |
-| **OEM 版** | Windows 服务 + Android 守护进程 + 白标 Web UI | 硬件厂商、路由器厂商 |
-
-每一层都建立在同一套加密与同步内核上——**没有第二个代码库，没有分叉维护成本**。
-
-### 3. 差异化护城河
-
-| 竞争对手的典型短板 | EveryoneNAS 的答案 |
-| :--- | :--- |
-| 开源同步工具普遍依赖中心服务器 | mDNS + UDP 广播双通道，**无中心发现** |
-| 去重常以明文哈希为索引，泄露文件指纹 | **确定性 nonce 派生**，密文哈希参与去重，服务端看不到明文指纹 |
-| 备份工具不做健康检查 | **并行 Bit-Rot 巡检 + 对端自愈**，把静默损坏变成可观测事件 |
-| 家用 NAS 依赖固定盘符 | **Win32 Volume GUID 绑定**，盘符漂移自动自愈 |
-| 移动端后台被杀 | **Magisk / Root / Shizuku / 前台服务** 四级保活，按设备能力自动降级 |
+它假定局域网不可信、硬盘会静默损坏、手机会杀掉你的后台进程——然后把这三件事分别交给加密、巡检和四级保活。
 
 ---
 
@@ -181,8 +149,8 @@ EveryoneNAS 的能力边界天然切分成清晰的商业分层：
 │                                                                              │
 │   ┌────────────────────┐   ┌────────────────────┐   ┌────────────────────┐   │
 │   │  Windows 桌面/服务  │   │   Android 手机      │   │   浏览器 / Web 管理台 │  │
-│   │  lanvault-win-svc  │   │  flutter_app       │   │   web-ui (静态)      │  │
-│   │  └ lanvault-server │   │  └ lanvault-ffi    │   │   └ REST + WebSocket │  │
+│   │  lanvault-win-svc  │   │  flutter_app       │   │   web-ui (静态)      │   │
+│   │  └ lanvault-server │   │  └ lanvault-ffi    │   │   └ REST + WebSocket │   │
 │   └─────────┬──────────┘   └─────────┬──────────┘   └──────────┬───────────┘  │
 │             │                        │                          │              │
 │             └────────────┬───────────┴──────────────────────────┘              │
@@ -214,15 +182,15 @@ EveryoneNAS 的能力边界天然切分成清晰的商业分层：
 
 | Crate | 行数 | 职责 | 关键模块 |
 | :--- | ---: | :--- | :--- |
-| `lanvault-core` | 2 801 | 领域模型、密码学、分块、SQLite、发现、协议 | `crypto.rs` `chunker.rs` `db.rs` `discovery.rs` |
-| `lanvault-server` | 3 208 | 存储池、巡检、GC、鉴权、HTTP/WS | `vault.rs` `scrub.rs` `gc.rs` `auth.rs` `web/mod.rs` |
-| `lanvault-client` | 1 616 | 监听、对账、增量同步、重连、剪贴板 | `watcher.rs` `scanner.rs` `sync_engine.rs` `reconnect.rs` |
-| `lanvault-ffi` | 1 753 | FRB v2 + C-ABI + Android JNI | `api.rs` `c_abi.rs` |
-| `lanvault-win-svc` | 792 | Windows SCM、防火墙、Volume GUID | `main.rs` `firewall.rs` `volume_guid.rs` |
-| `web-ui` | 3 079 | 零构建静态管理台 | `index.html` `js/*.js` `css/*.css` |
-| `flutter_app` | 4 435 | 跨端 UI、原生保活层 | `lib/**` `android/**/*.kt` |
+| `lanvault-core` | 3 311 | 领域模型、密码学、分块、SQLite、发现、协议 | `crypto.rs` `chunker.rs` `db.rs` `discovery.rs` |
+| `lanvault-server` | 4 314 | 存储池、巡检、GC、鉴权、HTTP/WS | `vault.rs` `scrub.rs` `gc.rs` `auth.rs` `web/mod.rs` |
+| `lanvault-client` | 1 680 | 监听、对账、增量同步、重连、剪贴板 | `watcher.rs` `scanner.rs` `sync_engine.rs` `reconnect.rs` |
+| `lanvault-ffi` | 2 303 | FRB v2 + C-ABI + Android JNI | `api.rs` `c_abi.rs` |
+| `lanvault-win-svc` | 900 | Windows SCM、防火墙、Volume GUID | `main.rs` `firewall.rs` `volume_guid.rs` |
+| `web-ui` | 3 084 | 零构建静态管理台 | `index.html` `js/*.js` `css/*.css` |
+| `flutter_app` | 6 133 | 跨端 UI（Dart 4 639）+ 原生保活层（Kotlin 1 494） | `lib/**` `android/**/*.kt` |
 
-**约 17 700 行自有代码，零占位符，零 `todo!()`。**
+**约 21 700 行自有代码，零占位符，零 `todo!()`。**
 
 ---
 
@@ -231,6 +199,11 @@ EveryoneNAS 的能力边界天然切分成清晰的商业分层：
 ### 威胁模型
 
 EveryoneNAS 假定：**局域网是不可信的**。同网段的任何设备都可能尝试读取、篡改或重放流量。因此加密不做"传输层可选项"，而是数据落盘前的最后一步。
+
+<div align="center">
+<img src="docs/promo/02-zero-knowledge.png" alt="同一份照片，一侧被溶解成不可读的噪声，另一侧被封存在玻璃保险库" width="300" />
+<br /><sub>客户端完成分块、压缩、加密后才出网；服务端拿到的只是密文块</sub>
+</div>
 
 ### 密钥层级
 
@@ -271,6 +244,11 @@ EveryoneNAS 假定：**局域网是不可信的**。同网段的任何设备都�
 - PIN 通过二维码（ISO/IEC 18004，`web-ui/js/qr.js` 纯手写编码器）或手输传递，**不经网络**。
 - 握手 transcript 参与 KDF，防止中间人替换公钥。
 
+<div align="center">
+<img src="docs/promo/05-discovery-pairing.png" alt="局域网内设备彼此发现并建立连接" width="720" />
+<br /><sub>双通道发现：mDNS 与 UDP 广播并行，任一可用即可完成设备发现</sub>
+</div>
+
 ### Web 管理台鉴权
 
 | 机制 | 实现 |
@@ -285,6 +263,11 @@ EveryoneNAS 假定：**局域网是不可信的**。同网段的任何设备都�
 ---
 
 ## 数据管线：从字节到块
+
+<div align="center">
+<img src="docs/promo/03-cdc-dedup.png" alt="上下两层玻璃块序列，少数块被点亮并由光丝从下层复制到上层" width="720" />
+<br /><sub>内容定义分块：只有真正变化的块才需要重新上传</sub>
+</div>
 
 一次增量同步的完整生命周期：
 
@@ -377,6 +360,10 @@ EveryoneNAS 假定：**局域网是不可信的**。同网段的任何设备都�
 
 ### Bit-Rot 巡检
 
+<div align="center">
+<img src="docs/promo/04-bitrot-selfheal.png" alt="上方完好副本将健康字节注入下方受损分片" width="420" />
+</div>
+
 ```
 触发 → 分片到 N 个线程（N ≤ 16）→ 逐块 BLAKE3 校验
                                         │
@@ -415,6 +402,10 @@ EveryoneNAS 假定：**局域网是不可信的**。同网段的任何设备都�
 
 ## Web 管理台
 
+<div align="center">
+<img src="docs/promo/07-web-console.png" alt="新拟态深色管理台：状态胶囊、存储环、增长柱状、快照时间线" />
+</div>
+
 `web-ui/` 是一个**零构建步骤**的静态站点：没有 npm、没有打包器、没有 node_modules。Rust 的 `static-serve` 在编译期把全部 HTML/CSS/JS 压缩并嵌入二进制，服务端不需要附带任何静态文件目录。
 
 ### 设计语言：可访问新拟态
@@ -451,6 +442,10 @@ WebSocket `/ws` 每 15 秒 ping、30 秒无 pong 则断开重连，出站队列�
 
 ## 跨端客户端
 
+<div align="center">
+<img src="docs/promo/06-three-forms.png" alt="同一内核，三种形态：桌面窗口、手机、浏览器" />
+</div>
+
 ### Flutter 应用
 
 五个功能页，按运行模式动态裁剪：
@@ -480,7 +475,7 @@ WebSocket `/ws` 每 15 秒 ping、30 秒无 pong 则断开重连，出站队列�
 
 ## REST / WebSocket API
 
-所有需鉴权接口校验 `lv_session` Cookie。共 **17 个端点**。
+所有需鉴权接口校验 `lv_session` Cookie。共 **17 条路由、22 个操作**。
 
 | 方法 | 路径 | 说明 |
 | :--- | :--- | :--- |
@@ -490,17 +485,17 @@ WebSocket `/ws` 每 15 秒 ping、30 秒无 pong 则断开重连，出站队列�
 | `POST` | `/api/system/restart` | 优雅重启（排空 → WAL checkpoint → 退出码 75） |
 | `GET` | `/api/vaults` | 列出 Vault 与卷 |
 | `POST` | `/api/vaults` | 创建 Vault |
-| `PUT` | `/api/vaults/{id}/chunks/{hash}` | 上传密文块（幂等，命中返回 200） |
-| `POST` | `/api/vaults/{id}/snapshots` | 提交快照清单 |
+| `PUT` | `/api/vaults/{vault_id}/chunks/{hash_hex}` | 上传密文块（幂等，命中返回 200） |
+| `POST` | `/api/vaults/{vault_id}/snapshots` | 提交快照清单 |
 | `GET` | `/api/snapshots` | 按 Vault 列出快照 |
-| `GET` | `/api/snapshots/{id}/file` | **流式**下载快照内文件 |
+| `GET` | `/api/snapshots/{snapshot_id}/file` | **流式**下载快照内文件 |
 | `POST` | `/api/scrub/trigger` | 触发 Bit-Rot 巡检 |
 | `GET` | `/api/peers` | 对端列表 + 配对 PIN + 二维码 URI |
-| `DELETE` | `/api/peers/{id}` | 吊销对端信任 |
+| `DELETE` | `/api/peers/{device_id}` | 吊销对端信任 |
 | `POST` | `/api/peers/pair` | X25519 + PIN 配对握手 |
 | `POST` | `/api/clipboard` | 推送剪贴板到目标设备 |
-| `GET/POST` | `/api/debug/config` | 调试开关 |
-| `GET/DELETE` | `/api/debug/logs` | 调试日志读取/清空 |
+| `GET` / `POST` | `/api/debug/config` | 调试开关 |
+| `GET` / `DELETE` | `/api/debug/logs` | 调试日志读取/清空 |
 | `POST` | `/api/debug/logs/client` | 前端异常上报 |
 | `GET` | `/ws` | Cookie 鉴权 WebSocket 遥测通道 |
 
@@ -537,7 +532,7 @@ char* lanvault_ffi_invoke_json(const char* fn_name, const char* payload_json);
 void  lanvault_ffi_free_string(char* ptr);
 ```
 
-19 个分发函数：
+22 个分发函数：
 
 | 类别 | 函数 |
 | :--- | :--- |
@@ -547,6 +542,8 @@ void  lanvault_ffi_free_string(char* ptr);
 | 剪贴板 | `push_clipboard_text` |
 | 模式 | `set_role_mode` `get_role_mode` |
 | 规则 | `list_sync_rules` `upsert_sync_rule` `delete_sync_rule` |
+| 密钥备份 | `export_vault_key_backup` `import_vault_key_backup` |
+| 设备环境 | `update_device_environment` |
 | 诊断 | `set_debug_mode` `get_debug_mode` `get_debug_logs` `clear_debug_logs` `report_client_log` |
 
 两个导出符号都标注 `unsafe extern "C"` 并附 `# Safety` 文档——调用方必须保证指针有效，这是 C-ABI 边界的硬约束，不该被 `unsafe` 内部的假安全感掩盖。
@@ -590,9 +587,9 @@ R8 Full Mode 下用 `proguard-rules.pro` 严格保留全部 JNI 方法、AIDL �
 | :--- | :--- |
 | **Fat LTO + `codegen-units = 1`** | 跨 crate 内联，密码学热点收益显著 |
 | **`target-cpu=native`（Windows）** | 启用 AVX2 / AES-NI；跨机分发时改为显式 feature 列表 |
-| **`+neon,+crc,+crypto`（Android arm64）** | blake3 / chacha20poly1305 / zstd 走硬件指令 |
+| **`+neon,+aes,+sha2`（Android arm64）** | blake3 / chacha20poly1305 / zstd 走硬件指令 |
 | **`panic = "abort"`** | 去掉 unwind 表，二进制更小、分支预测更友好 |
-| **`strip = "symbols"`** | 发布件 4.7 MB，无调试符号泄露 |
+| **`strip = "symbols"`** | 发布件 4.8 MB，无调试符号泄露 |
 | **有界通道（4 块）** | 大文件流式处理，内存上界与文件大小解耦 |
 | **`spawn_blocking` 分离** | CPU 密集压缩不阻塞 Tokio 调度线程 |
 | **SQLite WAL + `prepare_cached`** | 读不阻塞写；批量写入单事务提交 |
@@ -601,7 +598,14 @@ R8 Full Mode 下用 `proguard-rules.pro` 严格保留全部 JNI 方法、AIDL �
 | **抖动重连（±15%）** | 多台设备同时断线不会形成惊群 |
 | **LRU 上限（会话 256 / 锁定 4 096 / 去重缓存 10 万）** | 长期常驻进程的内存有硬上界 |
 
-实测：Windows x86_64 发布构建 `cargo build --release` 在 16 逻辑核主机上约 **1 分 36 秒**完成全工作区构建。
+发布件体积（`cargo build --workspace --release`，strip 后）：
+
+| 文件 | 体积 |
+| :--- | ---: |
+| `lanvault-server.exe`（含内嵌 Web UI） | 4.8 MB |
+| `lanvault-win-svc.exe` | 5.0 MB |
+| `lanvault_ffi.dll` | 7.0 MB |
+| `EveryoneNAS-1.0.0-arm64-v8a.apk` | 23.1 MB |
 
 ---
 
@@ -612,7 +616,7 @@ R8 Full Mode 下用 `proguard-rules.pro` 严格保留全部 JNI 方法、AIDL �
 | 工具 | 版本 | 用途 |
 | :--- | :--- | :--- |
 | Rust | `stable`（已验证 1.100.0） | 全部 Rust crate |
-| Flutter | `3.50.0 stable`（已验证） | 桌面 / Android UI |
+| Flutter | `3.24+` | 桌面 / Android UI |
 | Android NDK | `28.2.13676358`（已验证） | Android `.so` 交叉编译 |
 | JDK | `17`（已验证 17.0.21） | Gradle / AGP 9 |
 | Android Gradle Plugin | `9.3.1`（已验证） | Android 构建 |
@@ -714,7 +718,7 @@ EveryoneNAS/
 │   │   └── src/
 │   │       ├── crypto.rs           X25519 / Ed25519 / XChaCha20 / BLAKE3
 │   │       ├── chunker.rs          FastCDC + zstd + 确定性 AEAD
-│   │       ├── db.rs               SQLite WAL、8 张表、批量事务
+│   │       ├── db.rs               SQLite WAL、10 张表、批量事务
 │   │       ├── discovery.rs        mDNS-SD + UDP 广播
 │   │       ├── debug_telemetry.rs  探针与前端日志缓冲
 │   │       ├── protocol.rs         共享线格式类型
@@ -761,6 +765,7 @@ EveryoneNAS/
 │       ├── MainActivity.kt
 │       ├── privilege/*.kt          四级保活
 │       └── receiver/BootReceiver.kt
+├── docs/promo/                     宣传图
 └── scripts/
     ├── build_windows_release.ps1
     └── build_android_release.ps1
@@ -770,18 +775,18 @@ EveryoneNAS/
 
 ## 质量与验证
 
-### 本次交付的验证结果
+### 检查项
 
 | 检查 | 命令 | 结果 |
 | :--- | :--- | :--- |
 | 类型检查（全目标） | `cargo check --workspace --all-targets` | ✅ 0 error / 0 warning |
 | Lint | `cargo clippy --workspace --all-targets` | ✅ 0 warning |
-| 单元测试 | `cargo test --workspace` | ✅ 11 passed / 0 failed |
-| 发布构建 | `cargo build --workspace --release` | ✅ 1m36s，产物 4.7 MB / 4.9 MB / 7.0 MB |
+| 单元测试 | `cargo test --workspace` | ✅ 12 passed / 0 failed |
+| 发布构建 | `cargo build --workspace --release` | ✅ 4.8 MB / 5.0 MB / 7.0 MB |
 | JS 语法 | `node --check web-ui/js/*.js` | ✅ 5/5 通过 |
 | Flutter 静态分析 | `flutter analyze` | ✅ No issues found |
-| Flutter Windows 构建 | `flutter build windows --release` | ✅ 32s，实机启动无 panic |
-| Flutter Android 构建 | `flutter build apk --release` | ✅ 22.8 MB，含 `lib/arm64-v8a/liblanvault_ffi.so` |
+| Flutter Windows 构建 | `flutter build windows --release` | ✅ 实机启动无 panic |
+| Flutter Android 构建 | `flutter build apk --release` | ✅ 23.1 MB，含 `lib/arm64-v8a/liblanvault_ffi.so` |
 | Android 交叉编译 | `cargo build --target aarch64-linux-android` | ✅ 0 warning，JNI/ABI 符号齐全 |
 | 真实启动冒烟 | 启动服务端 → 静态页 + 登录 + 遥测 | ✅ HTTP 200 / 认证成功 / 状态 JSON 正确 |
 
@@ -794,35 +799,36 @@ EveryoneNAS/
  "vault_used_bytes":0,"vault_quota_bytes":1073741824}
 ```
 
-### 本次修复的缺陷
+<details>
+<summary>1.0.0 修复记录（点击展开）</summary>
 
 | 文件 | 问题 | 修复 |
 | :--- | :--- | :--- |
-| `sync_engine.rs` | `restore_chunk` 中遗留的 `pending_db_states` 与 `diff` 引用（跨函数粘贴残留） | 移回 `sync_diff` 作用域 |
+| `sync_engine.rs` | `restore_chunk` 中遗留的 `pending_db_states` 与 `diff` 引用 | 移回 `sync_diff` 作用域 |
 | `error.rs` | `ClientError::RemoteRejected` 被引用但未定义 | 新增变体 |
 | `web/mod.rs` | 模块内文档注释出现在 `use` 之后 | 移到文件顶部 |
 | `web/mod.rs` | `embed_assets!` 路径相对 crate 而非工作区 | `../../web-ui` → `web-ui` |
 | `web/mod.rs` | 快照下载闭包返回类型写错为 `Vec<u8>` | 改为 `Vec<[u8; 32]>` |
-| `web/mod.rs` | `vault_id` 移动后再次借用 | 提取 `scan_vault_id` |
-| `web/debug_routes.rs` | 请求结构体私有导致 Axum 处理器无法公开 | 提升为 `pub(super)` |
-| `crates/lanvault-core/error.rs` | `IntegrityMismatch` / `InvalidState` 未定义 | 新增变体 |
-| `crates/lanvault-ffi/api.rs` | 借用已移动字段、未定义变量、临时值生命周期 | 显式 `clone()`、修正变量名、提前取出快照 |
-| `crates/lanvault-ffi/c_abi.rs` | 公开 C-ABI 函数解引用裸指针却未标 `unsafe` | 加 `unsafe extern "C"` + `# Safety` 文档 |
-| `crates/lanvault-win-svc/volume_guid.rs` | `guid_for_mount_path` 无调用方 | 保留为诊断入口并标注 `#[allow(dead_code)]` |
-| `Cargo.toml` | `static-serve 0.4` 在运行时 panic（路由路径必须以 `/` 开头） | 升级到 `0.6.4` |
-| `windows/CMakeLists.txt` | `runner` 是独立 CMake 子工程，跨目录挂 `POST_BUILD` 报 "TARGET was not created in this directory" | 改为 ALL 自定义目标并 `DEPENDS` 可执行文件 |
-| `sync_engine` 冷启动路径 | `start_client_background_tasks` 无 ambient Tokio runtime 就 `tokio::spawn`，Windows 桌面端启动即 panic | 函数入口统一 `runtime.enter()` |
-| `c_abi.rs` JNI | `return -2` 作用于 `u8` 返回类型（Android 端编译失败） | Kotlin 侧是 `Boolean`，改为记录日志后返回 `false` |
-| `.cargo/config.toml` | aarch64 的 `+crc` 是 unstable 目标特性，rustc 告警 | 移除，保留 `+neon,+aes,+sha2` |
-| `backup_screen.dart` | `dangerColor`/`healthyColor`/`borderRadius`/`label` 四个 Widdget 参数名与主题定义不符 | 改用 `NeuTokens.danger`/`NeuTokens.healthy`/`radius`/`title` |
-| `flutter_app/android` | AGP 8.7.3 低于 Flutter 3.50 要求的 9.1.1；`kotlin-android` 与 AGP 9 内置 Kotlin 冲突；`configuration-cache` 无法序列化 `ReleaseMinSdkCheck` | 升级 AGP 9.3.1 / Kotlin 2.4.20、移除 kotlin 插件改用 `compilerOptions`、关闭配置缓存 |
-| `flutter_app/lib` | `package:flutter/material.dart` 在 Flutter 3.50 已废弃 | 迁移到 `package:material_ui/material_ui.dart` |
+| `web/debug_routes.rs` | 请求结构体私有导致处理器无法公开 | 提升为 `pub(super)` |
+| `lanvault-core/error.rs` | `IntegrityMismatch` / `InvalidState` 未定义 | 新增变体 |
+| `lanvault-ffi/api.rs` | 借用已移动字段、未定义变量、临时值生命周期 | 显式 `clone()`、修正变量名 |
+| `lanvault-ffi/c_abi.rs` | 公开 C-ABI 函数解引用裸指针却未标 `unsafe` | 加 `unsafe extern "C"` + `# Safety` |
+| `Cargo.toml` | `static-serve 0.4` 运行时 panic | 升级到 `0.6.4` |
+| `windows/CMakeLists.txt` | 跨目录 `POST_BUILD` 报 TARGET 错误 | 改为 ALL 自定义目标 |
+| `sync_engine` 冷启动 | 无 ambient Tokio runtime 即 `tokio::spawn` | 入口统一 `runtime.enter()` |
+| `.cargo/config.toml` | aarch64 的 `+crc` 是 unstable 特性 | 移除，保留 `+neon,+aes,+sha2` |
+| `flutter_app/android` | AGP 8.7.3 低于 Flutter 要求；Kotlin 插件冲突 | 升级 AGP 9.3.1 / Kotlin 2.4.20 |
 
-### 已知限制
+</details>
 
-- 冒烟测试覆盖了服务端启动、静态资源、登录、遥测，以及 Windows 桌面端实机启动；**未**覆盖多设备真实配对、跨设备传输与断网重连的端到端场景。
+---
+
+## 已知限制
+
+- 冒烟测试覆盖服务端启动、静态资源、登录、遥测，以及 Windows 桌面端实机启动；**未**覆盖多设备真实配对、跨设备传输与断网重连的端到端场景。
 - Android APK 已构建并确认包含 `liblanvault_ffi.so` 与全部 JNI/ABI 导出符号，但**未在真机上安装运行**。
 - Android 构建在本机用 NDK clang 直接交叉编译（`cargo-ndk` 未安装），`scripts/build_android_release.ps1` 仍按 `cargo-ndk` 编写，未在本机端到端执行。
+- 单元测试集中在 core 的密码学、分块、数据库与 server 的鉴权层；同步管线与巡检尚无自动化测试。
 
 ---
 
@@ -839,6 +845,47 @@ EveryoneNAS/
 
 ---
 
+## 商业价值
+
+<div align="center">
+<img src="docs/promo/08-hardware-reborn.png" alt="闲置的笔记本、路由器、电视盒子转变为 NAS 节点" />
+</div>
+
+### 1. 零边际成本的存储业务
+
+服务端是单个 `lanvault-server.exe`（发布构建 4.8 MB），内存占用低、无 JVM、无运行时依赖。任何一台闲置的旧笔记本、迷你主机、软路由、Android 电视盒子，都可以在五分钟内变成一台可被授权的 NAS 节点。
+
+对于增值服务商，这意味着：
+
+- **没有对象存储账单**——存储成本归用户自己的硬件；
+- **没有带宽账单**——数据在局域网内点对点流动，只有跨网段才回到中心节点；
+- **没有合规迁移成本**——数据物理归属用户，GDPR / 数据出境问题从根上消失。
+
+### 2. 可售卖的"私有云"SKU
+
+EveryoneNAS 的能力边界天然切分成清晰的商业分层：
+
+| 层级 | 能力 | 目标客户 |
+| :--- | :--- | :--- |
+| **个人版** | 单机回环备份、剪贴板同步、Web 管理台 | 个人用户、摄影爱好者 |
+| **家庭版** | 多设备配对、镜像池（Mirror RAID-1）、跨设备剪贴板 | 家庭、多机用户 |
+| **小型团队版** | 多 Vault、GFS 保留策略、Bit-Rot 巡检、审计日志 | 工作室、20 人以内团队 |
+| **OEM 版** | Windows 服务 + Android 守护进程 + 白标 Web UI | 硬件厂商、路由器厂商 |
+
+每一层都建立在同一套加密与同步内核上——**没有第二个代码库，没有分叉维护成本**。
+
+### 3. 差异化护城河
+
+| 竞争对手的典型短板 | EveryoneNAS 的答案 |
+| :--- | :--- |
+| 开源同步工具普遍依赖中心服务器 | mDNS + UDP 广播双通道，**无中心发现** |
+| 去重常以明文哈希为索引，泄露文件指纹 | **确定性 nonce 派生**，密文哈希参与去重，服务端看不到明文指纹 |
+| 备份工具不做健康检查 | **并行 Bit-Rot 巡检 + 对端自愈**，把静默损坏变成可观测事件 |
+| 家用 NAS 依赖固定盘符 | **Win32 Volume GUID 绑定**，盘符漂移自动自愈 |
+| 移动端后台被杀 | **Magisk / Root / Shizuku / 前台服务** 四级保活，按设备能力自动降级 |
+
+---
+
 ## 许可证
 
 双许可，任选其一：
@@ -849,6 +896,8 @@ EveryoneNAS/
 ---
 
 <div align="center">
+
+<img src="docs/promo/09-closing.png" alt="" />
 
 **EveryoneNAS** — 你的数据，留在你自己的网线里。
 

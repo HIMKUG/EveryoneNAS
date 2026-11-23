@@ -98,31 +98,39 @@ pub fn enumerate_volumes() -> Result<Vec<VolumeInfo>> {
     Ok(volumes)
 }
 
-/// 根据当前盘符或挂载目录（如 `D:\`）查询其绑定的 Win32 Volume GUID。
-/// 保留为运维/诊断入口（`lanvault-win-svc volumes` 之外的调用方），不在服务主循环内使用。
+/// 根据任意盘符、挂载点或子目录路径（如 `C:\ProgramData\EveryoneNAS`）查询其所在卷的 Win32 Volume GUID。
+/// 先通过 `GetVolumePathNameW` 规约到所在卷根路径，再调用 `GetVolumeNameForVolumeMountPointW`。
 #[cfg(windows)]
-#[allow(dead_code)]
 pub fn guid_for_mount_path(mount_path: &Path) -> Result<String> {
     use std::ffi::OsString;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-    use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+    };
 
-    // Win32 要求挂载点路径必须以反斜杠 `\` 结尾。
-    let mut normalized = mount_path.as_os_str().to_string_lossy().into_owned();
-    if !normalized.ends_with('\\') {
-        normalized.push('\\');
-    }
-
-    let wide_mount: Vec<u16> = OsString::from(&normalized)
+    let wide_input: Vec<u16> = mount_path
+        .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    let mut out_buf = vec![0u16; 128];
+    let mut volume_root_buf = vec![0u16; wide_input.len().max(260) + 16];
 
     let ok = unsafe {
+        GetVolumePathNameW(
+            wide_input.as_ptr(),
+            volume_root_buf.as_mut_ptr(),
+            volume_root_buf.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let mut out_buf = vec![0u16; 128];
+    let ok = unsafe {
         GetVolumeNameForVolumeMountPointW(
-            wide_mount.as_ptr(),
+            volume_root_buf.as_ptr(),
             out_buf.as_mut_ptr(),
             out_buf.len() as u32,
         )

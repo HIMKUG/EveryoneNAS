@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::DashSet;
+use dashmap::DashMap;
 use lanvault_core::{
     blake3_hash, Database, DeviceIdentity, DiscoveryAnnouncement, LanVaultError, MdnsRegistrar,
     PoolMode, Result, RetentionTier, SnapshotRecord, TrustedPeer, VaultRecord,
@@ -148,22 +148,30 @@ pub async fn serve_with_shutdown(
     #[cfg(unix)]
     if !vault_root_existed {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
+        if let Err(err) = std::fs::set_permissions(
             &config.vault_root,
             std::fs::Permissions::from_mode(0o700),
-        )?;
+        ) {
+            if !matches!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) {
+                return Err(LanVaultError::Io(err));
+            }
+        }
     }
+    let vault_root = normalize_absolute_dir(&config.vault_root)?;
     lanvault_core::install_rust_panic_hook();
-    lanvault_core::configure_debug_log_file(&config.vault_root.join("lanvault_debug.log"));
-    let db_path = config.vault_root.join("index.db");
+    lanvault_core::configure_debug_log_file(&vault_root.join("lanvault_debug.log"));
+    let db_path = vault_root.join("index.db");
     let db = Arc::new(Database::open(&db_path)?);
     let vault_store = Arc::new(VaultStore::new(Arc::clone(&db)));
 
     // Ensure at least one default vault exists on first boot.
     if db.list_vaults()?.is_empty() {
-        let metadata_path = config.vault_root.join("vault.meta.json");
+        let metadata_path = vault_root.join("vault.meta.json");
         if metadata_path.exists() {
-            let meta = VaultStore::read_vault_meta(&config.vault_root)?;
+            let meta = VaultStore::read_vault_meta(&vault_root)?;
             let vault = VaultRecord {
                 vault_id: meta.vault_id.clone(),
                 name: meta.name.clone(),
@@ -189,7 +197,7 @@ pub async fn serve_with_shutdown(
         } else {
             vault_store.create_vault(
                 "Default Vault".to_string(),
-                config.vault_root.to_string_lossy().into_owned(),
+                vault_root.to_string_lossy().into_owned(),
                 None,
                 PoolMode::Single,
                 config.default_quota_bytes,
@@ -199,7 +207,7 @@ pub async fn serve_with_shutdown(
         }
     }
     if db.get_setting(INDEX_RECOVERY_SETTING)?.as_deref() != Some("1") {
-        if recover_index_from_volumes(&db, &config.vault_root)? {
+        if recover_index_from_volumes(&db, &vault_root)? {
             db.set_setting(INDEX_RECOVERY_SETTING, "1")?;
         } else {
             warn!("index recovery was incomplete and will be retried on next startup");
@@ -207,7 +215,7 @@ pub async fn serve_with_shutdown(
     }
 
     let identity = Arc::new(DeviceIdentity::load_or_generate(
-        &config.vault_root.join("device.key"),
+        &vault_root.join("device.key"),
     )?);
     let device_id = format!("lv-{}", &identity.fingerprint_hex()[..12]);
     let clipboard_key = identity.derive_local_storage_key("clipboard-group");
@@ -296,7 +304,7 @@ pub async fn serve_with_shutdown(
         active_chunk_writes: AtomicU64::new(0),
         accepting_tasks: AtomicBool::new(true),
         pairing_pin: std::sync::Mutex::new(pairing_pin),
-        online_peers: DashSet::new(),
+        online_peers: DashMap::new(),
         db: Arc::clone(&db),
         vault_store: Arc::clone(&vault_store),
         scrubber: Arc::clone(&scrubber),
@@ -311,6 +319,7 @@ pub async fn serve_with_shutdown(
     let gc_task = tokio::spawn(async move {
         let interval_dur = Duration::from_secs(GC_CHECK_INTERVAL_SECS);
         let mut ticker = tokio::time::interval(interval_dur);
+        ticker.tick().await;
         loop {
             ticker.tick().await;
             let db_clone = Arc::clone(&gc_db);
@@ -355,6 +364,7 @@ pub async fn serve_with_shutdown(
     let scrub_task = tokio::spawn(async move {
         let interval_dur = Duration::from_secs(SCRUB_CHECK_INTERVAL_SECS);
         let mut ticker = tokio::time::interval(interval_dur);
+        ticker.tick().await;
         loop {
             ticker.tick().await;
             let db_clone = Arc::clone(&scrub_db);
@@ -522,9 +532,13 @@ fn recover_index_from_volumes(db: &Database, vault_root: &Path) -> Result<bool> 
             }
 
             let manifests_root = root.join("manifests");
-            let Ok(manifests) = std::fs::read_dir(&manifests_root) else {
-                complete = false;
-                continue;
+            let manifests = match std::fs::read_dir(&manifests_root) {
+                Ok(entries) => entries,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
             };
             for entry in manifests.flatten() {
                 let path = entry.path();
@@ -652,6 +666,25 @@ fn recover_index_from_volumes(db: &Database, vault_root: &Path) -> Result<bool> 
     }
     let _ = vault_root;
     Ok(complete)
+}
+
+fn normalize_absolute_dir(path: &Path) -> Result<PathBuf> {
+    let resolved = match std::fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(_) if !path.is_absolute() => std::env::current_dir()?.join(path),
+        Err(_) => path.to_path_buf(),
+    };
+    #[cfg(windows)]
+    {
+        let raw = resolved.to_string_lossy();
+        if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            return Ok(PathBuf::from(format!(r"\\{unc}")));
+        }
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(stripped));
+        }
+    }
+    Ok(resolved)
 }
 
 pub(crate) fn generate_six_digit_pin() -> String {

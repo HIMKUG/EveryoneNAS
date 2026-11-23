@@ -1,7 +1,7 @@
 // 参考依据:
-// - ARCHITECTURE_CONTRACTS.md 第 4 节 (flutter_rust_bridge FFI 接口及 DTO)
+// - ARCHITECTURE_CONTRACTS.md 第 4 节 (FFI 接口及 DTO)
 // - ARCHITECTURE_CONTRACTS.md 第 5 节 (Android com.lanvault.app/keep_alive MethodChannel)
-// - 严格遵循无过度防御原则：仅在 FFI / MethodChannel 外部边界解析与校验，内部直接传递强类型并向上抛出错误。
+// - 严格遵循零过度防御原则：仅在 FFI / MethodChannel 外部边界解析与校验，内部直接传递强类型并向上抛出错误。
 
 import 'dart:async';
 import 'dart:convert';
@@ -12,6 +12,8 @@ import 'dart:isolate';
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+
+import 'system_env_helper.dart';
 
 /// 节点运行模式（仅客户端 / 仅服务端 / 双端模式）。
 enum RoleMode {
@@ -41,7 +43,7 @@ enum KeepAliveLevel {
   level2RootLibsu('LEVEL_2_ROOT_LIBSU', 'Level 2 · Root Daemon (libsu)'),
   level1Shizuku('LEVEL_1_SHIZUKU', 'Level 1 · Shizuku (UID 2000)'),
   level0Foreground('LEVEL_0_FOREGROUND', 'Level 0 · 标准前台服务'),
-  winService('WIN_SERVICE', 'Windows SCM Session 0 服务');
+  winService('WIN_SERVICE', 'Windows 桌面 / SCM 服务');
 
   const KeepAliveLevel(this.wireValue, this.displayLabel);
 
@@ -63,9 +65,10 @@ enum KeepAliveLevel {
 
 /// Bit-Rot 健康状态枚举，严格对齐 ARCHITECTURE_CONTRACTS.md 第 3.1 节。
 enum BitRotHealth {
-  healthy('healthy', '健康'),
-  degraded('degraded', '降级'),
-  corrupted('corrupted', '发现损坏块');
+  healthy('healthy', '系统正常'),
+  degraded('degraded', '状态降级'),
+  corrupted('corrupted', '发现损坏块'),
+  unknown('unknown', '未运行');
 
   const BitRotHealth(this.wireValue, this.displayLabel);
 
@@ -73,14 +76,18 @@ enum BitRotHealth {
   final String displayLabel;
 
   static BitRotHealth parseWireValue(String raw) {
+    final normalized = raw.trim().toLowerCase();
     for (final item in BitRotHealth.values) {
-      if (item.wireValue == raw) return item;
+      if (item.wireValue == normalized) return item;
+    }
+    if (normalized == 'stopped' || normalized == 'not_running') {
+      return BitRotHealth.unknown;
     }
     throw FormatException('Unsupported bit_rot_health wire value: $raw');
   }
 }
 
-/// 对应 Rust `DiscoveredPeer` DTO（ARCHITECTURE_CONTRACTS.md 第 4 节）。
+/// 对应 Rust `DiscoveredPeer` DTO。
 @immutable
 class DiscoveredPeer {
   const DiscoveredPeer({
@@ -111,29 +118,31 @@ class DiscoveredPeer {
   }
 }
 
-/// 对应 Rust `SyncProgressEvent` DTO（严格对齐 Rust 真实字段）。
+/// 对应 Rust `SyncProgressEvent` DTO。
 @immutable
 class SyncProgressEvent {
   const SyncProgressEvent({
     required this.ruleId,
     required this.filePath,
     required this.bytesProcessed,
+    required this.totalBytes,
     required this.chunksUploaded,
     required this.chunksDeduplicated,
     required this.status,
     this.throughputBps = 0,
-    this.bitRotHealth = BitRotHealth.healthy,
+    this.bitRotHealth,
     this.corruptedChunks = 0,
   });
 
   final String ruleId;
   final String filePath;
   final int bytesProcessed;
+  final int totalBytes;
   final int chunksUploaded;
   final int chunksDeduplicated;
   final String status;
   final int throughputBps;
-  final BitRotHealth bitRotHealth;
+  final BitRotHealth? bitRotHealth;
   final int corruptedChunks;
 
   int get totalChunks => chunksUploaded + chunksDeduplicated;
@@ -142,24 +151,28 @@ class SyncProgressEvent {
       ? 0.0
       : (chunksDeduplicated / totalChunks).clamp(0.0, 1.0);
 
+  double get progressRatio => totalBytes <= 0
+      ? 0.0
+      : (bytesProcessed / totalBytes).clamp(0.0, 1.0);
+
   factory SyncProgressEvent.fromJson(Map<String, dynamic> json) {
-    final filePath = json.containsKey('current_file')
-        ? json['current_file'] as String
-        : json['file_path'] as String;
     final rawBitRot = json['bit_rot_health'] as String?;
 
     return SyncProgressEvent(
       ruleId: json['rule_id'] as String,
-      filePath: filePath,
+      filePath: json['file_path'] as String,
       bytesProcessed: (json['bytes_processed'] as num).toInt(),
+      totalBytes: json['total_bytes'] == null
+          ? 0
+          : (json['total_bytes'] as num).toInt(),
       chunksUploaded: (json['chunks_uploaded'] as num).toInt(),
       chunksDeduplicated: (json['chunks_deduplicated'] as num).toInt(),
       status: json['status'] as String,
       throughputBps: json['throughput_bps'] == null
           ? 0
           : (json['throughput_bps'] as num).toInt(),
-      bitRotHealth: rawBitRot == null
-          ? BitRotHealth.healthy
+      bitRotHealth: rawBitRot == null || rawBitRot.trim().isEmpty
+          ? null
           : BitRotHealth.parseWireValue(rawBitRot),
       corruptedChunks: json['corrupted_chunks'] == null
           ? 0
@@ -168,7 +181,380 @@ class SyncProgressEvent {
   }
 }
 
-/// Android 原生保活 MethodChannel 通道封装（ARCHITECTURE_CONTRACTS.md 第 5 节）。
+/// 上次启动服务端配置快照。
+@immutable
+class LastServerConfig {
+  const LastServerConfig({
+    required this.vaultPath,
+    required this.quotaGb,
+    required this.port,
+    this.webPassword,
+  });
+
+  final String vaultPath;
+  final int quotaGb;
+  final int port;
+  final String? webPassword;
+
+  factory LastServerConfig.fromRustJson(Map<String, dynamic> json) {
+    return LastServerConfig(
+      vaultPath: json['vault_path'] as String,
+      quotaGb: (json['quota_gb'] as num).toInt(),
+      port: (json['port'] as num).toInt(),
+      webPassword: json['web_password'] as String?,
+    );
+  }
+}
+
+/// 最近系统活动条目（对齐 `get_system_overview.recent_activities`）。
+@immutable
+class RecentActivityModel {
+  const RecentActivityModel({
+    required this.id,
+    required this.title,
+    required this.detail,
+    required this.kind,
+    required this.timestamp,
+  });
+
+  final String id;
+  final String title;
+  final String detail;
+  final String kind;
+  final String timestamp;
+
+  factory RecentActivityModel.fromJson(Map<String, dynamic> json) {
+    return RecentActivityModel(
+      id: json['id'] as String,
+      title: json['title'] as String,
+      detail: json['detail'] as String,
+      kind: json['kind'] as String,
+      timestamp: json['timestamp'].toString(),
+    );
+  }
+}
+
+/// 快照恢复结果模型（对齐 `restore_snapshot`）。
+@immutable
+class RestoreSnapshotResultModel {
+  const RestoreSnapshotResultModel({
+    required this.snapshotId,
+    required this.restoredChunks,
+    required this.restoredBytes,
+    required this.outputPath,
+  });
+
+  final String snapshotId;
+  final int restoredChunks;
+  final int restoredBytes;
+  final String outputPath;
+
+  factory RestoreSnapshotResultModel.fromJson(Map<String, dynamic> json) {
+    return RestoreSnapshotResultModel(
+      snapshotId: json['snapshot_id'] as String,
+      restoredChunks: (json['restored_chunks'] as num).toInt(),
+      restoredBytes: (json['restored_bytes'] as num).toInt(),
+      outputPath: json['output_path'] as String,
+    );
+  }
+}
+
+/// 持久化传输历史条目模型（对齐 `list_transfer_history`）。
+@immutable
+class TransferHistoryModel {
+  const TransferHistoryModel({
+    required this.id,
+    required this.direction,
+    required this.kind,
+    required this.title,
+    required this.subtitle,
+    required this.peerName,
+    this.content,
+    required this.sizeBytes,
+    required this.createdAtSecs,
+  });
+
+  final int id;
+  final String direction;
+  final String kind;
+  final String title;
+  final String subtitle;
+  final String peerName;
+  final String? content;
+  final int sizeBytes;
+  final int createdAtSecs;
+
+  bool get isFile => kind == 'file';
+  bool get isIncoming => direction == 'received';
+
+  String get formattedTime {
+    final dt = DateTime.fromMillisecondsSinceEpoch(createdAtSecs * 1000);
+    return '${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} '
+        '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+  }
+
+  factory TransferHistoryModel.fromJson(Map<String, dynamic> json) {
+    return TransferHistoryModel(
+      id: (json['id'] as num).toInt(),
+      direction: json['direction'] as String,
+      kind: json['kind'] as String,
+      title: json['title'] as String,
+      subtitle: json['subtitle'] as String,
+      peerName: json['peer_name'] as String,
+      content: json['content'] as String?,
+      sizeBytes: (json['size_bytes'] as num).toInt(),
+      createdAtSecs: (json['created_at'] as num).toInt(),
+    );
+  }
+}
+
+/// 全局系统总览模型（对齐 `get_system_overview`）。
+@immutable
+class SystemOverviewModel {
+  const SystemOverviewModel({
+    required this.serverRunning,
+    required this.serverPort,
+    required this.lanIp,
+    required this.pairingPin,
+    required this.pairingQrUri,
+    required this.vaultUsedBytes,
+    required this.vaultQuotaBytes,
+    required this.vaultCount,
+    required this.pairedPeerCount,
+    required this.onlinePeerCount,
+    required this.syncRuleCount,
+    required this.bitRotHealth,
+    required this.corruptedChunks,
+    this.dedupRatio = 0.0,
+    this.compressionRatio = 1.0,
+    this.syncPaused = false,
+    this.bitRotAutoScrub = true,
+    required this.recentActivities,
+  });
+
+  final bool serverRunning;
+  final int? serverPort;
+  final String lanIp;
+  final String pairingPin;
+  final String pairingQrUri;
+  final int vaultUsedBytes;
+  final int vaultQuotaBytes;
+  final int vaultCount;
+  final int pairedPeerCount;
+  final int onlinePeerCount;
+  final int syncRuleCount;
+  final BitRotHealth bitRotHealth;
+  final int corruptedChunks;
+  final double dedupRatio;
+  final double compressionRatio;
+  final bool syncPaused;
+  final bool bitRotAutoScrub;
+  final List<RecentActivityModel> recentActivities;
+
+  double get storageRatio => vaultQuotaBytes <= 0
+      ? 0.0
+      : (vaultUsedBytes / vaultQuotaBytes).clamp(0.0, 1.0);
+
+  factory SystemOverviewModel.fromJson(Map<String, dynamic> json) {
+    final rawActivities = json['recent_activities'] as List<dynamic>;
+    final rawHealth = json['bit_rot_health'] as String;
+    return SystemOverviewModel(
+      serverRunning: json['server_running'] as bool,
+      serverPort: json['server_port'] == null
+          ? null
+          : (json['server_port'] as num).toInt(),
+      lanIp: json['lan_ip'] as String,
+      pairingPin: json['pairing_pin'] as String,
+      pairingQrUri: json['pairing_qr_uri'] as String,
+      vaultUsedBytes: (json['vault_used_bytes'] as num).toInt(),
+      vaultQuotaBytes: (json['vault_quota_bytes'] as num).toInt(),
+      vaultCount: (json['vault_count'] as num).toInt(),
+      pairedPeerCount: (json['paired_peer_count'] as num).toInt(),
+      onlinePeerCount: (json['online_peer_count'] as num).toInt(),
+      syncRuleCount: (json['sync_rule_count'] as num).toInt(),
+      bitRotHealth: BitRotHealth.parseWireValue(rawHealth),
+      corruptedChunks: (json['corrupted_chunks'] as num).toInt(),
+      dedupRatio: (json['dedup_ratio'] as num? ?? 0.0).toDouble(),
+      compressionRatio: (json['compression_ratio'] as num? ?? 1.0).toDouble(),
+      syncPaused: json['sync_paused'] as bool? ?? false,
+      bitRotAutoScrub: json['bit_rot_auto_scrub'] as bool? ?? true,
+      recentActivities: rawActivities
+          .map((e) => RecentActivityModel.fromJson(e as Map<String, dynamic>))
+          .toList(growable: false),
+    );
+  }
+}
+
+/// 存储池挂载卷模型（对齐 `list_vaults.vaults[].volumes[]`）。
+@immutable
+class VaultVolumeModel {
+  const VaultVolumeModel({
+    required this.volumeId,
+    required this.mountPath,
+    this.volumeGuid,
+    required this.role,
+    required this.isOnline,
+  });
+
+  final String volumeId;
+  final String mountPath;
+  final String? volumeGuid;
+  final String role;
+  final bool isOnline;
+
+  factory VaultVolumeModel.fromJson(Map<String, dynamic> json) {
+    return VaultVolumeModel(
+      volumeId: json['volume_id'] as String,
+      mountPath: json['mount_path'] as String,
+      volumeGuid: json['volume_guid'] as String?,
+      role: json['role'] as String,
+      isOnline: json['is_online'] as bool,
+    );
+  }
+}
+
+/// 存储池摘要模型（对齐 `list_vaults` 与 `create_vault`）。
+@immutable
+class VaultSummaryModel {
+  const VaultSummaryModel({
+    required this.vaultId,
+    required this.name,
+    required this.poolMode,
+    required this.quotaBytes,
+    required this.usedBytes,
+    required this.e2eeEnabled,
+    required this.volumes,
+  });
+
+  final String vaultId;
+  final String name;
+  final String poolMode;
+  final int quotaBytes;
+  final int usedBytes;
+  final bool e2eeEnabled;
+  final List<VaultVolumeModel> volumes;
+
+  double get usageRatio => quotaBytes <= 0
+      ? 0.0
+      : (usedBytes / quotaBytes).clamp(0.0, 1.0);
+
+  factory VaultSummaryModel.fromJson(Map<String, dynamic> json) {
+    final rawVolumes = json['volumes'] as List<dynamic>;
+    return VaultSummaryModel(
+      vaultId: json['vault_id'] as String,
+      name: json['name'] as String,
+      poolMode: json['pool_mode'] as String,
+      quotaBytes: (json['quota_bytes'] as num).toInt(),
+      usedBytes: (json['used_bytes'] as num).toInt(),
+      e2eeEnabled: json['e2ee_enabled'] as bool,
+      volumes: rawVolumes
+          .map((e) => VaultVolumeModel.fromJson(e as Map<String, dynamic>))
+          .toList(growable: false),
+    );
+  }
+}
+
+/// 历史快照摘要模型（对齐 `list_snapshots`）。
+@immutable
+class SnapshotSummaryModel {
+  const SnapshotSummaryModel({
+    required this.snapshotId,
+    required this.vaultId,
+    required this.deviceId,
+    required this.retentionTier,
+    required this.fileCount,
+    required this.totalBytes,
+    required this.createdAt,
+  });
+
+  final String snapshotId;
+  final String vaultId;
+  final String deviceId;
+  final String retentionTier;
+  final int fileCount;
+  final int totalBytes;
+  final String createdAt;
+
+  String get retentionLabel {
+    return switch (retentionTier.toLowerCase()) {
+      'daily' => '每日保留',
+      'weekly' => '每周保留',
+      'monthly' => '每月保留',
+      'manual' => '手动快照',
+      _ => retentionTier,
+    };
+  }
+
+  factory SnapshotSummaryModel.fromJson(Map<String, dynamic> json) {
+    return SnapshotSummaryModel(
+      snapshotId: json['snapshot_id'] as String,
+      vaultId: json['vault_id'] as String,
+      deviceId: json['device_id'] as String,
+      retentionTier: json['retention_tier'] as String,
+      fileCount: (json['file_count'] as num).toInt(),
+      totalBytes: (json['total_bytes'] as num).toInt(),
+      createdAt: json['created_at'].toString(),
+    );
+  }
+}
+
+/// Bit-Rot 巡检结果模型（对齐 `trigger_bit_rot_scrub`）。
+@immutable
+class BitRotScrubResultModel {
+  const BitRotScrubResultModel({
+    required this.scrubId,
+    required this.checkedChunks,
+    required this.corruptedChunks,
+    required this.healedChunks,
+    required this.status,
+  });
+
+  final String scrubId;
+  final int checkedChunks;
+  final int corruptedChunks;
+  final int healedChunks;
+  final String status;
+
+  factory BitRotScrubResultModel.fromJson(Map<String, dynamic> json) {
+    return BitRotScrubResultModel(
+      scrubId: json['scrub_id'] as String,
+      checkedChunks: (json['checked_chunks'] as num).toInt(),
+      corruptedChunks: (json['corrupted_chunks'] as num).toInt(),
+      healedChunks: (json['healed_chunks'] as num).toInt(),
+      status: json['status'] as String,
+    );
+  }
+}
+
+/// 本机配对信息模型（对齐 `get_pairing_info`）。
+@immutable
+class PairingInfoModel {
+  const PairingInfoModel({
+    required this.serverRunning,
+    required this.lanIp,
+    required this.port,
+    required this.pairingPin,
+    required this.pairingQrUri,
+  });
+
+  final bool serverRunning;
+  final String lanIp;
+  final int port;
+  final String pairingPin;
+  final String pairingQrUri;
+
+  factory PairingInfoModel.fromJson(Map<String, dynamic> json) {
+    return PairingInfoModel(
+      serverRunning: json['server_running'] as bool,
+      lanIp: json['lan_ip'] as String,
+      port: (json['port'] as num).toInt(),
+      pairingPin: json['pairing_pin'] as String,
+      pairingQrUri: json['pairing_qr_uri'] as String,
+    );
+  }
+}
+
+/// Android 原生保活 MethodChannel 通道封装。
 class AndroidKeepAliveChannel {
   const AndroidKeepAliveChannel({
     MethodChannel channel = const MethodChannel(channelName),
@@ -194,6 +580,7 @@ class AndroidKeepAliveChannel {
     required int quotaGb,
     required int port,
     required String webPassword,
+    bool skipNativeStart = false,
   }) async {
     if (!Platform.isAndroid) return true;
     final started = await _channel.invokeMethod<bool>(
@@ -203,6 +590,7 @@ class AndroidKeepAliveChannel {
         'quotaGb': quotaGb,
         'port': port,
         'webPassword': webPassword,
+        'skipNativeStart': skipNativeStart,
       },
     );
     if (started == null) {
@@ -247,6 +635,36 @@ class AndroidKeepAliveChannel {
     return granted;
   }
 
+  Future<bool> requestLocationPermission() async {
+    if (!Platform.isAndroid) return true;
+    final granted = await _channel.invokeMethod<bool>(
+      'requestLocationPermission',
+    );
+    if (granted == null) {
+      throw StateError('requestLocationPermission returned null.');
+    }
+    return granted;
+  }
+
+  Future<bool> requestNotificationPermission() async {
+    if (!Platform.isAndroid) return true;
+    final granted = await _channel.invokeMethod<bool>(
+      'requestNotificationPermission',
+    );
+    if (granted == null) {
+      throw StateError('requestNotificationPermission returned null.');
+    }
+    return granted;
+  }
+
+  Future<String?> pickDirectory() async {
+    if (!Platform.isAndroid) return null;
+    final picked = await _channel.invokeMethod<String>('pickDirectory');
+    if (picked == null) return null;
+    final trimmed = picked.trim();
+    return trimmed.isEmpty ? null : trimmed;
+  }
+
   Future<({bool onWifi, String? currentSsid, bool isCharging})>
       getDeviceEnvironment() async {
     if (!Platform.isAndroid) {
@@ -265,25 +683,22 @@ class AndroidKeepAliveChannel {
     );
   }
 
-  Future<({String vaultPath, int quotaGb, int port, String webPassword})?>
-      getLastServerConfig() async {
+  Future<LastServerConfig?> getLastServerConfig() async {
     if (!Platform.isAndroid) return null;
     final raw = await _channel.invokeMapMethod<String, Object?>(
       'getLastServerConfig',
     );
     if (raw == null) return null;
-    return (
+    return LastServerConfig(
       vaultPath: raw['vaultPath'] as String,
       quotaGb: (raw['quotaGb'] as num).toInt(),
       port: (raw['port'] as num).toInt(),
-      webPassword: raw['webPassword'] as String,
+      webPassword: raw['webPassword'] as String?,
     );
   }
 }
 
-/// 严格对齐 `crates/lanvault-ffi/src/api.rs` 导出函数的抽象契约。
-/// 持久化备份规则模型（对应 SQLite `sync_rules` 表）。
-/// 统一 Debug 与性能探针日志条目（聚合 Rust 原生错误/Panic、探针耗时与前端异常）。
+/// 统一 Debug 与性能探针日志条目。
 class DebugLogEntryModel {
   const DebugLogEntryModel({
     required this.seq,
@@ -312,25 +727,48 @@ class DebugLogEntryModel {
       level: json['level'] as String,
       source: json['source'] as String,
       probe: json['probe'] as String?,
-      durationUs: json['duration_us'] == null ? null : (json['duration_us'] as num).toInt(),
+      durationUs: json['duration_us'] == null
+          ? null
+          : (json['duration_us'] as num).toInt(),
       message: json['message'] as String,
       detail: json['detail'] as String?,
     );
   }
 }
 
+/// 持久化备份规则模型。
 class SyncRuleModel {
   const SyncRuleModel({
     required this.ruleId,
     required this.localDir,
     required this.targetVaultId,
     required this.enabled,
+    this.scheduleMode = 'realtime',
   });
 
   final String ruleId;
   final String localDir;
   final String targetVaultId;
   final bool enabled;
+  final String scheduleMode;
+
+  String get scheduleLabel {
+    return switch (scheduleMode) {
+      'daily' => '每日 · 增量',
+      'manual' => '手动',
+      _ => '实时 · 增量',
+    };
+  }
+
+  SyncRuleModel copyWith({bool? enabled, String? scheduleMode}) {
+    return SyncRuleModel(
+      ruleId: ruleId,
+      localDir: localDir,
+      targetVaultId: targetVaultId,
+      enabled: enabled ?? this.enabled,
+      scheduleMode: scheduleMode ?? this.scheduleMode,
+    );
+  }
 
   factory SyncRuleModel.fromJson(Map<String, dynamic> json) {
     return SyncRuleModel(
@@ -338,10 +776,108 @@ class SyncRuleModel {
       localDir: json['local_dir'] as String,
       targetVaultId: json['target_vault_id'] as String,
       enabled: json['enabled'] as bool,
+      scheduleMode: json['schedule_mode'] as String? ?? 'realtime',
     );
   }
 }
 
+@immutable
+class PairedPeerModel {
+  const PairedPeerModel({
+    required this.deviceId,
+    required this.deviceName,
+    required this.osType,
+    this.ip,
+    this.port,
+    this.online = false,
+    this.lastSeenSecs,
+  });
+
+  final String deviceId;
+  final String deviceName;
+  final String osType;
+  final String? ip;
+  final int? port;
+  final bool online;
+  final int? lastSeenSecs;
+
+  String get presenceLabel {
+    if (online) return '在线';
+    final secs = lastSeenSecs;
+    if (secs == null) return '离线';
+    if (secs < 60) return '离线 · 刚刚';
+    if (secs < 3600) return '离线 · ${secs ~/ 60} 分钟前';
+    return '离线 · ${secs ~/ 3600} 小时前';
+  }
+
+  String get displayLabel {
+    final name = deviceName.trim().isEmpty ? deviceId : deviceName.trim();
+    if (ip != null && ip!.isNotEmpty) {
+      return '$name · $ip';
+    }
+    return name;
+  }
+
+  factory PairedPeerModel.fromJson(Map<String, dynamic> json) {
+    return PairedPeerModel(
+      deviceId: json['device_id'] as String,
+      deviceName: json['device_name'] as String,
+      osType: json['os_type'] as String,
+      ip: json['ip'] as String?,
+      port: json['port'] == null ? null : (json['port'] as num).toInt(),
+      online: json['online'] as bool? ?? false,
+      lastSeenSecs: json['last_seen_secs'] == null
+          ? null
+          : (json['last_seen_secs'] as num).toInt(),
+    );
+  }
+}
+
+@immutable
+class PowerNetworkPolicyModel {
+  const PowerNetworkPolicyModel({
+    required this.wifiOnly,
+    required this.allowedSsids,
+    required this.requireCharging,
+    required this.maxKbps,
+  });
+
+  final bool wifiOnly;
+  final List<String> allowedSsids;
+  final bool requireCharging;
+  final int maxKbps;
+
+  factory PowerNetworkPolicyModel.fromJson(Map<String, dynamic> json) {
+    final rawSsids =
+        json['allowed_ssids'] as List<dynamic>? ?? const <dynamic>[];
+    return PowerNetworkPolicyModel(
+      wifiOnly: json['wifi_only'] as bool,
+      allowedSsids: rawSsids.map((e) => e as String).toList(growable: false),
+      requireCharging: json['require_charging'] as bool,
+      maxKbps: (json['max_kbps'] as num).toInt(),
+    );
+  }
+}
+
+@immutable
+class BackupStorageConfigModel {
+  const BackupStorageConfigModel({
+    required this.primaryDir,
+    this.fallbackDir,
+  });
+
+  final String primaryDir;
+  final String? fallbackDir;
+
+  factory BackupStorageConfigModel.fromJson(Map<String, dynamic> json) {
+    return BackupStorageConfigModel(
+      primaryDir: json['primary_dir'] as String,
+      fallbackDir: json['fallback_dir'] as String?,
+    );
+  }
+}
+
+/// 严格对齐 `crates/lanvault-ffi/src/api.rs` 导出函数的抽象契约。
 abstract class LanVaultRustFfi {
   Stream<DiscoveredPeer> startMdnsScan();
   Future<String> pairWithPin({
@@ -357,6 +893,7 @@ abstract class LanVaultRustFfi {
     int? port,
   });
   Future<void> prepareGracefulRestart();
+  Future<LastServerConfig?> getLastServerConfig();
   Stream<SyncProgressEvent> subscribeSyncProgress();
   Future<void> triggerIncrementalScan(String ruleId);
   Future<void> updatePowerNetworkPolicy({
@@ -396,9 +933,63 @@ abstract class LanVaultRustFfi {
     required String message,
     String? detail,
   });
+  Future<List<PairedPeerModel>> listPairedPeers();
+  Future<PowerNetworkPolicyModel> getPowerNetworkPolicy();
+  Future<bool> getAutoReconnect();
+  Future<BackupStorageConfigModel> getBackupStorageConfig();
+  Future<BackupStorageConfigModel> setBackupStorageConfig({
+    required String primaryDir,
+    String? fallbackDir,
+  });
+  Future<String?> getDebugLogPath();
+  Future<Map<String, dynamic>> runSelfDiagnostics();
+
+  // --- 新增 9 个 WebUI 端内整合 FFI 接口 ---
+  Future<SystemOverviewModel> getSystemOverview();
+  Future<List<VaultSummaryModel>> listVaults();
+  Future<VaultSummaryModel> createVault({
+    required String name,
+    required String mountPath,
+    required String poolMode,
+    required int quotaGb,
+    required bool e2eeEnabled,
+    String? extraMountPath,
+  });
+  Future<List<SnapshotSummaryModel>> listSnapshots({String? vaultId});
+  Future<BitRotScrubResultModel> triggerBitRotScrub();
+  Future<bool> revokePairedPeer(String deviceId);
+  Future<PairingInfoModel> getPairingInfo();
+  Future<bool> toggleSyncRule({
+    required String ruleId,
+    required bool enabled,
+  });
+  Future<bool> pushClipboardFile({
+    String? targetDeviceId,
+    required String filePath,
+  });
+
+  Future<RestoreSnapshotResultModel> restoreSnapshot({
+    required String snapshotId,
+    required String targetDir,
+  });
+
+  Future<List<TransferHistoryModel>> listTransferHistory({int limit = 50});
+
+  Future<bool> setSyncPaused(bool paused);
+
+  Future<bool> getSyncPaused();
+
+  Future<bool> setBitRotAutoScrub(bool enabled);
+
+  Future<bool> getBitRotAutoScrub();
+
+  Future<String> setSyncRuleSchedule({
+    required String ruleId,
+    required String scheduleMode,
+  });
 }
 
-// --- Native C-ABI 符号签名，与 flutter_rust_bridge / lanvault_ffi 共享库对齐 ---
+// --- Native C-ABI 符号签名，与 lanvault_ffi 共享库对齐 ---
 typedef _CInvokeJsonNative = ffi.Pointer<Utf8> Function(
   ffi.Pointer<Utf8> fnName,
   ffi.Pointer<Utf8> payloadJson,
@@ -410,8 +1001,6 @@ typedef _CInvokeJsonDart = ffi.Pointer<Utf8> Function(
 typedef _CFreeStringNative = ffi.Void Function(ffi.Pointer<Utf8> ptr);
 typedef _CFreeStringDart = void Function(ffi.Pointer<Utf8> ptr);
 
-/// 基于 `liblanvault_ffi` 动态库（Windows: `lanvault_ffi.dll`, Android: `liblanvault_ffi.so`）
-/// 的 FFI 绑定实现；在边界解码 JSON 响应并立即将 Rust 错误向上抛出。
 ffi.DynamicLibrary _openLanVaultLibrary() {
   if (Platform.isWindows) {
     return ffi.DynamicLibrary.open('lanvault_ffi.dll');
@@ -440,6 +1029,9 @@ Map<String, dynamic> _invokeJsonInWorker((String, String) args) {
   ffi.Pointer<Utf8>? resultPtr;
   try {
     resultPtr = invokeJson(fnPtr, payloadPtr);
+    if (resultPtr == ffi.nullptr) {
+      throw StateError('FFI $fnName returned null pointer.');
+    }
     final raw = resultPtr.toDartString();
     final decoded = jsonDecode(raw) as Map<String, dynamic>;
     if (decoded['ok'] != true) {
@@ -456,52 +1048,7 @@ Map<String, dynamic> _invokeJsonInWorker((String, String) args) {
 }
 
 class NativeLanVaultRustFfi implements LanVaultRustFfi {
-  NativeLanVaultRustFfi() : _lib = _openLibrary() {
-    _invokeJson = _lib.lookupFunction<_CInvokeJsonNative, _CInvokeJsonDart>(
-      'lanvault_ffi_invoke_json',
-    );
-    _freeString = _lib.lookupFunction<_CFreeStringNative, _CFreeStringDart>(
-      'lanvault_ffi_free_string',
-    );
-  }
-
-  final ffi.DynamicLibrary _lib;
-  late final _CInvokeJsonDart _invokeJson;
-  late final _CFreeStringDart _freeString;
-
-  static ffi.DynamicLibrary _openLibrary() {
-    if (Platform.isWindows) {
-      return ffi.DynamicLibrary.open('lanvault_ffi.dll');
-    }
-    if (Platform.isAndroid || Platform.isLinux) {
-      return ffi.DynamicLibrary.open('liblanvault_ffi.so');
-    }
-    if (Platform.isMacOS) {
-      return ffi.DynamicLibrary.open('liblanvault_ffi.dylib');
-    }
-    throw UnsupportedError('Unsupported platform: ${Platform.operatingSystem}');
-  }
-
-  Map<String, dynamic> _callSync(String fnName, Map<String, Object?> payload) {
-    final fnPtr = fnName.toNativeUtf8();
-    final payloadPtr = jsonEncode(payload).toNativeUtf8();
-    ffi.Pointer<Utf8>? resultPtr;
-    try {
-      resultPtr = _invokeJson(fnPtr, payloadPtr);
-      final raw = resultPtr.toDartString();
-      final decoded = jsonDecode(raw) as Map<String, dynamic>;
-      if (decoded['ok'] != true) {
-        throw StateError('FFI $fnName failed: ${decoded['error']}');
-      }
-      return decoded;
-    } finally {
-      calloc.free(fnPtr);
-      calloc.free(payloadPtr);
-      if (resultPtr != null && resultPtr != ffi.nullptr) {
-        _freeString(resultPtr);
-      }
-    }
-  }
+  NativeLanVaultRustFfi();
 
   Future<Map<String, dynamic>> _callAsync(
     String fnName,
@@ -513,16 +1060,47 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
 
   @override
   Stream<DiscoveredPeer> startMdnsScan() {
-    return Stream<List<DiscoveredPeer>>.periodic(
-      const Duration(seconds: 2),
-      (_) {
-        final resp = _callSync('start_mdns_scan', const <String, Object?>{});
+    late final StreamController<DiscoveredPeer> controller;
+    Timer? timer;
+    var inFlight = false;
+
+    Future<void> pollOnce() async {
+      if (inFlight || controller.isClosed) return;
+      inFlight = true;
+      try {
+        final resp =
+            await _callAsync('start_mdns_scan', const <String, Object?>{});
+        if (controller.isClosed) return;
         final list = resp['peers'] as List<dynamic>;
-        return list
-            .map((e) => DiscoveredPeer.fromJson(e as Map<String, dynamic>))
-            .toList(growable: false);
+        for (final item in list) {
+          controller.add(DiscoveredPeer.fromJson(item as Map<String, dynamic>));
+        }
+      } catch (err, st) {
+        if (!controller.isClosed) {
+          controller.addError(err, st);
+        }
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    controller = StreamController<DiscoveredPeer>(
+      onListen: () {
+        unawaited(pollOnce());
+        timer = Timer.periodic(
+          const Duration(seconds: 2),
+          (_) => unawaited(pollOnce()),
+        );
       },
-    ).expand((peers) => peers);
+      onCancel: () async {
+        timer?.cancel();
+        timer = null;
+        if (!controller.isClosed) {
+          await controller.close();
+        }
+      },
+    );
+    return controller.stream;
   }
 
   @override
@@ -541,7 +1119,10 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
 
   @override
   Future<void> enableAutoReconnect(bool enabled) async {
-    await _callAsync('enable_auto_reconnect', <String, Object?>{'enabled': enabled});
+    await _callAsync(
+      'enable_auto_reconnect',
+      <String, Object?>{'enabled': enabled},
+    );
   }
 
   @override
@@ -566,22 +1147,71 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
   }
 
   @override
+  Future<LastServerConfig?> getLastServerConfig() async {
+    final resp = await _callAsync(
+      'get_last_server_config',
+      const <String, Object?>{},
+    );
+    final raw = resp.containsKey('config') ? resp['config'] : resp;
+    if (raw == null) return null;
+    if (raw is Map<String, dynamic> && raw['vault_path'] is String) {
+      return LastServerConfig.fromRustJson(raw);
+    }
+    return null;
+  }
+
+  @override
   Stream<SyncProgressEvent> subscribeSyncProgress() {
-    return Stream<SyncProgressEvent>.periodic(
-      const Duration(seconds: 1),
-      (_) {
-        final resp = _callSync(
+    late final StreamController<SyncProgressEvent> controller;
+    Timer? timer;
+    var inFlight = false;
+
+    Future<void> pollOnce() async {
+      if (inFlight || controller.isClosed) return;
+      inFlight = true;
+      try {
+        final resp = await _callAsync(
           'subscribe_sync_progress',
           const <String, Object?>{},
         );
-        return SyncProgressEvent.fromJson(resp['event'] as Map<String, dynamic>);
+        if (controller.isClosed) return;
+        controller.add(
+          SyncProgressEvent.fromJson(resp['event'] as Map<String, dynamic>),
+        );
+      } catch (err, st) {
+        if (!controller.isClosed) {
+          controller.addError(err, st);
+        }
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    controller = StreamController<SyncProgressEvent>(
+      onListen: () {
+        unawaited(pollOnce());
+        timer = Timer.periodic(
+          const Duration(seconds: 1),
+          (_) => unawaited(pollOnce()),
+        );
+      },
+      onCancel: () async {
+        timer?.cancel();
+        timer = null;
+        if (!controller.isClosed) {
+          await controller.close();
+        }
       },
     );
+    return controller.stream;
   }
 
   @override
   Future<void> triggerIncrementalScan(String ruleId) async {
-    await _callAsync('trigger_incremental_scan', <String, Object?>{'rule_id': ruleId});
+    await _callAsync(
+      'trigger_incremental_scan',
+      <String, Object?>{'rule_id': ruleId},
+    );
   }
 
   @override
@@ -639,7 +1269,8 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
 
   @override
   Future<List<SyncRuleModel>> listSyncRules() async {
-    final resp = await _callAsync('list_sync_rules', const <String, Object?>{});
+    final resp =
+        await _callAsync('list_sync_rules', const <String, Object?>{});
     final list = resp['rules'] as List<dynamic>;
     return list
         .map((e) => SyncRuleModel.fromJson(e as Map<String, dynamic>))
@@ -672,7 +1303,8 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
 
   @override
   Future<String> exportVaultKeyBackup(String passphrase) async {
-    final resp = await _callAsync('export_vault_key_backup', <String, Object?>{
+    final resp =
+        await _callAsync('export_vault_key_backup', <String, Object?>{
       'passphrase': passphrase,
     });
     return resp['backup'] as String;
@@ -733,6 +1365,252 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
       'detail': detail,
     });
   }
+
+  @override
+  Future<List<PairedPeerModel>> listPairedPeers() async {
+    final resp =
+        await _callAsync('list_paired_peers', const <String, Object?>{});
+    final list = resp['peers'] as List<dynamic>;
+    return list
+        .map((e) => PairedPeerModel.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<PowerNetworkPolicyModel> getPowerNetworkPolicy() async {
+    final resp = await _callAsync(
+      'get_power_network_policy',
+      const <String, Object?>{},
+    );
+    return PowerNetworkPolicyModel.fromJson(
+      resp['policy'] as Map<String, dynamic>,
+    );
+  }
+
+  @override
+  Future<bool> getAutoReconnect() async {
+    final resp =
+        await _callAsync('get_auto_reconnect', const <String, Object?>{});
+    return resp['enabled'] as bool;
+  }
+
+  @override
+  Future<BackupStorageConfigModel> getBackupStorageConfig() async {
+    final resp = await _callAsync(
+      'get_backup_storage_config',
+      const <String, Object?>{},
+    );
+    return BackupStorageConfigModel.fromJson(
+      resp['config'] as Map<String, dynamic>,
+    );
+  }
+
+  @override
+  Future<BackupStorageConfigModel> setBackupStorageConfig({
+    required String primaryDir,
+    String? fallbackDir,
+  }) async {
+    final resp = await _callAsync(
+      'set_backup_storage_config',
+      <String, Object?>{
+        'primary_dir': primaryDir,
+        'fallback_dir': fallbackDir,
+      },
+    );
+    return BackupStorageConfigModel.fromJson(
+      resp['config'] as Map<String, dynamic>,
+    );
+  }
+
+  @override
+  Future<String?> getDebugLogPath() async {
+    final resp =
+        await _callAsync('get_debug_log_path', const <String, Object?>{});
+    return resp['log_path'] as String?;
+  }
+
+  @override
+  Future<Map<String, dynamic>> runSelfDiagnostics() async {
+    final resp =
+        await _callAsync('run_self_diagnostics', const <String, Object?>{});
+    return resp['report'] as Map<String, dynamic>;
+  }
+
+  // --- 新增 9 个 WebUI 端内整合 FFI 接口实现 ---
+
+  @override
+  Future<SystemOverviewModel> getSystemOverview() async {
+    final resp = await _callAsync(
+      'get_system_overview',
+      const <String, Object?>{},
+    );
+    final raw = resp.containsKey('overview')
+        ? resp['overview'] as Map<String, dynamic>
+        : resp;
+    return SystemOverviewModel.fromJson(raw);
+  }
+
+  @override
+  Future<List<VaultSummaryModel>> listVaults() async {
+    final resp = await _callAsync('list_vaults', const <String, Object?>{});
+    final list = resp['vaults'] as List<dynamic>;
+    return list
+        .map((e) => VaultSummaryModel.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<VaultSummaryModel> createVault({
+    required String name,
+    required String mountPath,
+    required String poolMode,
+    required int quotaGb,
+    required bool e2eeEnabled,
+    String? extraMountPath,
+  }) async {
+    final resp = await _callAsync('create_vault', <String, Object?>{
+      'name': name,
+      'mount_path': mountPath,
+      'pool_mode': poolMode,
+      'quota_gb': quotaGb,
+      'e2ee_enabled': e2eeEnabled,
+      'extra_mount_path': extraMountPath,
+    });
+    final raw = resp.containsKey('vault')
+        ? resp['vault'] as Map<String, dynamic>
+        : resp;
+    return VaultSummaryModel.fromJson(raw);
+  }
+
+  @override
+  Future<List<SnapshotSummaryModel>> listSnapshots({String? vaultId}) async {
+    final resp = await _callAsync('list_snapshots', <String, Object?>{
+      'vault_id': vaultId,
+    });
+    final list = resp['snapshots'] as List<dynamic>;
+    return list
+        .map((e) => SnapshotSummaryModel.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<BitRotScrubResultModel> triggerBitRotScrub() async {
+    final resp = await _callAsync(
+      'trigger_bit_rot_scrub',
+      const <String, Object?>{},
+    );
+    final raw = resp.containsKey('scrub')
+        ? resp['scrub'] as Map<String, dynamic>
+        : resp;
+    return BitRotScrubResultModel.fromJson(raw);
+  }
+
+  @override
+  Future<bool> revokePairedPeer(String deviceId) async {
+    final resp = await _callAsync('revoke_paired_peer', <String, Object?>{
+      'device_id': deviceId,
+    });
+    return resp['revoked'] as bool;
+  }
+
+  @override
+  Future<PairingInfoModel> getPairingInfo() async {
+    final resp = await _callAsync(
+      'get_pairing_info',
+      const <String, Object?>{},
+    );
+    final raw = resp.containsKey('pairing_info')
+        ? resp['pairing_info'] as Map<String, dynamic>
+        : resp;
+    return PairingInfoModel.fromJson(raw);
+  }
+
+  @override
+  Future<bool> toggleSyncRule({
+    required String ruleId,
+    required bool enabled,
+  }) async {
+    final resp = await _callAsync('toggle_sync_rule', <String, Object?>{
+      'rule_id': ruleId,
+      'enabled': enabled,
+    });
+    return resp['enabled'] as bool;
+  }
+
+  @override
+  Future<bool> pushClipboardFile({
+    String? targetDeviceId,
+    required String filePath,
+  }) async {
+    final resp = await _callAsync('push_clipboard_file', <String, Object?>{
+      'target_device_id': targetDeviceId,
+      'file_path': filePath,
+    });
+    return resp['sent'] as bool;
+  }
+
+  @override
+  Future<RestoreSnapshotResultModel> restoreSnapshot({
+    required String snapshotId,
+    required String targetDir,
+  }) async {
+    final resp = await _callAsync('restore_snapshot', <String, Object?>{
+      'snapshot_id': snapshotId,
+      'target_dir': targetDir,
+    });
+    return RestoreSnapshotResultModel.fromJson(resp);
+  }
+
+  @override
+  Future<List<TransferHistoryModel>> listTransferHistory({int limit = 50}) async {
+    final resp = await _callAsync('list_transfer_history', <String, Object?>{
+      'limit': limit,
+    });
+    final raw = resp['records'] as List<dynamic>? ?? const <dynamic>[];
+    return raw
+        .map((e) => TransferHistoryModel.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<bool> setSyncPaused(bool paused) async {
+    final resp = await _callAsync('set_sync_paused', <String, Object?>{
+      'paused': paused,
+    });
+    return resp['paused'] as bool? ?? paused;
+  }
+
+  @override
+  Future<bool> getSyncPaused() async {
+    final resp = await _callAsync('get_sync_paused', const <String, Object?>{});
+    return resp['paused'] as bool? ?? false;
+  }
+
+  @override
+  Future<bool> setBitRotAutoScrub(bool enabled) async {
+    final resp = await _callAsync('set_bit_rot_auto_scrub', <String, Object?>{
+      'enabled': enabled,
+    });
+    return resp['enabled'] as bool? ?? enabled;
+  }
+
+  @override
+  Future<bool> getBitRotAutoScrub() async {
+    final resp = await _callAsync('get_bit_rot_auto_scrub', const <String, Object?>{});
+    return resp['enabled'] as bool? ?? true;
+  }
+
+  @override
+  Future<String> setSyncRuleSchedule({
+    required String ruleId,
+    required String scheduleMode,
+  }) async {
+    final resp = await _callAsync('set_sync_rule_schedule', <String, Object?>{
+      'rule_id': ruleId,
+      'schedule_mode': scheduleMode,
+    });
+    return resp['schedule_mode'] as String? ?? scheduleMode;
+  }
 }
 
 /// 统一桥接门面：协调 Rust FFI 与 Android MethodChannel，
@@ -747,41 +1625,82 @@ class LanVaultBridge {
         roleModeNotifier = ValueNotifier<RoleMode>(initialRoleMode) {
     _environmentTimer = Timer.periodic(
       const Duration(seconds: 15),
-      (_) => _refreshDeviceEnvironment(),
+      (_) => unawaited(_refreshDeviceEnvironment()),
     );
     unawaited(_refreshDeviceEnvironment());
   }
 
+  static const String appVersion = '0.2.0';
   static const int defaultServerPort = 7842;
 
   LanVaultRustFfi? _rustFfi;
   final AndroidKeepAliveChannel _keepAliveChannel;
   Timer? _environmentTimer;
+  bool _disposed = false;
   ({String vaultPath, int quotaGb, String webPassword, int port, bool elevated})?
       _lastServerConfig;
 
-  /// 运行模式单一真相源，供 Shell 导航栏与 Dashboard 实时联动。
+  /// 运行模式单一真相源，供 Shell 导航栏、Dashboard 与 Settings 实时联动。
   final ValueNotifier<RoleMode> roleModeNotifier;
+
+  /// 已配对设备列表状态源，配对/解绑成功后自动刷新。
+  final ValueNotifier<List<PairedPeerModel>> pairedPeersNotifier =
+      ValueNotifier<List<PairedPeerModel>>(const <PairedPeerModel>[]);
+
+  /// 断线自动重连开关状态源。
+  final ValueNotifier<bool> autoReconnectNotifier = ValueNotifier<bool>(true);
 
   RoleMode get currentRoleMode => roleModeNotifier.value;
 
   LanVaultRustFfi get _ffi => _rustFfi ??= NativeLanVaultRustFfi();
 
   void dispose() {
+    if (_disposed) return;
+    _disposed = true;
     _environmentTimer?.cancel();
+    _environmentTimer = null;
     roleModeNotifier.dispose();
+    pairedPeersNotifier.dispose();
+    autoReconnectNotifier.dispose();
+  }
+
+  Future<({bool onWifi, String? currentSsid, bool isCharging})>
+      _readPlatformDeviceEnvironment() async {
+    if (Platform.isWindows) {
+      final scan = await SystemEnvHelper.scanNetworks();
+      return (
+        onWifi: scan.hasWifiAdapter && scan.currentSsid != null,
+        currentSsid: scan.currentSsid,
+        isCharging: true,
+      );
+    }
+    return _keepAliveChannel.getDeviceEnvironment();
   }
 
   Future<void> _refreshDeviceEnvironment() async {
+    if (_disposed) return;
     try {
-      final environment = await _keepAliveChannel.getDeviceEnvironment();
+      final environment = await _readPlatformDeviceEnvironment();
+      if (_disposed) return;
       await _ffi.updateDeviceEnvironment(
         onWifi: environment.onWifi,
         currentSsid: environment.currentSsid,
         isCharging: environment.isCharging,
       );
-    } catch (_) {
-      // A subsequent periodic refresh retries transient platform failures.
+    } catch (err, st) {
+      debugPrint('EveryoneNAS _refreshDeviceEnvironment failed: $err');
+      if (!_disposed) {
+        unawaited(
+          _ffi
+              .reportClientLog(
+                level: 'WARN',
+                source: 'bridge.device_env',
+                message: '刷新设备网络环境失败: $err',
+                detail: st.toString(),
+              )
+              .catchError((Object _) {}),
+        );
+      }
     }
   }
 
@@ -813,13 +1732,15 @@ class LanVaultBridge {
         roleModeNotifier.value = reverted;
         throw StateError('后台服务未能停止，运行模式已回滚到 ${reverted.wireValue}。');
       }
+    } else if (Platform.isAndroid && !previous.hasServer && applied.hasServer) {
+      await _keepAliveChannel.detectKeepAliveLevel();
     }
 
     roleModeNotifier.value = applied;
     return applied;
   }
 
-  // --- 1..9: ARCHITECTURE_CONTRACTS.md 第 4 节 FFI 接口 ---
+  // --- 核心 FFI 接口 ---
 
   Stream<DiscoveredPeer> startMdnsScan() => _ffi.startMdnsScan();
 
@@ -827,18 +1748,62 @@ class LanVaultBridge {
     required String ip,
     required int port,
     required String pin,
-  }) {
+  }) async {
     if (!RegExp(r'^\d{6}$').hasMatch(pin)) {
       throw ArgumentError.value(pin, 'pin', 'PIN 必须为 6 位数字');
     }
     if (port <= 0 || port > 65535) {
       throw RangeError.range(port, 1, 65535, 'port');
     }
-    return _ffi.pairWithPin(ip: ip, port: port, pin: pin);
+    final pairedId = await _ffi.pairWithPin(ip: ip, port: port, pin: pin);
+    unawaited(refreshPairedPeers());
+    return pairedId;
   }
 
-  Future<void> enableAutoReconnect(bool enabled) =>
-      _ffi.enableAutoReconnect(enabled);
+  Future<void> enableAutoReconnect(bool enabled) async {
+    await _ffi.enableAutoReconnect(enabled);
+    autoReconnectNotifier.value = enabled;
+  }
+
+  Future<bool> getAutoReconnect() async {
+    final enabled = await _ffi.getAutoReconnect();
+    autoReconnectNotifier.value = enabled;
+    return enabled;
+  }
+
+  Future<List<PairedPeerModel>> refreshPairedPeers() async {
+    final peers = await _ffi.listPairedPeers();
+    pairedPeersNotifier.value = peers;
+    return peers;
+  }
+
+  Future<PowerNetworkPolicyModel> getPowerNetworkPolicy() =>
+      _ffi.getPowerNetworkPolicy();
+
+  Future<BackupStorageConfigModel> getBackupStorageConfig() =>
+      _ffi.getBackupStorageConfig();
+
+  Future<BackupStorageConfigModel> setBackupStorageConfig({
+    required String primaryDir,
+    String? fallbackDir,
+  }) =>
+      _ffi.setBackupStorageConfig(
+        primaryDir: primaryDir,
+        fallbackDir: fallbackDir,
+      );
+
+  Future<({bool onWifi, String? currentSsid, bool isCharging})>
+      getDeviceEnvironment() => _readPlatformDeviceEnvironment();
+
+  Future<LastServerConfig?> getLastServerConfig() async {
+    if (Platform.isAndroid) {
+      final androidSaved = await _keepAliveChannel.getLastServerConfig();
+      if (androidSaved != null) {
+        return androidSaved;
+      }
+    }
+    return _ffi.getLastServerConfig();
+  }
 
   Future<int> startLocalServer({
     required String vaultPath,
@@ -853,10 +1818,13 @@ class LanVaultBridge {
     if (quotaGb <= 0) {
       throw RangeError.value(quotaGb, 'quotaGb', '存储配额必须大于 0 GB');
     }
+    if (port <= 0 || port > 65535) {
+      throw RangeError.range(port, 1, 65535, 'port');
+    }
     if (webPassword.length < 8) {
       throw ArgumentError.value(webPassword, 'webPassword', 'Web 管理密码至少 8 位');
     }
-    final environment = await _keepAliveChannel.getDeviceEnvironment();
+    final environment = await _readPlatformDeviceEnvironment();
     await _ffi.updateDeviceEnvironment(
       onWifi: environment.onWifi,
       currentSsid: environment.currentSsid,
@@ -896,6 +1864,7 @@ class LanVaultBridge {
         quotaGb: quotaGb,
         port: boundPort,
         webPassword: webPassword,
+        skipNativeStart: true,
       );
       _lastServerConfig = (
         vaultPath: trimmedPath,
@@ -949,7 +1918,8 @@ class LanVaultBridge {
     return _ffi.upsertSyncRule(
       ruleId: ruleId.trim(),
       localDir: localDir.trim(),
-      targetVaultId: targetVaultId.trim().isEmpty ? 'default' : targetVaultId.trim(),
+      targetVaultId:
+          targetVaultId.trim().isEmpty ? 'default' : targetVaultId.trim(),
       enabled: enabled,
     );
   }
@@ -981,10 +1951,10 @@ class LanVaultBridge {
     required bool requireCharging,
     required int maxKbps,
   }) async {
-    if (maxKbps < 0) {
-      throw RangeError.value(maxKbps, 'maxKbps', '限速值不能为负数');
+    if (maxKbps < 0 || maxKbps > 0xFFFFFFFF) {
+      throw RangeError.range(maxKbps, 0, 0xFFFFFFFF, 'maxKbps');
     }
-    final environment = await _keepAliveChannel.getDeviceEnvironment();
+    final environment = await _readPlatformDeviceEnvironment();
     await _ffi.updateDeviceEnvironment(
       onWifi: environment.onWifi,
       currentSsid: environment.currentSsid,
@@ -1011,36 +1981,154 @@ class LanVaultBridge {
     );
   }
 
-  // --- ARCHITECTURE_CONTRACTS.md 第 5 节 Android 保活通道 ---
+  // --- 新增 9 个 WebUI 端内整合能力 ---
+
+  Future<SystemOverviewModel> getSystemOverview() => _ffi.getSystemOverview();
+
+  Future<List<VaultSummaryModel>> listVaults() => _ffi.listVaults();
+
+  Future<VaultSummaryModel> createVault({
+    required String name,
+    required String mountPath,
+    required String poolMode,
+    required int quotaGb,
+    required bool e2eeEnabled,
+    String? extraMountPath,
+  }) {
+    if (name.trim().isEmpty) {
+      throw ArgumentError.value(name, 'name', '存储池名称不能为空');
+    }
+    if (mountPath.trim().isEmpty) {
+      throw ArgumentError.value(mountPath, 'mountPath', '挂载路径不能为空');
+    }
+    if (quotaGb <= 0) {
+      throw RangeError.value(quotaGb, 'quotaGb', '存储配额必须大于 0 GB');
+    }
+    return _ffi.createVault(
+      name: name.trim(),
+      mountPath: mountPath.trim(),
+      poolMode: poolMode.trim(),
+      quotaGb: quotaGb,
+      e2eeEnabled: e2eeEnabled,
+      extraMountPath:
+          extraMountPath != null && extraMountPath.trim().isNotEmpty
+              ? extraMountPath.trim()
+              : null,
+    );
+  }
+
+  Future<List<SnapshotSummaryModel>> listSnapshots({String? vaultId}) =>
+      _ffi.listSnapshots(vaultId: vaultId);
+
+  Future<BitRotScrubResultModel> triggerBitRotScrub() =>
+      _ffi.triggerBitRotScrub();
+
+  Future<bool> revokePairedPeer(String deviceId) async {
+    if (deviceId.trim().isEmpty) {
+      throw ArgumentError.value(deviceId, 'deviceId', '设备 ID 不能为空');
+    }
+    final revoked = await _ffi.revokePairedPeer(deviceId.trim());
+    if (revoked) {
+      unawaited(refreshPairedPeers());
+    }
+    return revoked;
+  }
+
+  Future<PairingInfoModel> getPairingInfo() => _ffi.getPairingInfo();
+
+  Future<bool> toggleSyncRule({
+    required String ruleId,
+    required bool enabled,
+  }) {
+    if (ruleId.trim().isEmpty) {
+      throw ArgumentError.value(ruleId, 'ruleId', '规则 ID 不能为空');
+    }
+    return _ffi.toggleSyncRule(ruleId: ruleId.trim(), enabled: enabled);
+  }
+
+  Future<bool> pushClipboardFile({
+    String? targetDeviceId,
+    required String filePath,
+  }) {
+    final trimmed = filePath.trim();
+    if (trimmed.isEmpty) {
+      throw ArgumentError.value(filePath, 'filePath', '文件路径不能为空');
+    }
+    return _ffi.pushClipboardFile(
+      targetDeviceId: targetDeviceId,
+      filePath: trimmed,
+    );
+  }
+
+  Future<RestoreSnapshotResultModel> restoreSnapshot({
+    required String snapshotId,
+    required String targetDir,
+  }) {
+    if (snapshotId.trim().isEmpty || targetDir.trim().isEmpty) {
+      throw ArgumentError('snapshotId 与 targetDir 不能为空');
+    }
+    return _ffi.restoreSnapshot(
+      snapshotId: snapshotId.trim(),
+      targetDir: targetDir.trim(),
+    );
+  }
+
+  Future<List<TransferHistoryModel>> listTransferHistory({int limit = 50}) =>
+      _ffi.listTransferHistory(limit: limit);
+
+  Future<bool> setSyncPaused(bool paused) => _ffi.setSyncPaused(paused);
+
+  Future<bool> getSyncPaused() => _ffi.getSyncPaused();
+
+  Future<bool> setBitRotAutoScrub(bool enabled) =>
+      _ffi.setBitRotAutoScrub(enabled);
+
+  Future<bool> getBitRotAutoScrub() => _ffi.getBitRotAutoScrub();
+
+  Future<String> setSyncRuleSchedule({
+    required String ruleId,
+    required String scheduleMode,
+  }) =>
+      _ffi.setSyncRuleSchedule(
+        ruleId: ruleId.trim(),
+        scheduleMode: scheduleMode.trim(),
+      );
+
+  // --- 双端服务生命周期与权限通道 ---
 
   Future<KeepAliveLevel> detectKeepAliveLevel() =>
       _keepAliveChannel.detectKeepAliveLevel();
 
   Future<bool> stopKeepAliveServer() async {
-    final config = _lastServerConfig;
-    if (config != null && !config.elevated) {
-      await _ffi.prepareGracefulRestart();
+    if (Platform.isAndroid) {
+      final stopped = await _keepAliveChannel.stopKeepAliveServer();
+      if (stopped) {
+        _lastServerConfig = null;
+      }
+      return stopped;
     }
-    final stopped = await _keepAliveChannel.stopKeepAliveServer();
-    if (stopped) {
-      _lastServerConfig = null;
-    }
-    return stopped;
+    await _ffi.prepareGracefulRestart();
+    _lastServerConfig = null;
+    return true;
   }
 
-  /// 完整优雅重启流程：先通知 Rust 停接新任务与 WAL 刷盘，再通过 Android 提权通道拉起。
+  Future<bool> stopLocalServer() => stopKeepAliveServer();
+
   Future<bool> executeGracefulRestart() async {
     var config = _lastServerConfig;
-    if (config == null && Platform.isAndroid) {
-      final saved = await _keepAliveChannel.getLastServerConfig();
-      final level = await _keepAliveChannel.detectKeepAliveLevel();
+    if (config == null) {
+      final saved = await getLastServerConfig();
       if (saved != null) {
+        final elevated = Platform.isAndroid
+            ? (await _keepAliveChannel.detectKeepAliveLevel())
+                .isElevatedAndroidDaemon
+            : false;
         config = (
           vaultPath: saved.vaultPath,
           quotaGb: saved.quotaGb,
-          webPassword: saved.webPassword,
+          webPassword: saved.webPassword ?? '',
           port: saved.port,
-          elevated: level.isElevatedAndroidDaemon,
+          elevated: elevated,
         );
       }
     }
@@ -1057,6 +2145,15 @@ class LanVaultBridge {
       webPassword: config.webPassword,
       port: config.port,
     );
+    if (Platform.isAndroid) {
+      await _keepAliveChannel.startKeepAliveServer(
+        vaultPath: config.vaultPath,
+        quotaGb: config.quotaGb,
+        port: boundPort,
+        webPassword: config.webPassword,
+        skipNativeStart: true,
+      );
+    }
     _lastServerConfig = (
       vaultPath: config.vaultPath,
       quotaGb: config.quotaGb,
@@ -1072,6 +2169,18 @@ class LanVaultBridge {
 
   Future<bool> requestStoragePermission() =>
       _keepAliveChannel.requestStoragePermission();
+
+  Future<bool> requestLocationPermission() =>
+      _keepAliveChannel.requestLocationPermission();
+
+  Future<bool> requestNotificationPermission() =>
+      _keepAliveChannel.requestNotificationPermission();
+
+  Future<String?> pickDirectory({String description = '选择文件夹'}) =>
+      SystemEnvHelper.pickDirectory(description: description);
+
+  Future<String?> pickFile({String title = '选择要发送的文件'}) =>
+      SystemEnvHelper.pickFile(title: title);
 
   // --- 统一 Debug 开关、性能探针日志与前端异常上报 ---
 
@@ -1092,4 +2201,9 @@ class LanVaultBridge {
         message: message,
         detail: detail,
       );
+
+  Future<String?> getDebugLogPath() => _ffi.getDebugLogPath();
+
+  Future<Map<String, dynamic>> runSelfDiagnostics() =>
+      _ffi.runSelfDiagnostics();
 }

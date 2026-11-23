@@ -120,10 +120,14 @@ impl ReconnectController {
         let mut was_connected = false;
 
         loop {
+            let wake_notified = self.wake.notified();
+            tokio::pin!(wake_notified);
+            wake_notified.as_mut().enable();
+
             if !self.is_enabled() {
                 was_connected = false;
                 attempt = 0;
-                self.wake.notified().await;
+                wake_notified.await;
                 continue;
             }
 

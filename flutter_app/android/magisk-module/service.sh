@@ -1,7 +1,7 @@
 #!/system/bin/sh
 # 参考依据:
 # - lanvault_complete_blueprint.md 第 3.4 / 5.5 节 (Level 3 Magisk/KernelSU late_start 守护脚本)
-# - 等待 sys.boot_completed=1 后初始化默认配置并单实例守护 lanvault-server，含 5MB 日志轮转与异常退避
+# - 等待 sys.boot_completed=1 后初始化默认配置并单实例守护 lanvault-server，含 5MB 日志轮转、停服哨兵与异常退避
 
 MODDIR="${0%/*}"
 BIN_PATH="$MODDIR/bin/lanvault-server"
@@ -10,6 +10,7 @@ VAULT_DIR="$DATA_DIR/vault"
 CONFIG_PATH="$DATA_DIR/config.toml"
 PID_FILE="$DATA_DIR/server.pid"
 WATCHDOG_PID_FILE="$DATA_DIR/watchdog.pid"
+STOP_SENTINEL="$DATA_DIR/.stop_requested"
 LOG_FILE="$DATA_DIR/daemon.log"
 MAX_LOG_BYTES=5242880
 
@@ -37,17 +38,31 @@ if [ -f "$PID_FILE" ]; then
     rm -f "$PID_FILE"
 fi
 
-# 首次缺少配置文件时自动生成默认 config.toml，防止 lanvault-server 启动即退出导致死循环刷盘
+generate_random_password() {
+    pw=""
+    if [ -r /proc/sys/kernel/random/uuid ]; then
+        pw="$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d '-')"
+        pw="$(printf '%s' "$pw" | cut -c1-24)"
+    fi
+    if [ "${#pw}" -lt 24 ] && [ -r /dev/urandom ]; then
+        pw="$(od -An -N12 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n' | cut -c1-24)"
+    fi
+    printf '%s' "$pw"
+}
+
+# 首次缺少配置文件时自动生成带 24 位随机高熵密码的默认 config.toml
 if [ ! -f "$CONFIG_PATH" ]; then
-    cat <<'EOF' > "$CONFIG_PATH"
+    GENERATED_PASSWORD="$(generate_random_password)"
+    cat <<EOF > "$CONFIG_PATH"
 bind_addr = "0.0.0.0"
 port = 7842
 vault_root = "/data/adb/lanvault/vault"
 default_quota_bytes = 107374182400
-web_password = "lanvault-change-me"
-device_name = "LanVault-Android-Daemon"
+web_password = "$GENERATED_PASSWORD"
+device_name = "EveryoneNAS-Android-Daemon"
 keep_alive_level = "LEVEL_3_MAGISK_DAEMON"
 EOF
+    chmod 600 "$CONFIG_PATH" 2>/dev/null || true
 fi
 
 rotate_log_if_needed() {
@@ -63,6 +78,12 @@ BACKOFF_SECS=1
 
 while true; do
     rotate_log_if_needed
+
+    if [ -f "$STOP_SENTINEL" ]; then
+        BACKOFF_SECS=1
+        sleep 3
+        continue
+    fi
 
     if [ ! -x "$BIN_PATH" ]; then
         sleep 10
@@ -81,6 +102,12 @@ while true; do
     wait "$CHILD_PID"
     EXIT_CODE=$?
     rm -f "$PID_FILE"
+
+    if [ -f "$STOP_SENTINEL" ]; then
+        BACKOFF_SECS=1
+        sleep 3
+        continue
+    fi
 
     END_TS="$(date +%s 2>/dev/null || echo 0)"
     RUNTIME=$((END_TS - START_TS))

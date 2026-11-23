@@ -1252,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "lanvault-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "lanvault-core",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "lanvault-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "chacha20poly1305",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "lanvault-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1310,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "lanvault-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "axum",
@@ -1332,7 +1332,7 @@ dependencies = [
 
 [[package]]
 name = "lanvault-win-svc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "lanvault-core",

@@ -1,7 +1,7 @@
 name: lanvault_app
 description: EveryoneNAS 跨平台局域网存储与增量备份客户端（Windows + Android）
 publish_to: "none"
-version: 1.0.0+1
+version: 0.2.0+2
 
 environment:
   sdk: ">=3.5.0 <4.0.0"
@@ -21,3 +21,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/brand/

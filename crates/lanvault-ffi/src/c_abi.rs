@@ -3,7 +3,7 @@
 //! - C-ABI 符号：`lanvault_ffi_invoke_json`、`lanvault_ffi_free_string`，
 //!   与 `flutter_app/lib/bridge/lanvault_bridge.dart` 100% 对齐并覆盖 `api.rs` 全部导出函数（含三态模式控制）。
 //! - Android JNI 符号（`#[cfg(target_os = "android")]`）：
-//!   与 `ShizukuUserService.kt` 和 `RootDaemonService.kt` 的 `external fun` 声明精确匹配。
+//!   与 `ShizukuUserService.kt`、`RootDaemonService.kt` 和 `KeepAliveService.kt` 的 `external fun` 声明精确匹配。
 
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -96,6 +96,33 @@ struct ImportKeyBackupPayload {
     backup_json: String,
 }
 
+#[derive(Deserialize)]
+struct RestoreSnapshotPayload {
+    snapshot_id: String,
+    target_dir: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ListTransferHistoryPayload {
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct SetBoolPayload {
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct SetSyncPausedPayload {
+    paused: bool,
+}
+
+#[derive(Deserialize)]
+struct SetSyncRuleSchedulePayload {
+    rule_id: String,
+    schedule_mode: String,
+}
+
 fn dispatch_json(fn_name: &str, payload_json: &str) -> Result<Value> {
     let _probe = lanvault_core::ProbeGuard::start(
         "ffi.c_abi",
@@ -162,6 +189,8 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
                     "chunks_deduplicated": ev.chunks_deduplicated,
                     "throughput_bps": ev.throughput_bps,
                     "status": ev.status,
+                    "bit_rot_health": ev.bit_rot_health,
+                    "corrupted_chunks": ev.corrupted_chunks,
                 }
             }))
         }
@@ -256,7 +285,7 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
         }
         "get_debug_logs" => {
             let req: GetDebugLogsPayload = serde_json::from_str(payload_json)
-                .unwrap_or(GetDebugLogsPayload { limit: 200 });
+                .context("invalid get_debug_logs JSON payload")?;
             let entries = api::block_on(api::get_debug_logs(req.limit))??;
             Ok(json!({ "ok": true, "debug_enabled": lanvault_core::is_debug_enabled(), "entries": entries }))
         }
@@ -269,6 +298,168 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
                 .context("invalid report_client_log JSON payload")?;
             api::block_on(api::report_client_log(req.level, req.source, req.message, req.detail))??;
             Ok(json!({ "ok": true }))
+        }
+        "list_paired_peers" => {
+            let peers = api::block_on(api::list_paired_peers())??;
+            Ok(json!({ "ok": true, "peers": peers }))
+        }
+        "get_power_network_policy" => {
+            let policy = api::block_on(api::get_power_network_policy())??;
+            Ok(json!({ "ok": true, "policy": policy }))
+        }
+        "get_auto_reconnect" => {
+            let enabled = api::block_on(api::get_auto_reconnect())??;
+            Ok(json!({ "ok": true, "enabled": enabled }))
+        }
+        "get_backup_storage_config" => {
+            let config = api::block_on(api::get_backup_storage_config())??;
+            Ok(json!({ "ok": true, "config": config }))
+        }
+        "set_backup_storage_config" => {
+            let req: SetBackupStorageConfigPayload = serde_json::from_str(payload_json)
+                .context("invalid set_backup_storage_config JSON payload")?;
+            let config = api::block_on(api::set_backup_storage_config(
+                req.primary_dir,
+                req.fallback_dir,
+            ))??;
+            Ok(json!({ "ok": true, "config": config }))
+        }
+        "get_debug_log_path" => {
+            let log_path = api::block_on(api::get_debug_log_path())??;
+            Ok(json!({ "ok": true, "log_path": log_path }))
+        }
+        "get_last_server_config" => {
+            let config = api::block_on(api::get_last_server_config())??;
+            Ok(json!({ "ok": true, "config": config }))
+        }
+        "run_self_diagnostics" => {
+            let report = api::block_on(api::run_self_diagnostics())??;
+            Ok(json!({ "ok": true, "report": report }))
+        }
+        "get_system_overview" => {
+            let overview = api::block_on(api::get_system_overview())??;
+            let mut obj = serde_json::to_value(overview)?;
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("ok".to_string(), json!(true));
+            }
+            Ok(obj)
+        }
+        "list_vaults" => {
+            let vaults = api::block_on(api::list_vaults())??;
+            Ok(json!({ "ok": true, "vaults": vaults }))
+        }
+        "create_vault" => {
+            let req: CreateVaultPayload = serde_json::from_str(payload_json)
+                .context("invalid create_vault JSON payload")?;
+            let vault = api::block_on(api::create_vault(
+                req.name,
+                req.mount_path,
+                req.pool_mode,
+                req.quota_gb,
+                req.e2ee_enabled,
+                req.extra_mount_path,
+            ))??;
+            let mut obj = serde_json::to_value(vault)?;
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("ok".to_string(), json!(true));
+            }
+            Ok(obj)
+        }
+        "list_snapshots" => {
+            let req: ListSnapshotsPayload = if payload_json.trim().is_empty() {
+                ListSnapshotsPayload::default()
+            } else {
+                serde_json::from_str(payload_json)
+                    .context("invalid list_snapshots JSON payload")?
+            };
+            let snapshots = api::block_on(api::list_snapshots(req.vault_id))??;
+            Ok(json!({ "ok": true, "snapshots": snapshots }))
+        }
+        "trigger_bit_rot_scrub" => {
+            let report = api::block_on(api::trigger_bit_rot_scrub())??;
+            let mut obj = serde_json::to_value(report)?;
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("ok".to_string(), json!(true));
+            }
+            Ok(obj)
+        }
+        "revoke_paired_peer" => {
+            let req: RevokePairedPeerPayload = serde_json::from_str(payload_json)
+                .context("invalid revoke_paired_peer JSON payload")?;
+            let res = api::block_on(api::revoke_paired_peer(req.device_id))??;
+            Ok(json!({ "ok": true, "revoked": res.revoked, "device_id": res.device_id }))
+        }
+        "get_pairing_info" => {
+            let info = api::block_on(api::get_pairing_info())??;
+            let mut obj = serde_json::to_value(info)?;
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("ok".to_string(), json!(true));
+            }
+            Ok(obj)
+        }
+        "toggle_sync_rule" => {
+            let req: ToggleSyncRulePayload = serde_json::from_str(payload_json)
+                .context("invalid toggle_sync_rule JSON payload")?;
+            let res = api::block_on(api::toggle_sync_rule(req.rule_id, req.enabled))??;
+            Ok(json!({ "ok": true, "rule_id": res.rule_id, "enabled": res.enabled }))
+        }
+        "push_clipboard_file" => {
+            let req: PushClipboardFilePayload = serde_json::from_str(payload_json)
+                .context("invalid push_clipboard_file JSON payload")?;
+            let res = api::block_on(api::push_clipboard_file(
+                req.target_device_id,
+                req.file_path,
+            ))??;
+            Ok(json!({ "ok": true, "sent": res.sent, "file_path": res.file_path }))
+        }
+        "restore_snapshot" => {
+            let req: RestoreSnapshotPayload = serde_json::from_str(payload_json)
+                .context("invalid restore_snapshot JSON payload")?;
+            let res = api::block_on(api::restore_snapshot(req.snapshot_id, req.target_dir))??;
+            let mut obj = serde_json::to_value(res)?;
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("ok".to_string(), json!(true));
+            }
+            Ok(obj)
+        }
+        "list_transfer_history" => {
+            let req: ListTransferHistoryPayload = if payload_json.trim().is_empty() {
+                ListTransferHistoryPayload::default()
+            } else {
+                serde_json::from_str(payload_json)
+                    .context("invalid list_transfer_history JSON payload")?
+            };
+            let records = api::block_on(api::list_transfer_history(req.limit))??;
+            Ok(json!({ "ok": true, "records": records }))
+        }
+        "set_sync_paused" => {
+            let req: SetSyncPausedPayload = serde_json::from_str(payload_json)
+                .context("invalid set_sync_paused JSON payload")?;
+            let paused = api::block_on(api::set_sync_paused(req.paused))??;
+            Ok(json!({ "ok": true, "paused": paused }))
+        }
+        "get_sync_paused" => {
+            let paused = api::block_on(api::get_sync_paused())??;
+            Ok(json!({ "ok": true, "paused": paused }))
+        }
+        "set_bit_rot_auto_scrub" => {
+            let req: SetBoolPayload = serde_json::from_str(payload_json)
+                .context("invalid set_bit_rot_auto_scrub JSON payload")?;
+            let enabled = api::block_on(api::set_bit_rot_auto_scrub(req.enabled))??;
+            Ok(json!({ "ok": true, "enabled": enabled }))
+        }
+        "get_bit_rot_auto_scrub" => {
+            let enabled = api::block_on(api::get_bit_rot_auto_scrub())??;
+            Ok(json!({ "ok": true, "enabled": enabled }))
+        }
+        "set_sync_rule_schedule" => {
+            let req: SetSyncRuleSchedulePayload = serde_json::from_str(payload_json)
+                .context("invalid set_sync_rule_schedule JSON payload")?;
+            let mode = api::block_on(api::set_sync_rule_schedule(
+                req.rule_id,
+                req.schedule_mode,
+            ))??;
+            Ok(json!({ "ok": true, "schedule_mode": mode }))
         }
         other => bail!("unsupported FFI function: `{other}`"),
     }
@@ -338,8 +529,8 @@ pub unsafe extern "C" fn lanvault_ffi_free_string(ptr: *mut c_char) {
 
 #[cfg(target_os = "android")]
 mod android_jni {
-    use std::ffi::{c_void, CStr};
-    use std::os::raw::c_char;
+    use std::ffi::c_void;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     use tracing::error;
 
@@ -353,14 +544,16 @@ mod android_jni {
     const JNI_FALSE: JBoolean = 0;
     const JNI_TRUE: JBoolean = 1;
 
-    // 标准 JNI `JNINativeInterface_` 函数表固定槽位（Android NDK / OpenJDK ABI 不可变）。
-    const JNI_GET_STRING_UTF_CHARS_INDEX: usize = 169;
-    const JNI_RELEASE_STRING_UTF_CHARS_INDEX: usize = 170;
+    // 标准 JNI `JNINativeInterface_` UTF-16 函数表固定槽位（Android NDK / OpenJDK ABI 不可变）。
+    const JNI_GET_STRING_LENGTH_INDEX: usize = 164;
+    const JNI_GET_STRING_CHARS_INDEX: usize = 165;
+    const JNI_RELEASE_STRING_CHARS_INDEX: usize = 166;
 
-    type GetStringUtfCharsFn =
-        unsafe extern "C" fn(env: JniEnvPtr, string: JString, is_copy: *mut u8) -> *const c_char;
-    type ReleaseStringUtfCharsFn =
-        unsafe extern "C" fn(env: JniEnvPtr, string: JString, utf: *const c_char);
+    type GetStringLengthFn = unsafe extern "C" fn(env: JniEnvPtr, string: JString) -> i32;
+    type GetStringCharsFn =
+        unsafe extern "C" fn(env: JniEnvPtr, string: JString, is_copy: *mut u8) -> *const u16;
+    type ReleaseStringCharsFn =
+        unsafe extern "C" fn(env: JniEnvPtr, string: JString, chars: *const u16);
 
     unsafe fn jstring_to_rust_string(env: JniEnvPtr, jstr: JString) -> Option<String> {
         if env.is_null() || jstr.is_null() {
@@ -371,17 +564,28 @@ mod android_jni {
             return None;
         }
 
-        let get_utf: GetStringUtfCharsFn =
-            std::mem::transmute(*vtable.add(JNI_GET_STRING_UTF_CHARS_INDEX));
-        let release_utf: ReleaseStringUtfCharsFn =
-            std::mem::transmute(*vtable.add(JNI_RELEASE_STRING_UTF_CHARS_INDEX));
+        let get_len: GetStringLengthFn =
+            std::mem::transmute(*vtable.add(JNI_GET_STRING_LENGTH_INDEX));
+        let get_chars: GetStringCharsFn =
+            std::mem::transmute(*vtable.add(JNI_GET_STRING_CHARS_INDEX));
+        let release_chars: ReleaseStringCharsFn =
+            std::mem::transmute(*vtable.add(JNI_RELEASE_STRING_CHARS_INDEX));
 
-        let chars = get_utf(env, jstr, std::ptr::null_mut());
+        let len = get_len(env, jstr);
+        if len < 0 {
+            return None;
+        }
+        if len == 0 {
+            return Some(String::new());
+        }
+
+        let chars = get_chars(env, jstr, std::ptr::null_mut());
         if chars.is_null() {
             return None;
         }
-        let parsed = CStr::from_ptr(chars).to_str().ok().map(str::to_owned);
-        release_utf(env, jstr, chars);
+        let slice = std::slice::from_raw_parts(chars, len as usize);
+        let parsed = String::from_utf16(slice).ok();
+        release_chars(env, jstr, chars);
         parsed
     }
 
@@ -391,57 +595,74 @@ mod android_jni {
         quota_gb: i64,
         port: i32,
         supplied_web_password: Option<String>,
+        daemon_mode: bool,
     ) -> JBoolean {
         let Some(path) = (unsafe { jstring_to_rust_string(env, vault_path) }) else {
-            error!("JNI start server received null or non-UTF-8 vaultPath");
+            error!("JNI start server received null or invalid UTF-16 vaultPath");
             return JNI_FALSE;
         };
         if quota_gb <= 0 {
             error!(quota_gb, "JNI start server received non-positive quotaGb");
             return JNI_FALSE;
         }
-        if port < 0 || port > u16::MAX as i32 {
+        if port > u16::MAX as i32 {
             error!(port, "JNI start server received out-of-range port");
             return JNI_FALSE;
         }
-        let requested_port = if port > 0 { Some(port as u16) } else { None };
+        let requested_port = if port < 0 { None } else { Some(port as u16) };
 
         let web_password = match supplied_web_password.map(|value| value.trim().to_string()) {
             Some(value) if value.len() >= 8 => value,
             _ => match std::env::var("LANVAULT_WEB_PASSWORD") {
-                Ok(value) if value.len() >= 8 => value,
-                _ => match api::load_or_generate_jni_web_password() {
-                Ok(generated) => generated,
-                // The Kotlin signature is `Boolean`, so the only failure channel is `false`;
-                // the cause is logged rather than encoded in the return value.
-                Err(err) => {
-                    error!(error = %err, "JNI web password generation failed");
-                    return JNI_FALSE;
-                }
+                Ok(value) if value.trim().len() >= 8 => value.trim().to_string(),
+                _ => match api::load_or_generate_jni_web_password(daemon_mode) {
+                    Ok(generated) => generated,
+                    // The Kotlin signature is `Boolean`, so the only failure channel is `false`;
+                    // the cause is logged rather than encoded in the return value.
+                    Err(err) => {
+                        error!(error = %err, "JNI web password generation failed");
+                        return JNI_FALSE;
+                    }
                 },
             },
         };
 
-        match api::block_on(api::start_local_server_with_port(
-            path,
-            quota_gb as u64,
-            web_password,
-            requested_port,
-        )) {
+        let outcome = if daemon_mode {
+            api::block_on_daemon(api::start_local_server_for_daemon(
+                path,
+                quota_gb as u64,
+                web_password,
+                requested_port,
+            ))
+        } else {
+            api::block_on(api::start_local_server_with_port(
+                path,
+                quota_gb as u64,
+                web_password,
+                requested_port,
+            ))
+        };
+
+        match outcome {
             Ok(Ok(_port)) => JNI_TRUE,
             Ok(Err(err)) => {
-                error!(error = %err, "JNI start_local_server_with_port failed");
+                error!(error = %err, daemon_mode, "JNI start local server failed");
                 JNI_FALSE
             }
             Err(err) => {
-                error!(error = %err, "JNI Tokio runtime error during start_local_server_with_port");
+                error!(error = %err, daemon_mode, "JNI Tokio runtime error during start local server");
                 JNI_FALSE
             }
         }
     }
 
-    fn jni_graceful_restart_impl() -> JBoolean {
-        match api::block_on(api::prepare_graceful_restart()) {
+    fn jni_graceful_restart_impl(daemon_mode: bool) -> JBoolean {
+        let outcome = if daemon_mode {
+            api::block_on_daemon(api::prepare_graceful_restart())
+        } else {
+            api::block_on(api::prepare_graceful_restart())
+        };
+        match outcome {
             Ok(Ok(())) => JNI_TRUE,
             Ok(Err(err)) => {
                 error!(error = %err, "JNI prepare_graceful_restart failed");
@@ -463,13 +684,20 @@ mod android_jni {
         port: i32,
         web_password: JString,
     ) -> JBoolean {
-        jni_start_server_impl(
-            env,
-            vault_path,
-            quota_gb,
-            port,
-            unsafe { jstring_to_rust_string(env, web_password) },
-        )
+        catch_unwind(AssertUnwindSafe(|| {
+            jni_start_server_impl(
+                env,
+                vault_path,
+                quota_gb,
+                port,
+                unsafe { jstring_to_rust_string(env, web_password) },
+                true,
+            )
+        }))
+        .unwrap_or_else(|_| {
+            error!("panic across JNI boundary in ShizukuUserService_nativeStartServer");
+            JNI_FALSE
+        })
     }
 
     #[no_mangle]
@@ -477,7 +705,10 @@ mod android_jni {
         _env: JniEnvPtr,
         _class: JClass,
     ) -> JBoolean {
-        jni_graceful_restart_impl()
+        catch_unwind(|| jni_graceful_restart_impl(true)).unwrap_or_else(|_| {
+            error!("panic across JNI boundary in ShizukuUserService_nativeGracefulRestart");
+            JNI_FALSE
+        })
     }
 
     #[no_mangle]
@@ -489,13 +720,20 @@ mod android_jni {
         port: i32,
         web_password: JString,
     ) -> JBoolean {
-        jni_start_server_impl(
-            env,
-            vault_path,
-            quota_gb,
-            port,
-            unsafe { jstring_to_rust_string(env, web_password) },
-        )
+        catch_unwind(AssertUnwindSafe(|| {
+            jni_start_server_impl(
+                env,
+                vault_path,
+                quota_gb,
+                port,
+                unsafe { jstring_to_rust_string(env, web_password) },
+                true,
+            )
+        }))
+        .unwrap_or_else(|_| {
+            error!("panic across JNI boundary in RootDaemonService_nativeStartRootServer");
+            JNI_FALSE
+        })
     }
 
     #[no_mangle]
@@ -503,7 +741,10 @@ mod android_jni {
         _env: JniEnvPtr,
         _class: JClass,
     ) -> JBoolean {
-        jni_graceful_restart_impl()
+        catch_unwind(|| jni_graceful_restart_impl(true)).unwrap_or_else(|_| {
+            error!("panic across JNI boundary in RootDaemonService_nativeGracefulRestartRootServer");
+            JNI_FALSE
+        })
     }
 
     #[no_mangle]
@@ -515,13 +756,20 @@ mod android_jni {
         port: i32,
         web_password: JString,
     ) -> JBoolean {
-        jni_start_server_impl(
-            env,
-            vault_path,
-            quota_gb,
-            port,
-            unsafe { jstring_to_rust_string(env, web_password) },
-        )
+        catch_unwind(AssertUnwindSafe(|| {
+            jni_start_server_impl(
+                env,
+                vault_path,
+                quota_gb,
+                port,
+                unsafe { jstring_to_rust_string(env, web_password) },
+                false,
+            )
+        }))
+        .unwrap_or_else(|_| {
+            error!("panic across JNI boundary in KeepAliveService_nativeStartKeepAliveServer");
+            JNI_FALSE
+        })
     }
 
     #[no_mangle]
@@ -529,7 +777,10 @@ mod android_jni {
         _env: JniEnvPtr,
         _class: JClass,
     ) -> JBoolean {
-        jni_graceful_restart_impl()
+        catch_unwind(|| jni_graceful_restart_impl(false)).unwrap_or_else(|_| {
+            error!("panic across JNI boundary in KeepAliveService_nativeGracefulRestartKeepAliveServer");
+            JNI_FALSE
+        })
     }
 }
 
@@ -554,4 +805,46 @@ struct ReportClientLogPayload {
     source: String,
     message: String,
     detail: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SetBackupStorageConfigPayload {
+    primary_dir: String,
+    #[serde(default)]
+    fallback_dir: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct CreateVaultPayload {
+    name: String,
+    mount_path: String,
+    pool_mode: String,
+    quota_gb: u64,
+    e2ee_enabled: bool,
+    #[serde(default)]
+    extra_mount_path: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ListSnapshotsPayload {
+    #[serde(default)]
+    vault_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RevokePairedPeerPayload {
+    device_id: String,
+}
+
+#[derive(Deserialize)]
+struct ToggleSyncRulePayload {
+    rule_id: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct PushClipboardFilePayload {
+    #[serde(default)]
+    target_device_id: Option<String>,
+    file_path: String,
 }

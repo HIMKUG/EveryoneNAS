@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::header::{HeaderName, HeaderValue, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -27,7 +27,7 @@ use axum::{Json, Router};
 use std::fs::{self, File};
 use std::io::Write;
 
-use dashmap::DashSet;
+use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use lanvault_core::crypto::constant_time_eq;
 use lanvault_core::{
@@ -50,7 +50,7 @@ use crate::scrub::{BitRotAlertEvent, BitRotScrubber, ScrubReport};
 use crate::vault::{unix_timestamp_secs, ExtraVolumeSpec, VaultStore};
 
 #[cfg(feature = "embed-web-ui")]
-static_serve::embed_assets!("web-ui");
+static_serve::embed_assets!("../../web-ui");
 
 const WS_PING_INTERVAL_SECS: u64 = 15;
 const WS_PONG_TIMEOUT_SECS: u64 = 30;
@@ -114,7 +114,7 @@ pub struct AppState {
     pub active_chunk_writes: AtomicU64,
     pub accepting_tasks: AtomicBool,
     pub pairing_pin: StdMutex<String>,
-    pub online_peers: DashSet<String>,
+    pub online_peers: DashMap<String, usize>,
     pub db: Arc<Database>,
     pub vault_store: Arc<VaultStore>,
     pub scrubber: Arc<BitRotScrubber>,
@@ -363,11 +363,14 @@ fn require_session_device(session: &SessionInfo, device_id: &str) -> Result<(), 
 async fn require_auth_middleware(
     State(state): State<Arc<AppState>>,
     cookies: Cookies,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     match require_auth(&state, &cookies) {
-        Ok(_) => next.run(request).await,
+        Ok(session) => {
+            request.extensions_mut().insert(session);
+            next.run(request).await
+        }
         Err(response) => response,
     }
 }
@@ -731,7 +734,11 @@ async fn handle_login(
     }
 }
 
-async fn handle_logout(State(state): State<Arc<AppState>>, cookies: Cookies) -> Response {
+async fn handle_logout(
+    State(state): State<Arc<AppState>>,
+    Extension(_session): Extension<SessionInfo>,
+    cookies: Cookies,
+) -> Response {
     let token = cookies
         .get(SESSION_COOKIE_NAME)
         .map(|cookie| cookie.value().to_string())
@@ -740,9 +747,6 @@ async fn handle_logout(State(state): State<Arc<AppState>>, cookies: Cookies) -> 
         Ok(token) => token,
         Err(resp) => return resp,
     };
-    if state.auth.validate_session(&token).is_none() {
-        return unauthorized_response();
-    }
     state.auth.revoke_session(&token);
     let token_hash = hex::encode(blake3_hash(token.as_bytes()));
     if let Err(err) = state.db.revoke_session(
@@ -759,22 +763,20 @@ async fn handle_logout(State(state): State<Arc<AppState>>, cookies: Cookies) -> 
         .into_response()
 }
 
-async fn handle_system_status(State(state): State<Arc<AppState>>, cookies: Cookies) -> Response {
-    let _session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
+async fn handle_system_status(
+    State(state): State<Arc<AppState>>,
+    Extension(_session): Extension<SessionInfo>,
+) -> Response {
     match state.build_system_status() {
         Ok(status) => (StatusCode::OK, Json(status)).into_response(),
         Err(err) => map_domain_error(err),
     }
 }
 
-async fn handle_system_restart(State(state): State<Arc<AppState>>, cookies: Cookies) -> Response {
-    let session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
+async fn handle_system_restart(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<SessionInfo>,
+) -> Response {
     if let Err(resp) = require_admin(&session) {
         return resp;
     }
@@ -799,11 +801,10 @@ async fn handle_system_restart(State(state): State<Arc<AppState>>, cookies: Cook
         .into_response()
 }
 
-async fn handle_list_vaults(State(state): State<Arc<AppState>>, cookies: Cookies) -> Response {
-    let session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
+async fn handle_list_vaults(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<SessionInfo>,
+) -> Response {
     let vaults = match state.db.list_vaults() {
         Ok(v) => v,
         Err(err) => return map_domain_error(err),
@@ -848,16 +849,12 @@ async fn handle_list_vaults(State(state): State<Arc<AppState>>, cookies: Cookies
 
 async fn handle_create_vault(
     State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(session): Extension<SessionInfo>,
     Json(req): Json<CreateVaultRequest>,
 ) -> Response {
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    let session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
     if let Err(resp) = require_admin(&session) {
         return resp;
     }
@@ -902,7 +899,7 @@ async fn handle_create_vault(
 
 async fn handle_put_chunk(
     State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(_session): Extension<SessionInfo>,
     Path((vault_id, hash_hex)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -910,10 +907,6 @@ async fn handle_put_chunk(
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    let _session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
 
     let expected_hash = match decode_hex_32(&hash_hex, "hash_hex") {
         Ok(h) => h,
@@ -996,13 +989,9 @@ async fn handle_put_chunk(
 
 async fn handle_list_snapshots(
     State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(session): Extension<SessionInfo>,
     Query(query): Query<SnapshotQuery>,
 ) -> Response {
-    let session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
     match state.db.list_snapshots(query.vault_id.as_deref()) {
         Ok(snaps) => {
             let dtos: Vec<SnapshotDto> = snaps
@@ -1036,17 +1025,13 @@ async fn handle_list_snapshots(
 
 async fn handle_create_snapshot(
     State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(session): Extension<SessionInfo>,
     Path(vault_id): Path<String>,
     Json(req): Json<CreateSnapshotRequest>,
 ) -> Response {
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    let session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
 
     let snapshot_id = match req.snapshot_id {
         Some(id) => {
@@ -1260,14 +1245,10 @@ async fn handle_create_snapshot(
 
 async fn handle_snapshot_file_download(
     State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(session): Extension<SessionInfo>,
     Path(snapshot_id): Path<String>,
     Query(query): Query<SnapshotFileQuery>,
 ) -> Response {
-    let session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
 
     if let Err(err) = validate_snapshot_id(&snapshot_id) {
         return map_domain_error(err);
@@ -1372,7 +1353,16 @@ async fn handle_snapshot_file_download(
                         .await
                         .map_err(|e| std::io::Error::other(format!("chunk stream join error: {e}")))?
                         .map_err(|e| std::io::Error::other(e.to_string()))?;
-                    Ok(Some((axum::body::Bytes::from(bytes), (iter, store, vid))))
+                    let frame_len: u32 = bytes.len().try_into().map_err(|_| {
+                        std::io::Error::other(format!(
+                            "chunk exceeds u32 frame limit: {}",
+                            bytes.len()
+                        ))
+                    })?;
+                    let mut framed = Vec::with_capacity(4 + bytes.len());
+                    framed.extend_from_slice(&frame_len.to_be_bytes());
+                    framed.extend_from_slice(&bytes);
+                    Ok(Some((axum::body::Bytes::from(framed), (iter, store, vid))))
                 },
             );
             let mut resp = axum::response::Response::builder()
@@ -1389,6 +1379,10 @@ async fn handle_snapshot_file_download(
             resp.headers_mut().insert(
                 HeaderName::from_static("x-lanvault-encoded"),
                 HeaderValue::from_static("true"),
+            );
+            resp.headers_mut().insert(
+                HeaderName::from_static("x-lanvault-chunk-framing"),
+                HeaderValue::from_static("u32be-aead-v1"),
             );
             if e2ee_enabled {
                 resp.headers_mut().insert(
@@ -1412,16 +1406,12 @@ async fn handle_snapshot_file_download(
 
 async fn handle_scrub_trigger(
     State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(session): Extension<SessionInfo>,
     Query(query): Query<ScrubQuery>,
 ) -> Response {
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    let session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
     if let Err(resp) = require_admin(&session) {
         return resp;
     }
@@ -1473,11 +1463,10 @@ async fn handle_scrub_trigger(
     }
 }
 
-async fn handle_list_peers(State(state): State<Arc<AppState>>, cookies: Cookies) -> Response {
-    let session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
+async fn handle_list_peers(
+    State(state): State<Arc<AppState>>,
+    Extension(session): Extension<SessionInfo>,
+) -> Response {
     if let Err(resp) = require_admin(&session) {
         return resp;
     }
@@ -1485,7 +1474,12 @@ async fn handle_list_peers(State(state): State<Arc<AppState>>, cookies: Cookies)
         Ok(p) => p,
         Err(err) => return map_domain_error(err),
     };
-    let online_set: HashSet<String> = state.online_peers.iter().map(|r| r.clone()).collect();
+    let online_set: HashSet<String> = state
+        .online_peers
+        .iter()
+        .filter(|entry| *entry.value() > 0)
+        .map(|entry| entry.key().clone())
+        .collect();
     let peer_dtos: Vec<PeerDto> = peers
         .into_iter()
         .map(|p| {
@@ -1534,44 +1528,20 @@ async fn handle_pair_peer(
         return resp;
     }
 
-    let pin_matched = {
-        let mut pairing_pin = state
-            .pairing_pin
-            .lock()
-            .expect("pairing PIN lock poisoned");
-        let matched = constant_time_eq(req.pin.as_bytes(), pairing_pin.as_bytes());
-        if matched {
-            *pairing_pin = crate::generate_six_digit_pin();
+    if let Some(retry_after_secs) = state.auth.pair_lockout_remaining(addr.ip()) {
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "locked_out",
+                "retry_after_secs": retry_after_secs,
+            })),
+        )
+            .into_response();
+        if let Ok(val) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+            resp.headers_mut()
+                .insert(HeaderName::from_static("retry-after"), val);
         }
-        matched
-    };
-    match state.auth.check_and_record_pair_attempt(addr.ip(), pin_matched) {
-        AuthOutcome::Allowed => {}
-        AuthOutcome::Rejected { remaining_attempts } => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({
-                    "error": "invalid_pairing_pin",
-                    "remaining_attempts": remaining_attempts,
-                })),
-            )
-                .into_response();
-        }
-        AuthOutcome::LockedOut { retry_after_secs } => {
-            let mut resp = (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "error": "locked_out",
-                    "retry_after_secs": retry_after_secs,
-                })),
-            )
-                .into_response();
-            if let Ok(val) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                resp.headers_mut()
-                    .insert(HeaderName::from_static("retry-after"), val);
-            }
-            return resp;
-        }
+        return resp;
     }
 
     let client_ed25519_pubkey =
@@ -1612,6 +1582,47 @@ async fn handle_pair_peer(
         return map_domain_error(err);
     }
 
+    let pair_outcome = {
+        let mut pairing_pin = state
+            .pairing_pin
+            .lock()
+            .expect("pairing PIN lock poisoned");
+        let matched = constant_time_eq(req.pin.as_bytes(), pairing_pin.as_bytes());
+        let outcome = state.auth.check_and_record_pair_attempt(addr.ip(), matched);
+        if matches!(outcome, AuthOutcome::Allowed) {
+            *pairing_pin = crate::generate_six_digit_pin();
+        }
+        outcome
+    };
+    match pair_outcome {
+        AuthOutcome::Allowed => {}
+        AuthOutcome::Rejected { remaining_attempts } => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "invalid_pairing_pin",
+                    "remaining_attempts": remaining_attempts,
+                })),
+            )
+                .into_response();
+        }
+        AuthOutcome::LockedOut { retry_after_secs } => {
+            let mut resp = (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "locked_out",
+                    "retry_after_secs": retry_after_secs,
+                })),
+            )
+                .into_response();
+            if let Ok(val) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                resp.headers_mut()
+                    .insert(HeaderName::from_static("retry-after"), val);
+            }
+            return resp;
+        }
+    }
+
     let server_kex = SessionKeyExchange::new();
     let server_x25519_pub = server_kex.public_key_bytes();
     let session_key = match server_kex.agree(&client_x25519_pubkey, &identity_message) {
@@ -1621,13 +1632,17 @@ async fn handle_pair_peer(
 
     let peer_fp = public_key_fingerprint(&client_ed25519_pubkey);
     let peer_device_id = format!("lv-{}", &peer_fp[..12]);
+    let existing_last_port = match state.db.get_trusted_peer(&peer_device_id) {
+        Ok(existing) => existing.and_then(|peer| peer.last_port),
+        Err(err) => return map_domain_error(err),
+    };
     let peer = TrustedPeer {
         device_id: peer_device_id.clone(),
         device_name: req.device_name,
         os_type: req.os_type,
         ed25519_pubkey: client_ed25519_pubkey.to_vec(),
         last_ip: Some(addr.ip().to_string()),
-        last_port: Some(addr.port()),
+        last_port: existing_last_port,
         auto_connect: true,
         paired_at: unix_timestamp_secs(),
         revoked_at: None,
@@ -1675,16 +1690,12 @@ async fn handle_pair_peer(
 
 async fn handle_delete_peer(
     State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(session): Extension<SessionInfo>,
     Path(device_id): Path<String>,
 ) -> Response {
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    let session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
     if let Err(resp) = require_admin(&session) {
         return resp;
     }
@@ -1708,16 +1719,12 @@ async fn handle_delete_peer(
 
 async fn handle_clipboard_push(
     State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(session): Extension<SessionInfo>,
     Json(req): Json<ClipboardRequest>,
 ) -> Response {
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    let session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
     if req.content.is_empty() {
         return map_domain_error(LanVaultError::InvalidInput(
             "clipboard content must not be empty".to_string(),
@@ -1750,7 +1757,7 @@ async fn handle_clipboard_push(
     };
     if let Some(target_id) = req.target_device_id.as_deref() {
         if session.device_id.as_deref() == Some(target_id)
-            || !state.online_peers.contains(target_id)
+            || !state.online_peers.contains_key(target_id)
         {
             return map_domain_error(LanVaultError::InvalidInput(
                 "clipboard target is not an online peer".to_string(),
@@ -1758,7 +1765,7 @@ async fn handle_clipboard_push(
         }
     }
     let delivered_to = match &req.target_device_id {
-        Some(target_id) => usize::from(state.online_peers.contains(target_id)),
+        Some(target_id) => usize::from(state.online_peers.contains_key(target_id)),
         None => state
             .online_peers
             .len()
@@ -1766,7 +1773,7 @@ async fn handle_clipboard_push(
                 session
                     .device_id
                     .as_ref()
-                    .is_some_and(|device_id| state.online_peers.contains(device_id)),
+                    .is_some_and(|device_id| state.online_peers.contains_key(device_id)),
             )),
     };
 
@@ -1799,13 +1806,10 @@ async fn handle_clipboard_push(
 
 async fn handle_ws_upgrade(
     State(state): State<Arc<AppState>>,
+    Extension(session): Extension<SessionInfo>,
     cookies: Cookies,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let session = match require_auth(&state, &cookies) {
-        Ok(session) => session,
-        Err(resp) => return resp,
-    };
     let token = cookies
         .get(SESSION_COOKIE_NAME)
         .map(|cookie| cookie.value().to_string())
@@ -1838,7 +1842,7 @@ async fn serve_ws_connection(
     let mut ping_tick = tokio::time::interval(Duration::from_secs(WS_PING_INTERVAL_SECS));
     let mut last_pong = Instant::now();
     if let Some(device_id) = connected_device_id.as_ref() {
-        state.online_peers.insert(device_id.clone());
+        *state.online_peers.entry(device_id.clone()).or_insert(0) += 1;
     }
 
     loop {
@@ -1930,7 +1934,16 @@ async fn serve_ws_connection(
     }
 
     if let Some(device_id) = connected_device_id.as_ref() {
-        state.online_peers.remove(device_id);
+        if let dashmap::mapref::entry::Entry::Occupied(mut entry) =
+            state.online_peers.entry(device_id.clone())
+        {
+            let count = entry.get_mut();
+            if *count <= 1 {
+                entry.remove();
+            } else {
+                *count -= 1;
+            }
+        }
     }
     drop(out_tx);
     if tokio::time::timeout(Duration::from_secs(1), &mut writer_task)

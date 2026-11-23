@@ -26,13 +26,18 @@
 -keepclassmembers class com.lanvault.app.privilege.ShizukuUserService {
     public <init>();
     public <init>(android.content.Context);
-    public static native boolean nativeStartServer(java.lang.String, long, int);
+    public static native boolean nativeStartServer(java.lang.String, long, int, java.lang.String);
     public static native boolean nativeGracefulRestart();
 }
 
 -keepclassmembers class com.lanvault.app.privilege.RootDaemonService {
-    public static native boolean nativeStartRootServer(java.lang.String, long, int);
+    public static native boolean nativeStartRootServer(java.lang.String, long, int, java.lang.String);
     public static native boolean nativeGracefulRestartRootServer();
+}
+
+-keepclassmembers class com.lanvault.app.privilege.KeepAliveService {
+    public static native boolean nativeStartKeepAliveServer(java.lang.String, long, int, java.lang.String);
+    public static native boolean nativeGracefulRestartKeepAliveServer();
 }
 
 # ---------------------------------------------------------------------------

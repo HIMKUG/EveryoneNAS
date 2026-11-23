@@ -71,6 +71,11 @@ pub fn reconcile_directory(
     target_vault_id: &str,
     root_dir: &Path,
 ) -> Result<DiffResult, ClientError> {
+    let _probe = lanvault_core::ProbeGuard::start(
+        "client.scanner",
+        "scanner.reconcile_dir",
+        Some(format!("rule_id={rule_id} root={}", root_dir.display())),
+    );
     if !root_dir.is_dir() {
         return Err(ClientError::InvalidPath {
             path: root_dir.to_path_buf(),
@@ -99,10 +104,48 @@ pub fn reconcile_directory(
     let mut stack = vec![root_dir.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err)
+                if dir != root_dir
+                    && matches!(
+                        err.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                    ) =>
+            {
+                warn!(path = %dir.display(), "skipping unreadable subdirectory: {err}");
+                continue;
+            }
+            Err(err) => return Err(ClientError::Io(err)),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    warn!(dir = %dir.display(), "skipping unreadable directory entry: {err}");
+                    continue;
+                }
+                Err(err) => return Err(ClientError::Io(err)),
+            };
             let path = entry.path();
-            let file_type = entry.file_type()?;
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    warn!(path = %path.display(), "skipping entry with unreadable file type: {err}");
+                    continue;
+                }
+                Err(err) => return Err(ClientError::Io(err)),
+            };
 
             // 跳过符号链接，防止目录环路。
             if file_type.is_symlink() {
@@ -116,7 +159,19 @@ pub fn reconcile_directory(
                 continue;
             }
 
-            let meta = entry.metadata()?;
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    warn!(path = %path.display(), "skipping entry with unreadable metadata: {err}");
+                    continue;
+                }
+                Err(err) => return Err(ClientError::Io(err)),
+            };
             let snapshot = match build_snapshot(root_dir, &path, &meta) {
                 Ok(snapshot) => snapshot,
                 Err(ClientError::InvalidPath { path, reason }) => {
@@ -155,6 +210,21 @@ pub fn reconcile_directory(
         "completed metadata diff reconciliation"
     );
 
+    lanvault_core::record_debug(
+        "client.scanner",
+        Some("scanner.diff_summary"),
+        None,
+        || {
+            format!(
+                "rule={rule_id} added={} modified={} deleted={} unchanged={}",
+                diff.added.len(),
+                diff.modified.len(),
+                diff.deleted.len(),
+                diff.unchanged_count
+            )
+        },
+        None,
+    );
     Ok(diff)
 }
 
@@ -200,13 +270,29 @@ pub fn delete_file_states(
     Ok(db.delete_local_file_states(rule_id, rel_paths)?)
 }
 
+fn strip_windows_verbatim(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = path.to_string_lossy();
+        if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    path.to_path_buf()
+}
+
 fn build_snapshot(
     root_dir: &Path,
     abs_path: &Path,
     meta: &Metadata,
 ) -> Result<FileMetadataSnapshot, ClientError> {
-    let rel = abs_path
-        .strip_prefix(root_dir)
+    let clean_root = strip_windows_verbatim(root_dir);
+    let clean_abs = strip_windows_verbatim(abs_path);
+    let rel = clean_abs
+        .strip_prefix(&clean_root)
         .map_err(|_| ClientError::InvalidPath {
             path: abs_path.to_path_buf(),
             reason: format!("path is outside watch root {}", root_dir.display()),

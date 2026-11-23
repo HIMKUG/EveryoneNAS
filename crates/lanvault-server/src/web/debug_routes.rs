@@ -19,16 +19,10 @@ pub(super) struct ClientLogRequest {
 }
 
 pub(super) async fn handle_get_debug_config(
-    State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(session): Extension<SessionInfo>,
 ) -> Response {
-    match require_auth(&state, &cookies) {
-        Ok(session) => {
-            if let Err(resp) = require_admin(&session) {
-                return resp;
-            }
-        }
-        Err(resp) => return resp,
+    if let Err(resp) = require_admin(&session) {
+        return resp;
     }
     Json(serde_json::json!({
         "debug_enabled": lanvault_core::is_debug_enabled(),
@@ -37,17 +31,11 @@ pub(super) async fn handle_get_debug_config(
 }
 
 pub(super) async fn handle_set_debug_config(
-    State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(session): Extension<SessionInfo>,
     Json(req): Json<SetDebugConfigRequest>,
 ) -> Response {
-    match require_auth(&state, &cookies) {
-        Ok(session) => {
-            if let Err(resp) = require_admin(&session) {
-                return resp;
-            }
-        }
-        Err(resp) => return resp,
+    if let Err(resp) = require_admin(&session) {
+        return resp;
     }
     lanvault_core::set_debug_mode(req.enabled);
     Json(serde_json::json!({
@@ -57,17 +45,11 @@ pub(super) async fn handle_set_debug_config(
 }
 
 pub(super) async fn handle_get_debug_logs(
-    State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(session): Extension<SessionInfo>,
     Query(query): Query<DebugLogsQuery>,
 ) -> Response {
-    match require_auth(&state, &cookies) {
-        Ok(session) => {
-            if let Err(resp) = require_admin(&session) {
-                return resp;
-            }
-        }
-        Err(resp) => return resp,
+    if let Err(resp) = require_admin(&session) {
+        return resp;
     }
     let limit = query.limit.unwrap_or(200);
     let entries = lanvault_core::get_debug_logs(limit);
@@ -79,29 +61,19 @@ pub(super) async fn handle_get_debug_logs(
 }
 
 pub(super) async fn handle_clear_debug_logs(
-    State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(session): Extension<SessionInfo>,
 ) -> Response {
-    match require_auth(&state, &cookies) {
-        Ok(session) => {
-            if let Err(resp) = require_admin(&session) {
-                return resp;
-            }
-        }
-        Err(resp) => return resp,
+    if let Err(resp) = require_admin(&session) {
+        return resp;
     }
     lanvault_core::clear_debug_logs();
     Json(serde_json::json!({ "cleared": true })).into_response()
 }
 
 pub(super) async fn handle_report_client_log(
-    State(state): State<Arc<AppState>>,
-    cookies: Cookies,
+    Extension(_session): Extension<SessionInfo>,
     Json(req): Json<ClientLogRequest>,
 ) -> Response {
-    if let Err(resp) = require_auth(&state, &cookies) {
-        return resp;
-    }
     lanvault_core::record_frontend_log(&req.level, &req.source, req.message, req.detail);
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "recorded": true }))).into_response()
 }

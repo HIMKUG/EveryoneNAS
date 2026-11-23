@@ -4,6 +4,7 @@
 
 package com.lanvault.app.privilege
 
+import android.app.ForegroundServiceStartNotAllowedException
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -14,8 +15,11 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.work.Constraints
@@ -26,8 +30,6 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.lanvault.app.MainActivity
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
 import java.util.concurrent.TimeUnit
 
 /**
@@ -38,6 +40,7 @@ import java.util.concurrent.TimeUnit
  */
 class KeepAliveService : Service() {
     companion object {
+        private const val TAG = "LanVaultKeepAlive"
         const val CHANNEL_ID = "lanvault_keep_alive"
         const val NOTIFICATION_ID = 7842
         const val ACTION_START = "com.lanvault.app.action.START_KEEP_ALIVE"
@@ -48,9 +51,11 @@ class KeepAliveService : Service() {
         const val EXTRA_QUOTA_GB = "quota_gb"
         const val EXTRA_PORT = "port"
         const val EXTRA_WEB_PASSWORD = "web_password"
+        const val EXTRA_SKIP_NATIVE_START = "skip_native_start"
 
         private const val WORK_NAME = "lanvault_level0_periodic_recovery"
         private const val PREFS_NAME = "lanvault_keep_alive_prefs"
+        private const val KEY_USER_STOPPED = "user_stopped"
 
         data class LastConfig(
             val vaultPath: String,
@@ -80,7 +85,9 @@ class KeepAliveService : Service() {
             quotaGb: Long,
             port: Int,
             webPassword: String,
+            skipNativeStart: Boolean = false,
         ) {
+            setUserStopped(context, false)
             saveLastConfig(context, vaultPath, quotaGb, port, webPassword)
             val intent = Intent(context, KeepAliveService::class.java).apply {
                 action = ACTION_START
@@ -88,6 +95,7 @@ class KeepAliveService : Service() {
                 putExtra(EXTRA_QUOTA_GB, quotaGb)
                 putExtra(EXTRA_PORT, port)
                 putExtra(EXTRA_WEB_PASSWORD, webPassword)
+                putExtra(EXTRA_SKIP_NATIVE_START, skipNativeStart)
             }
             ContextCompat.startForegroundService(context, intent)
             scheduleRecoveryWork(context)
@@ -100,7 +108,28 @@ class KeepAliveService : Service() {
             port: Int,
             webPassword: String,
         ) {
+            setUserStopped(context, false)
             saveLastConfig(context, vaultPath, quotaGb, port, webPassword)
+        }
+
+        /**
+         * 取消 WorkManager 周期恢复任务并写入 user_stopped 标记，防止用户停服或切 client_only 后被自动拉起。
+         */
+        fun cancelRecovery(context: Context) {
+            setUserStopped(context, true)
+            WorkManager.getInstance(context).cancelUniqueWork(WORK_NAME)
+        }
+
+        fun isUserStopped(context: Context): Boolean {
+            return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_USER_STOPPED, false)
+        }
+
+        private fun setUserStopped(context: Context, stopped: Boolean) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_USER_STOPPED, stopped)
+                .apply()
         }
 
         fun requestGracefulRestart(context: Context) {
@@ -174,6 +203,7 @@ class KeepAliveService : Service() {
         }
     }
 
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var wakeLock: PowerManager.WakeLock? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var activeVaultPath: String = "/storage/emulated/0/LanVault"
@@ -215,8 +245,19 @@ class KeepAliveService : Service() {
                     ?: prefs.getInt(EXTRA_PORT, activePort)
                 activeWebPassword = intent?.getStringExtra(EXTRA_WEB_PASSWORD)
                     ?: prefs.getString(EXTRA_WEB_PASSWORD, activeWebPassword)!!
+                val skipNativeStart = intent?.getBooleanExtra(EXTRA_SKIP_NATIVE_START, false) == true
 
+                saveLastConfig(
+                    this,
+                    activeVaultPath,
+                    activeQuotaGb,
+                    activePort,
+                    activeWebPassword,
+                )
                 promoteToForeground("运行中 · 端口 $activePort (Level 0)")
+                if (skipNativeStart) {
+                    return START_STICKY
+                }
                 val vaultPath = activeVaultPath
                 val quotaGb = activeQuotaGb
                 val port = activePort
@@ -294,6 +335,18 @@ class KeepAliveService : Service() {
 
     private fun performGracefulRestart() {
         releaseTransferLocks()
+        if (activeWebPassword.isBlank()) {
+            val saved = loadLastConfig(this)
+            if (saved == null) {
+                Log.w(TAG, "Cannot graceful-restart Level 0 service: no persisted config found.")
+                stopSelf()
+                return
+            }
+            activeVaultPath = saved.vaultPath
+            activeQuotaGb = saved.quotaGb
+            activePort = saved.port
+            activeWebPassword = saved.webPassword
+        }
         promoteToForeground("正在执行优雅重启（WAL 刷盘）…")
         val vaultPath = activeVaultPath
         val quotaGb = activeQuotaGb
@@ -303,7 +356,11 @@ class KeepAliveService : Service() {
             val stopped = nativeGracefulRestartKeepAliveServer()
             val restarted =
                 stopped && nativeStartKeepAliveServer(vaultPath, quotaGb, port, webPassword)
-            if (!restarted) {
+            if (restarted) {
+                mainHandler.post {
+                    promoteToForeground("运行中 · 端口 $port (Level 0)")
+                }
+            } else {
                 stopSelf()
             }
         }.start()
@@ -352,7 +409,7 @@ class KeepAliveService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentTitle("LanVault 局域网存储服务")
+            .setContentTitle("EveryoneNAS 局域网存储服务")
             .setContentText(contentText)
             .setOngoing(true)
             .setContentIntent(launchPending)
@@ -369,7 +426,7 @@ class KeepAliveService : Service() {
             val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "LanVault 后台保活与增量同步",
+                "EveryoneNAS 后台保活与增量同步",
                 NotificationManager.IMPORTANCE_LOW,
             )
             manager.createNotificationChannel(channel)
@@ -381,7 +438,14 @@ class KeepAliveRecoveryWorker(
     appContext: Context,
     params: WorkerParameters,
 ) : CoroutineWorker(appContext, params) {
+    companion object {
+        private const val TAG = "LanVaultRecoveryWorker"
+    }
+
     override suspend fun doWork(): Result {
+        if (KeepAliveService.isUserStopped(applicationContext)) {
+            return Result.success()
+        }
         return when (PrivilegeDetector.detect()) {
             KeepAliveLevel.LEVEL_3_MAGISK_DAEMON -> Result.success()
             KeepAliveLevel.LEVEL_2_ROOT_LIBSU -> {
@@ -415,19 +479,34 @@ class KeepAliveRecoveryWorker(
                 }
             }
             KeepAliveLevel.LEVEL_0_FOREGROUND -> {
-                // Level 0 在后台 WorkManager 窗口内执行增量扫描与健康检查，
-                // 避免违反 Android 15 后台拉起 dataSync 前台服务限制。
                 val config = KeepAliveService.loadLastConfig(applicationContext)
                 if (config == null) {
                     Result.failure()
                 } else {
-                    KeepAliveService.start(
-                        applicationContext,
-                        config.vaultPath,
-                        config.quotaGb,
-                        config.port,
-                        config.webPassword,
-                    )
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        try {
+                            KeepAliveService.start(
+                                applicationContext,
+                                config.vaultPath,
+                                config.quotaGb,
+                                config.port,
+                                config.webPassword,
+                            )
+                        } catch (e: ForegroundServiceStartNotAllowedException) {
+                            Log.w(
+                                TAG,
+                                "Background Level 0 FGS recovery skipped on API ${Build.VERSION.SDK_INT}: ${e.message}",
+                            )
+                        }
+                    } else {
+                        KeepAliveService.start(
+                            applicationContext,
+                            config.vaultPath,
+                            config.quotaGb,
+                            config.port,
+                            config.webPassword,
+                        )
+                    }
                     Result.success()
                 }
             }

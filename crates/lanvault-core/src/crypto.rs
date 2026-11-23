@@ -155,7 +155,7 @@ impl DeviceIdentity {
 
     pub fn derive_local_storage_key(&self, purpose: &str) -> SymmetricKey {
         let seed = self.seed_bytes();
-        let mut input = Vec::with_capacity(seed.len() + purpose.len());
+        let mut input = Zeroizing::new(Vec::with_capacity(seed.len() + purpose.len()));
         input.extend_from_slice(seed.as_ref());
         input.extend_from_slice(purpose.as_bytes());
         SymmetricKey(blake3::derive_key(LOCAL_STORAGE_KDF_CONTEXT, &input))
@@ -175,7 +175,14 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        if let Err(err) = file.set_permissions(fs::Permissions::from_mode(0o600)) {
+            if !matches!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
+            ) {
+                return Err(LanVaultError::Io(err));
+            }
+        }
     }
     file.write_all(bytes)?;
     file.sync_all()?;

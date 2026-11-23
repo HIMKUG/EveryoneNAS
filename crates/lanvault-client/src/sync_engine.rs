@@ -2,7 +2,7 @@
 //! 集成令牌桶限速 (`max_kbps`)、场景化省电门控 (`wifi_only`, `allowed_ssids`, `require_charging`)
 //! 与全量分块上传后的快照提交闭环 (`POST /api/vaults/{vault_id}/snapshots`)。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::sync::Arc;
@@ -136,26 +136,28 @@ impl TokenBucket {
 
     /// 申请发送 `bytes` 字节的令牌；若限速为 0 则立即放行，否则精确休眠补齐赤字。
     pub async fn acquire(&self, bytes: usize) {
-        let mut state = self.inner.lock().await;
-        if state.rate_bytes_per_sec <= 0.0 {
-            return;
-        }
-        let now = Instant::now();
-        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-        state.tokens = (state.tokens + elapsed * state.rate_bytes_per_sec).min(state.capacity);
-        state.last_refill = now;
+        let wait = {
+            let mut state = self.inner.lock().await;
+            if state.rate_bytes_per_sec <= 0.0 {
+                return;
+            }
+            let now = Instant::now();
+            let elapsed = now.saturating_duration_since(state.last_refill).as_secs_f64();
+            state.tokens = (state.tokens + elapsed * state.rate_bytes_per_sec).min(state.capacity);
+            state.last_refill = now;
 
-        let needed = bytes as f64;
-        if state.tokens >= needed {
-            state.tokens -= needed;
-            return;
-        }
-        let deficit = needed - state.tokens;
-        state.tokens = 0.0;
-        let wait = Duration::from_secs_f64(deficit / state.rate_bytes_per_sec);
+            let needed = bytes as f64;
+            if state.tokens >= needed {
+                state.tokens -= needed;
+                return;
+            }
+            let deficit = needed - state.tokens;
+            state.tokens = 0.0;
+            let wait = Duration::from_secs_f64(deficit / state.rate_bytes_per_sec);
+            state.last_refill = now + wait;
+            wait
+        };
         time::sleep(wait).await;
-        state.tokens = 0.0;
-        state.last_refill = Instant::now();
     }
 }
 
@@ -201,7 +203,7 @@ pub struct SyncEngine {
     env: Arc<RwLock<DeviceEnvironment>>,
     rate_limiter: Arc<TokenBucket>,
     progress_tx: broadcast::Sender<SyncProgress>,
-    known_remote_chunks: Arc<RwLock<HashSet<[u8; 32]>>>,
+    known_remote_chunks: Arc<RwLock<HashSet<(String, [u8; 32])>>>,
 }
 
 impl SyncEngine {
@@ -326,19 +328,18 @@ impl SyncEngine {
         }
 
         if !diff.is_empty() {
-            let mut projected_states = db.list_local_file_states(rule_id)?;
             let deleted: HashSet<&str> = diff.deleted.iter().map(String::as_str).collect();
-            projected_states.retain(|state| !deleted.contains(state.rel_path.as_str()));
+            let mut projected_map: HashMap<String, LocalFileStateRecord> = db
+                .list_local_file_states(rule_id)?
+                .into_iter()
+                .filter(|state| !deleted.contains(state.rel_path.as_str()))
+                .map(|state| (state.rel_path.clone(), state))
+                .collect();
             for pending in &pending_db_states {
-                if let Some(existing) = projected_states
-                    .iter_mut()
-                    .find(|state| state.rel_path == pending.rel_path)
-                {
-                    *existing = pending.clone();
-                } else {
-                    projected_states.push(pending.clone());
-                }
+                projected_map.insert(pending.rel_path.clone(), pending.clone());
             }
+            let mut projected_states: Vec<LocalFileStateRecord> =
+                projected_map.into_values().collect();
             let snapshot_id = self
                 .commit_snapshot(rule_id, vault_id, &mut projected_states)
                 .await?;
@@ -482,11 +483,12 @@ impl SyncEngine {
             ordered_hashes.push((idx, packed.stored_hash));
             file_probe.add_bytes(packed.raw_size as u64);
 
+            let cache_key = (vault_id.to_string(), packed.stored_hash);
             let already_exists = self
                 .known_remote_chunks
                 .read()
                 .await
-                .contains(&packed.stored_hash);
+                .contains(&cache_key);
 
             if already_exists {
                 summary.chunks_deduplicated += 1;
@@ -538,8 +540,8 @@ impl SyncEngine {
                 }
                 let resp = req.send().await?;
                 match resp.status() {
-                    StatusCode::CREATED | StatusCode::OK => Ok((stored_hash, raw_size, false)),
-                    StatusCode::CONFLICT | StatusCode::NOT_MODIFIED => {
+                    StatusCode::CREATED => Ok((stored_hash, raw_size, false)),
+                    StatusCode::OK | StatusCode::CONFLICT | StatusCode::NOT_MODIFIED => {
                         Ok((stored_hash, raw_size, true))
                     }
                     other => {
@@ -555,7 +557,13 @@ impl SyncEngine {
             while let Some(joined) = inflight_uploads.try_join_next() {
                 match joined {
                     Ok(Ok((h, raw_sz, server_dedup))) => {
-                        { let mut guard = self.known_remote_chunks.write().await; if guard.len() >= MAX_KNOWN_REMOTE_CHUNKS { guard.clear(); } guard.insert(h); }
+                        {
+                            let mut guard = self.known_remote_chunks.write().await;
+                            if guard.len() >= MAX_KNOWN_REMOTE_CHUNKS {
+                                guard.clear();
+                            }
+                            guard.insert((vault_id.to_string(), h));
+                        }
                         if server_dedup {
                             summary.chunks_deduplicated += 1;
                         } else {
@@ -601,7 +609,13 @@ impl SyncEngine {
             }
             match joined {
                 Ok(Ok((h, raw_sz, server_dedup))) => {
-                    { let mut guard = self.known_remote_chunks.write().await; if guard.len() >= MAX_KNOWN_REMOTE_CHUNKS { guard.clear(); } guard.insert(h); }
+                    {
+                        let mut guard = self.known_remote_chunks.write().await;
+                        if guard.len() >= MAX_KNOWN_REMOTE_CHUNKS {
+                            guard.clear();
+                        }
+                        guard.insert((vault_id.to_string(), h));
+                    }
                     if server_dedup {
                         summary.chunks_deduplicated += 1;
                     } else {
@@ -688,6 +702,12 @@ impl SyncEngine {
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            if status == StatusCode::NOT_FOUND {
+                self.known_remote_chunks
+                    .write()
+                    .await
+                    .retain(|(vid, _)| vid != vault_id);
+            }
             return Err(ClientError::RemoteRejected {
                 status: status.as_u16(),
                 body: format!("{url}: {body}"),

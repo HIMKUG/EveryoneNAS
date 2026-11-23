@@ -222,6 +222,12 @@ impl VaultStore {
         raw_size: u64,
         stored_bytes: &[u8],
     ) -> Result<bool> {
+        let mut _probe = lanvault_core::ProbeGuard::start(
+            "server.vault",
+            "vault.put_chunk",
+            Some(format!("vault={vault_id}")),
+        );
+        _probe.add_bytes(stored_bytes.len() as u64);
         let _guard = self.write_lock.lock().map_err(|_| {
             LanVaultError::InvalidState("vault write lock poisoned".to_string())
         })?;
@@ -314,6 +320,11 @@ impl VaultStore {
     /// Under `mirror_raid1`, if the primary copy is unreadable or corrupted, transparently
     /// reads from a healthy mirror and repairs the primary copy.
     pub fn get_chunk(&self, vault_id: &str, hash: &[u8; 32]) -> Result<Vec<u8>> {
+        let _probe = lanvault_core::ProbeGuard::start(
+            "server.vault",
+            "vault.get_chunk",
+            Some(format!("vault={vault_id}")),
+        );
         let vault = self
             .db
             .get_vault(vault_id)?
@@ -436,7 +447,10 @@ impl VaultStore {
         let volumes = self.db.list_vault_volumes(vault_id)?;
         let hash_hex = hex::encode(hash);
         let candidates: Vec<&VaultVolumeRecord> = match vault.pool_mode {
-            PoolMode::Single => vec![primary_volume(&volumes)?],
+            PoolMode::Single => volumes
+                .iter()
+                .filter(|volume| volume.is_online && volume.role == VolumeRole::Primary)
+                .collect(),
             PoolMode::Striped => volumes.iter().filter(|volume| volume.is_online).collect(),
             PoolMode::MirrorRaid1 => volumes
                 .iter()
@@ -447,9 +461,19 @@ impl VaultStore {
                 .collect(),
         };
         let required_copies = match vault.pool_mode {
-            PoolMode::MirrorRaid1 => candidates.len(),
+            PoolMode::MirrorRaid1 => volumes
+                .iter()
+                .filter(|volume| matches!(volume.role, VolumeRole::Primary | VolumeRole::Mirror))
+                .count()
+                .max(2),
             PoolMode::Single | PoolMode::Striped => 1,
         };
+        if candidates.is_empty() {
+            return Ok(ChunkReplicaReport {
+                healthy_copies: 0,
+                required_copies,
+            });
+        }
         let mut healthy_copies = 0usize;
         for volume in candidates {
             if read_verified_chunk(Path::new(&volume.mount_path), &hash_hex, hash).is_ok() {
@@ -469,6 +493,9 @@ impl VaultStore {
         expected_hash: &[u8; 32],
         healthy_bytes: &[u8],
     ) -> Result<()> {
+        let _guard = self.write_lock.lock().map_err(|_| {
+            LanVaultError::InvalidState("vault write lock poisoned".to_string())
+        })?;
         if blake3_hash(healthy_bytes) != *expected_hash {
             return Err(LanVaultError::CorruptedChunk {
                 hash: hex::encode(expected_hash),
@@ -611,6 +638,18 @@ fn normalized_mount_key(raw: &str) -> Result<PathBuf> {
     if resolved.exists() {
         resolved = fs::canonicalize(&resolved)?;
     }
+    #[cfg(windows)]
+    {
+        let s = resolved.to_string_lossy();
+        let stripped = if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            s.into_owned()
+        };
+        resolved = PathBuf::from(stripped.to_lowercase());
+    }
     Ok(resolved)
 }
 
@@ -629,6 +668,6 @@ fn striped_target_volume<'a>(
 pub(crate) fn unix_timestamp_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system clock before UNIX_EPOCH")
+        .unwrap_or_default()
         .as_secs() as i64
 }

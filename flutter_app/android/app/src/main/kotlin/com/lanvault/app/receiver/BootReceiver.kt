@@ -28,6 +28,9 @@ class BootReceiver : BroadcastReceiver() {
         val appContext = context.applicationContext
         Thread {
             try {
+                if (KeepAliveService.isUserStopped(appContext)) {
+                    return@Thread
+                }
                 val lastConfig = KeepAliveService.loadLastConfig(appContext)
                 when (PrivilegeDetector.detect()) {
                     KeepAliveLevel.LEVEL_3_MAGISK_DAEMON -> {

@@ -23,7 +23,10 @@ enum class KeepAliveLevel(val wireValue: String) {
  */
 object PrivilegeDetector {
     private const val MAGISK_MODULE_DIR = "/data/adb/modules/lanvault_daemon"
-    private const val MAGISK_PID_FILE = "/data/adb/lanvault/server.pid"
+    private const val MAGISK_DATA_DIR = "/data/adb/lanvault"
+    private const val MAGISK_PID_FILE = "$MAGISK_DATA_DIR/server.pid"
+    private const val MAGISK_WATCHDOG_PID_FILE = "$MAGISK_DATA_DIR/watchdog.pid"
+    private const val MAGISK_STOP_SENTINEL = "$MAGISK_DATA_DIR/.stop_requested"
 
     fun detect(): KeepAliveLevel {
         if (Shell.getShell().isRoot) {
@@ -39,7 +42,7 @@ object PrivilegeDetector {
     }
 
     /**
-     * 通过 Root Shell 检查 Magisk 模块目录及守护进程 PID 是否处于活跃状态，
+     * 通过 Root Shell 检查 Magisk 模块目录及守护进程（或停服态看门狗）是否处于活跃状态，
      * 避免非 Root 应用进程直接访问受 SELinux/DAC 保护的 /data/adb 目录。
      */
     fun isMagiskDaemonRunning(): Boolean {
@@ -47,12 +50,52 @@ object PrivilegeDetector {
             return false
         }
         val result = Shell.cmd(
-            "if [ -d '$MAGISK_MODULE_DIR' ] && [ ! -f '$MAGISK_MODULE_DIR/disable' ] && [ -f '$MAGISK_PID_FILE' ]; then " +
+            "if [ -d '$MAGISK_MODULE_DIR' ] && [ ! -f '$MAGISK_MODULE_DIR/disable' ]; then " +
+                "if [ -f '$MAGISK_PID_FILE' ]; then " +
                 "pid=\$(cat '$MAGISK_PID_FILE' 2>/dev/null); " +
                 "if [ -n \"\$pid\" ] && [ -d \"/proc/\$pid\" ]; then echo RUNNING; fi; " +
+                "elif [ -f '$MAGISK_STOP_SENTINEL' ] && [ -f '$MAGISK_WATCHDOG_PID_FILE' ]; then " +
+                "wd=\$(cat '$MAGISK_WATCHDOG_PID_FILE' 2>/dev/null); " +
+                "if [ -n \"\$wd\" ] && [ -d \"/proc/\$wd\" ]; then echo RUNNING; fi; " +
+                "fi; " +
                 "fi",
         ).exec()
         return result.isSuccess && result.out.any { it.trim() == "RUNNING" }
+    }
+
+    /**
+     * 清除 Level 3 停服哨兵并触发 service.sh 看门狗拉起 lanvault-server。
+     */
+    fun startMagiskDaemon(): Boolean {
+        if (!Shell.getShell().isRoot) {
+            return false
+        }
+        val result = Shell.cmd(
+            "rm -f '$MAGISK_STOP_SENTINEL'",
+            "wd=''; if [ -f '$MAGISK_WATCHDOG_PID_FILE' ]; then wd=\$(cat '$MAGISK_WATCHDOG_PID_FILE' 2>/dev/null); fi; " +
+                "if [ -z \"\$wd\" ] || [ ! -d \"/proc/\$wd\" ]; then " +
+                "if [ -f '$MAGISK_MODULE_DIR/service.sh' ]; then nohup sh '$MAGISK_MODULE_DIR/service.sh' >/dev/null 2>&1 & fi; " +
+                "fi",
+        ).exec()
+        return result.isSuccess
+    }
+
+    /**
+     * 写入停服哨兵 /data/adb/lanvault/.stop_requested 并向 lanvault-server 发送 SIGTERM，
+     * 阻止 service.sh 看门狗在用户停服或切换 client_only 后重新拉起守护进程。
+     */
+    fun stopMagiskDaemon(): Boolean {
+        if (!Shell.getShell().isRoot) {
+            return false
+        }
+        val result = Shell.cmd(
+            "mkdir -p '$MAGISK_DATA_DIR' && touch '$MAGISK_STOP_SENTINEL'",
+            "if [ -f '$MAGISK_PID_FILE' ]; then " +
+                "pid=\$(cat '$MAGISK_PID_FILE' 2>/dev/null); " +
+                "if [ -n \"\$pid\" ] && [ -d \"/proc/\$pid\" ]; then kill -TERM \"\$pid\"; fi; " +
+                "fi",
+        ).exec()
+        return result.isSuccess
     }
 
     /**
@@ -63,7 +106,11 @@ object PrivilegeDetector {
             return false
         }
         val result = Shell.cmd(
-            "if [ -f '$MAGISK_PID_FILE' ]; then kill -TERM \$(cat '$MAGISK_PID_FILE'); fi",
+            "rm -f '$MAGISK_STOP_SENTINEL'",
+            "if [ -f '$MAGISK_PID_FILE' ]; then " +
+                "pid=\$(cat '$MAGISK_PID_FILE' 2>/dev/null); " +
+                "if [ -n \"\$pid\" ] && [ -d \"/proc/\$pid\" ]; then kill -TERM \"\$pid\"; fi; " +
+                "fi",
         ).exec()
         return result.isSuccess
     }

@@ -36,14 +36,27 @@ object ShizukuBridge {
     @Volatile
     private var pendingStart: PendingStart? = null
 
+    private val bindWaiters = mutableListOf<CountDownLatch>()
+
+    private fun notifyBindWaiters() {
+        val waiters = synchronized(bindWaiters) {
+            val copy = bindWaiters.toList()
+            bindWaiters.clear()
+            copy
+        }
+        waiters.forEach { it.countDown() }
+    }
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             if (service == null || !service.pingBinder()) {
                 completePending(false)
+                notifyBindWaiters()
                 return
             }
             val bound = IShizukuLanVaultService.Stub.asInterface(service)
             remoteService = bound
+            notifyBindWaiters()
             val start = pendingStart
             if (start != null) {
                 pendingStart = null
@@ -68,6 +81,7 @@ object ShizukuBridge {
         override fun onServiceDisconnected(name: ComponentName?) {
             remoteService = null
             completePending(false)
+            notifyBindWaiters()
         }
     }
 
@@ -133,15 +147,44 @@ object ShizukuBridge {
         Shizuku.bindUserService(buildUserServiceArgs(context), connection)
     }
 
-    fun gracefulRestart(): Boolean {
-        val service = remoteService
-            ?: throw IllegalStateException("ShizukuUserService is not bound.")
+    private fun ensureBoundAndWait(
+        context: Context,
+        timeoutSeconds: Long = 8L,
+    ): IShizukuLanVaultService? {
+        val existing = remoteService
+        if (existing != null && existing.asBinder().pingBinder()) {
+            return existing
+        }
+        val latch = CountDownLatch(1)
+        synchronized(bindWaiters) {
+            val current = remoteService
+            if (current != null && current.asBinder().pingBinder()) {
+                return current
+            }
+            bindWaiters.add(latch)
+        }
+        try {
+            Shizuku.bindUserService(buildUserServiceArgs(context), connection)
+            latch.await(timeoutSeconds, TimeUnit.SECONDS)
+        } finally {
+            synchronized(bindWaiters) {
+                bindWaiters.remove(latch)
+            }
+        }
+        return remoteService?.takeIf { it.asBinder().pingBinder() }
+    }
+
+    fun gracefulRestart(context: Context? = null): Boolean {
+        val service = remoteService?.takeIf { it.asBinder().pingBinder() }
+            ?: context?.let { ensureBoundAndWait(it) }
+            ?: return false
         return service.gracefulRestart()
     }
 
-    fun stopServer(): Boolean {
-        val service = remoteService
-            ?: throw IllegalStateException("ShizukuUserService is not bound.")
+    fun stopServer(context: Context? = null): Boolean {
+        val service = remoteService?.takeIf { it.asBinder().pingBinder() }
+            ?: context?.let { ensureBoundAndWait(it) }
+            ?: return false
         return service.stopServer()
     }
 
