@@ -378,6 +378,9 @@ fn start_client_background_tasks(
     if life.role_mode == RoleMode::ServerOnly {
         return;
     }
+    // Reached from cold init (no ambient runtime) as well as from async callers,
+    // so enter the FFI runtime explicitly before spawning or `tokio::spawn`.
+    let _runtime_guard = state.runtime.enter();
 
     if let Ok(rules) = state.client_db.list_sync_rules() {
         let (watch_tx, mut watch_rx) = mpsc::channel::<WatchEvent>(64);
@@ -408,7 +411,6 @@ fn start_client_background_tasks(
     }
 
     if let Some(peer) = active_peer {
-        let _guard = state.runtime.enter();
         life.reconnect_task = Some(state.reconnect.spawn_peer_loop(ReconnectTarget {
             device_id: peer.device_id,
             addr: peer.addr,

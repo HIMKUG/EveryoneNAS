@@ -14,9 +14,10 @@ rustflags = [
 ]
 
 [target.aarch64-linux-android]
-# 启用 ARM64 硬件 NEON / CRC32 / AES / SHA 加密指令加速（覆盖 blake3/chacha20poly1305/zstd）
+# 启用 ARM64 硬件 NEON / AES / SHA 指令加速（覆盖 blake3/chacha20poly1305/zstd）。
+# `+crc` 在该 target 上仍是 unstable feature，会触发 rustc 警告，故不启用。
 rustflags = [
-    "-C", "target-feature=+neon,+crc,+crypto",
+    "-C", "target-feature=+neon,+aes,+sha2",
 ]
 
 [env]

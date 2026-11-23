@@ -4,11 +4,10 @@
 // - ARCHITECTURE_CONTRACTS.md 第 6 节 (改良新拟态 Token 与 120Hz 高刷合规范式)
 
 import 'dart:math' as math;
-import 'dart:ui' show FontFeature;
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:material_ui/material_ui.dart';
 
 /// Apple HIG 统一动效 Token：全项目禁止散落不一致的毫秒数或曲线。
 abstract final class NeuMotion {

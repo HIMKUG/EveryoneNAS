@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../../bridge/lanvault_bridge.dart';
 import '../../theme/neu_theme.dart';
@@ -168,7 +168,6 @@ class _BackupScreenState extends State<BackupScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final neu = NeuTheme.of(context);
     final textTheme = Theme.of(context).textTheme;
     final dirHint = Platform.isAndroid
         ? '/storage/emulated/0/DCIM'
@@ -184,7 +183,7 @@ class _BackupScreenState extends State<BackupScreen> {
             inset: true,
             child: Text(
               _error!,
-              style: textTheme.bodyMedium?.copyWith(color: neu.dangerColor),
+              style: textTheme.bodyMedium?.copyWith(color: NeuTokens.danger),
             ),
           ),
           const SizedBox(height: NeuSpace.md),
@@ -194,7 +193,7 @@ class _BackupScreenState extends State<BackupScreen> {
             inset: true,
             child: Text(
               _feedback!,
-              style: textTheme.bodyMedium?.copyWith(color: neu.healthyColor),
+              style: textTheme.bodyMedium?.copyWith(color: NeuTokens.healthy),
             ),
           ),
           const SizedBox(height: NeuSpace.md),
@@ -213,7 +212,7 @@ class _BackupScreenState extends State<BackupScreen> {
                 for (final rule in _rules) ...<Widget>[
                   NeuCard(
                     inset: true,
-                    borderRadius: NeuRadius.concentric(NeuRadius.card, NeuSpace.sm),
+                    radius: NeuRadius.concentric(NeuRadius.card, NeuSpace.sm),
                     padding: const EdgeInsets.all(NeuSpace.sm),
                     child: Row(
                       children: <Widget>[
@@ -276,14 +275,14 @@ class _BackupScreenState extends State<BackupScreen> {
               Text('场景化省电与令牌桶限速', style: textTheme.titleMedium),
               const SizedBox(height: NeuSpace.sm),
               NeuSwitch(
-                label: '仅 Wi-Fi 网络下执行同步',
+                title: '仅 Wi-Fi 网络下执行同步',
                 subtitle: '避免消耗蜂窝流量',
                 value: _wifiOnly,
                 onChanged: (v) => setState(() => _wifiOnly = v),
               ),
               const SizedBox(height: NeuSpace.sm),
               NeuSwitch(
-                label: '仅充电时全速扫描上传',
+                title: '仅充电时全速扫描上传',
                 subtitle: '息屏非充电场景降低耗电',
                 value: _requireCharging,
                 onChanged: (v) => setState(() => _requireCharging = v),

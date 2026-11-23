@@ -5,7 +5,7 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 
 import '../../bridge/lanvault_bridge.dart';
 import '../../theme/neu_theme.dart';
@@ -29,8 +29,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
   bool _autoReconnectEnabled = true;
   bool _togglingReconnect = false;
   bool _restarting = false;
-  bool _debugMode = false;
-  List<DebugLogEntryModel> _debugLogs = const <DebugLogEntryModel>[];
   bool _loadingLevel = false;
 
   String? _statusMessage;

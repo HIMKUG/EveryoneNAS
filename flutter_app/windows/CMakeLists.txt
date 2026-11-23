@@ -96,14 +96,16 @@ endif()
 
 if(LANVAULT_FFI_DLL)
   message(STATUS "[LanVault] Found native FFI library: ${LANVAULT_FFI_DLL}")
-  if(TARGET ${BINARY_NAME})
-    add_custom_command(TARGET ${BINARY_NAME} POST_BUILD
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${LANVAULT_FFI_DLL}"
-        "$<TARGET_FILE_DIR:${BINARY_NAME}>/lanvault_ffi.dll"
-      COMMENT "[LanVault] Copying lanvault_ffi.dll to Windows output directory"
-    )
-  endif()
+  # `runner` is a separate CMake sub-project, so a POST_BUILD hook on its target
+  # cannot be attached from this directory; a custom target keeps the copy step
+  # here and orders it after the executable.
+  add_custom_target(copy_lanvault_ffi ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${LANVAULT_FFI_DLL}"
+      "$<TARGET_FILE_DIR:${BINARY_NAME}>/lanvault_ffi.dll"
+    DEPENDS ${BINARY_NAME}
+    COMMENT "[LanVault] Copying lanvault_ffi.dll to Windows output directory"
+  )
 else()
   message(WARNING
     "[LanVault] lanvault_ffi.dll not found at:\n"

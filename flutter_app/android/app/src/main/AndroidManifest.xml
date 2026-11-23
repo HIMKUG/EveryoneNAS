@@ -29,6 +29,9 @@
         android:usesCleartextTraffic="true">
 
         <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+        <meta-data
             android:name="moe.shizuku.client.V3_SUPPORT"
             android:value="true" />
 
@@ -61,11 +64,14 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- Level 2 libsu RootService（Daemon 模式独立 UID 0 进程） -->
+        <!-- Level 2 libsu RootService（Daemon 模式独立 UID 0 进程）
+             Instantiatable 为误报：RootService 继承自 android.app.Service，
+             由 libsu 的 RootService 工厂在 UID 0 进程中实例化。 -->
         <service
             android:name=".privilege.RootDaemonService"
             android:enabled="true"
-            android:exported="false" />
+            android:exported="false"
+            tools:ignore="Instantiatable" />
 
         <!-- 开机恢复广播接收器：按 Android 15 约束仅走提权通道或 WorkManager，绝不直接拉起 dataSync FGS -->
         <receiver

@@ -3,7 +3,7 @@
 .SYNOPSIS
     LanVault Android (arm64-v8a) 8C16T 极限性能发行版一键构建脚本。
 .DESCRIPTION
-    以 16 并发线程通过 cargo-ndk 编译 ARM64 NEON/Crypto 优化的 liblanvault_ffi.so，
+    以 16 并发线程通过 cargo-ndk 编译 ARM64 NEON/AES/SHA2 优化的 liblanvault_ffi.so，
     随后执行 R8 Full Mode + Dart 混淆与符号剥离的 Flutter Android Release 构建，
     并将最终 APK（及可选 AAB）归档至 dist/android-release/。
 .PARAMETER BuildAab
@@ -23,7 +23,7 @@ $ErrorActionPreference = "Stop"
 # 1. 锁定 8 核 16 线程并发与 ARM64 NEON/Crypto 指令集优化
 $env:CARGO_BUILD_JOBS = "16"
 
-$Arm64OptFlags = "-C target-feature=+neon,+aes,+sha2,+crc"
+$Arm64OptFlags = "-C target-feature=+neon,+aes,+sha2"
 if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS)) {
     $env:CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS = $Arm64OptFlags
 }

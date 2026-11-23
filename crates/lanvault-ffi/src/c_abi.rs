@@ -363,7 +363,12 @@ mod android_jni {
             Ok(v) if v.len() >= 6 => v,
             _ => match api::load_or_generate_jni_web_password() {
                 Ok(generated) => generated,
-                Err(_) => return -2,
+                // The Kotlin signature is `Boolean`, so the only failure channel is `false`;
+                // the cause is logged rather than encoded in the return value.
+                Err(err) => {
+                    error!(error = %err, "JNI web password generation failed");
+                    return JNI_FALSE;
+                }
             },
         };
 

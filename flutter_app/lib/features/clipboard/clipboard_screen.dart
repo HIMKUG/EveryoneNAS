@@ -2,7 +2,7 @@
 // - ARCHITECTURE_CONTRACTS.md 第 4 / 6 节 (push_clipboard_text)
 // - lanvault_complete_blueprint.md 第 3.3 节 (复用 E2EE 加密信道的局域网剪贴板双向快传)
 
-import 'package:flutter/material.dart';
+import 'package:material_ui/material_ui.dart';
 import 'package:flutter/services.dart';
 
 import '../../bridge/lanvault_bridge.dart';
