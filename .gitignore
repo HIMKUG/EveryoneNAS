@@ -12,3 +12,7 @@
 *.log.1
 *.iml
 /backups/
+/flutter_app/keystore/
+**/*.jks
+**/*.keystore
+/*-source.zip

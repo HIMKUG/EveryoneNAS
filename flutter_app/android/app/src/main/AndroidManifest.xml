@@ -26,6 +26,7 @@
 
     <application
         android:name=".LanVaultApplication"
+        android:icon="@mipmap/ic_launcher"
         android:label="EveryoneNAS"
         android:usesCleartextTraffic="true">
 
