@@ -21,6 +21,8 @@
 ### 3.1 REST API 路由与载荷（挂载于 `lanvault-server`）
 所有需鉴权接口校验 `lv_session` Cookie（`HttpOnly; SameSite=Strict; Path=/`），未认证返回 `401 Unauthorized`。
 
+局域网使用同一端口上的 TLS 1.3 HTTPS/WSS，服务启动时从本机设备身份生成自签证书。原生客户端使用对端 Ed25519 公钥指纹验证 TLS，首次配对需在对端界面复制指纹，现有可信设备直接使用已保存的公钥。配对链接的 `fp` 参数为 32 位十六进制指纹。局域网会话 Cookie 设置 `Secure`。本机回环仍提供管理 HTTP/WS，浏览器从局域网直连时需自行验证自签证书。
+
 1. `POST /api/auth/login`（公开，防爆破）
    - Request: `{ "password": string }`
    - 200 OK: `Set-Cookie: lv_session=<64-hex>; HttpOnly; SameSite=Strict; Path=/` + `{ "authenticated": true, "expires_in_secs": 86400 }`

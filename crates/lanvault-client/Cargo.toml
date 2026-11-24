@@ -14,5 +14,6 @@ tracing.workspace = true
 notify.workspace = true
 hex.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 uuid.workspace = true
 futures-util.workspace = true

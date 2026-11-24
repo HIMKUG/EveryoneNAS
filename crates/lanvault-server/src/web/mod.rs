@@ -8,7 +8,6 @@ mod debug_routes;
 use debug_routes::*;
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::path::{Component, Path as StdPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -46,6 +45,7 @@ use crate::auth::{
     SessionInfo, SESSION_COOKIE_NAME, SESSION_TTL_SECS,
 };
 use crate::scrub::{BitRotAlertEvent, BitRotScrubber, ScrubReport};
+use crate::tls::LanConnectionInfo;
 use crate::vault::{unix_timestamp_secs, ExtraVolumeSpec, VaultStore};
 
 #[cfg(feature = "embed-web-ui")]
@@ -875,7 +875,7 @@ struct ClipboardEnvelope {
 
 async fn handle_login(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(LanConnectionInfo { addr, secure }): ConnectInfo<LanConnectionInfo>,
     cookies: Cookies,
     Json(req): Json<LoginRequest>,
 ) -> Response {
@@ -901,7 +901,7 @@ async fn handle_login(
             token,
             expires_in_secs,
         } => {
-            cookies.add(build_session_cookie(token));
+            cookies.add(build_session_cookie(token, secure));
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -939,6 +939,7 @@ async fn handle_login(
 
 async fn handle_logout(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(LanConnectionInfo { secure, .. }): ConnectInfo<LanConnectionInfo>,
     Extension(_session): Extension<SessionInfo>,
     cookies: Cookies,
 ) -> Response {
@@ -958,7 +959,7 @@ async fn handle_logout(
     ) {
         return map_domain_error(err);
     }
-    cookies.add(build_clear_session_cookie());
+    cookies.add(build_clear_session_cookie(secure));
     (
         StatusCode::OK,
         Json(serde_json::json!({ "authenticated": false })),
@@ -1997,8 +1998,8 @@ async fn handle_list_peers(
         Err(poisoned) => poisoned.into_inner().clone(),
     };
     let pairing_qr_uri = format!(
-        "lanvault://pair?id={}&ip={}&port={}&pin={}",
-        state.device_id, state.lan_ip, state.port, pairing_pin
+        "lanvault://pair?id={}&ip={}&port={}&pin={}&fp={}",
+        state.device_id, state.lan_ip, state.port, pairing_pin, state.identity.fingerprint_hex()
     );
 
     (
@@ -2244,7 +2245,7 @@ impl AppState {
 
 async fn handle_pair_peer(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(LanConnectionInfo { addr, secure }): ConnectInfo<LanConnectionInfo>,
     cookies: Cookies,
     Json(req): Json<PairPinRequest>,
 ) -> Response {
@@ -2357,7 +2358,7 @@ async fn handle_pair_peer(
         addr.ip().to_string(),
     ) {
         Ok((pair_resp, session_token)) => {
-            cookies.add(build_session_cookie(session_token));
+            cookies.add(build_session_cookie(session_token, secure));
             (StatusCode::OK, Json(pair_resp)).into_response()
         }
         Err(err) => map_domain_error(err),
@@ -2366,7 +2367,7 @@ async fn handle_pair_peer(
 
 async fn handle_pair_request_initiate(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(LanConnectionInfo { addr, .. }): ConnectInfo<LanConnectionInfo>,
     Json(req): Json<PairRequestInitiateBody>,
 ) -> Response {
     if let Err(resp) = require_accepting_tasks(&state) {
@@ -2582,7 +2583,7 @@ async fn handle_respond_pair_request(
 async fn handle_peer_heartbeat(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<SessionInfo>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(LanConnectionInfo { addr, .. }): ConnectInfo<LanConnectionInfo>,
     Json(req): Json<HeartbeatRequest>,
 ) -> Response {
     if let Err(resp) = require_accepting_tasks(&state) {
@@ -2697,7 +2698,8 @@ async fn handle_peer_session_challenge(
 
 async fn handle_peer_session_renew(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ConnectInfo(LanConnectionInfo { addr, secure }): ConnectInfo<LanConnectionInfo>,
+    cookies: Cookies,
     Json(req): Json<PeerSessionRenewRequest>,
 ) -> Response {
     if let Err(resp) = require_accepting_tasks(&state) {
@@ -2768,20 +2770,13 @@ async fn handle_peer_session_renew(
     state.touch_peer_lease(&expected_device_id);
     info!(device_id = %expected_device_id, "peer session renewed via Ed25519 signature");
 
-    let mut response = Json(serde_json::json!({
+    cookies.add(build_session_cookie(token.clone(), secure));
+    Json(serde_json::json!({
         "ok": true,
         "device_id": expected_device_id,
         "session_cookie": token,
     }))
-    .into_response();
-    if let Ok(value) = HeaderValue::from_str(&format!(
-        "{SESSION_COOKIE_NAME}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}"
-    )) {
-        response
-            .headers_mut()
-            .insert(axum::http::header::SET_COOKIE, value);
-    }
-    response
+    .into_response()
 }
 
 async fn handle_delete_peer(

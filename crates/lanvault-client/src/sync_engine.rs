@@ -322,11 +322,11 @@ impl SyncEngine {
         initial_policy: PowerNetworkPolicy,
         environment: DeviceEnvironment,
         shared_rate_limiter: Option<Arc<TokenBucket>>,
+        pin: crate::transport::PeerFingerprint,
     ) -> Result<Self, ClientError> {
         // 单条长连接的吞吐直接受"连接池太小导致反复重建 TCP"与 Nagle 延迟影响：
         // 显式放大 keep-alive 池并关闭 nodelay 之外的额外协商开销。
-        let http = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
+        let http = crate::transport::peer_http_builder(pin)?
             .read_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(CHUNK_UPLOAD_CONCURRENCY * FILE_SYNC_CONCURRENCY)
             .pool_idle_timeout(Duration::from_secs(90))

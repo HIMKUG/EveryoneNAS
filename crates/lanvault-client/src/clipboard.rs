@@ -63,9 +63,9 @@ impl ClipboardClient {
         endpoint_base_url: String,
         session_cookie: Option<String>,
         channel_key: SymmetricKey,
+        pin: crate::transport::PeerFingerprint,
     ) -> Result<Self, ClientError> {
-        let http = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
+        let http = crate::transport::peer_http_builder(pin)?
             .timeout(Duration::from_secs(20))
             .build()?;
         Ok(Self {
@@ -251,9 +251,12 @@ pub struct ResumableFileTransferClient {
 }
 
 impl ResumableFileTransferClient {
-    pub fn new(endpoint_base_url: String, session_cookie: Option<String>) -> Result<Self, ClientError> {
-        let http = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
+    pub fn new(
+        endpoint_base_url: String,
+        session_cookie: Option<String>,
+        pin: crate::transport::PeerFingerprint,
+    ) -> Result<Self, ClientError> {
+        let http = crate::transport::peer_http_builder(pin)?
             .read_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(8)
             .tcp_nodelay(true)

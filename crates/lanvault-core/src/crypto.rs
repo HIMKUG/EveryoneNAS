@@ -143,6 +143,17 @@ impl DeviceIdentity {
         self.signing_key.verifying_key().to_bytes()
     }
 
+    /// Encodes this device's signing key for the local TLS listener.
+    pub fn tls_key_pkcs8(&self) -> Result<Zeroizing<Vec<u8>>> {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+
+        let encoded = self
+            .signing_key
+            .to_pkcs8_der()
+            .map_err(|e| LanVaultError::Crypto(format!("cannot encode device TLS key: {e}")))?;
+        Ok(Zeroizing::new(encoded.as_bytes().to_vec()))
+    }
+
     /// Computes a short deterministic hex fingerprint of the public key (first 16 bytes of BLAKE3).
     pub fn fingerprint_hex(&self) -> String {
         public_key_fingerprint(&self.public_key_bytes())
@@ -191,8 +202,13 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Computes the 32-char hex fingerprint (16 bytes of BLAKE3) for an Ed25519 public key.
 pub fn public_key_fingerprint(pubkey: &[u8; ED25519_KEY_LEN]) -> String {
-    let hash = blake3::hash(pubkey);
-    hex::encode(&hash.as_bytes()[..16])
+    hex::encode(public_key_fingerprint_bytes(pubkey))
+}
+
+pub fn public_key_fingerprint_bytes(pubkey: &[u8; ED25519_KEY_LEN]) -> [u8; 16] {
+    let mut fingerprint = [0; 16];
+    fingerprint.copy_from_slice(&blake3::hash(pubkey).as_bytes()[..16]);
+    fingerprint
 }
 
 /// Constant-time byte slice equality comparison.

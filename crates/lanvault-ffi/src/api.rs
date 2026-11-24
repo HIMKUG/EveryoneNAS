@@ -25,6 +25,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use lanvault_client::transport::{peer_http_builder, PeerFingerprint};
 use lanvault_client::{
     reconcile_directory, ClipboardClient, DirectoryWatcher, PowerNetworkPolicy,
     DeviceEnvironment, ReconnectController, ReconnectEvent, ReconnectTarget, SyncEngine,
@@ -187,6 +188,8 @@ struct ActivePeerSession {
     device_id: String,
     addr: SocketAddr,
     endpoint_base_url: String,
+    fingerprint: PeerFingerprint,
+    http: Client,
     session_cookie: Option<String>,
     channel_key: SymmetricKey,
     default_vault_id: Option<String>,
@@ -236,7 +239,7 @@ struct FfiRuntimeState {
     active_peer: Arc<RwLock<Option<ActivePeerSession>>>,
     environment: Arc<RwLock<DeviceEnvironment>>,
     sync_inflight: Arc<AsyncMutex<HashSet<String>>>,
-    sync_engine_cache: AsyncMutex<Option<(String, Arc<SyncEngine>)>>,
+    sync_engine_cache: AsyncMutex<Option<(SocketAddr, PeerFingerprint, Arc<SyncEngine>)>>,
     fast_backup_mode: AtomicBool,
 }
 
@@ -443,6 +446,10 @@ fn load_persisted_peer(
         .addr
         .parse()
         .context("invalid persisted peer SocketAddr")?;
+    let Some(trusted) = db.get_trusted_peer(&persisted.device_id)?.filter(|peer| peer.revoked_at.is_none()) else {
+        return Ok(None);
+    };
+    let fingerprint = trusted_peer_fingerprint(&trusted)?;
     let key_bytes = hex::decode(&persisted.channel_key_hex)
         .context("invalid persisted channel_key_hex")?;
     let key_arr: [u8; 32] = key_bytes
@@ -451,7 +458,9 @@ fn load_persisted_peer(
     Ok(Some(ActivePeerSession {
         device_id: persisted.device_id,
         addr,
-        endpoint_base_url: persisted.endpoint_base_url,
+        endpoint_base_url: format!("https://{addr}"),
+        fingerprint,
+        http: peer_http_client(fingerprint)?,
         session_cookie: persisted.session_cookie,
         channel_key: SymmetricKey::from_bytes(key_arr),
         default_vault_id: persisted.default_vault_id,
@@ -559,8 +568,8 @@ fn spawn_peer_heartbeat_task(
                 continue;
             };
             let url = format!("{}/api/peers/heartbeat", current.endpoint_base_url);
-            let result = state_for_task
-                .http_client
+            let result = current
+                .http
                 .post(&url)
                 .header("Cookie", format!("lv_session={cookie}"))
                 .json(&serde_json::json!({
@@ -591,12 +600,14 @@ fn spawn_peer_heartbeat_task(
                                 continue;
                             }
                             Err(err) => {
-                                warn!(
-                                    peer = %current.device_id,
-                                    "peer session renewal rejected ({err:#}); dropping stale pairing"
-                                );
-                                abandon_peer_session(&state_for_task, &current.device_id).await;
-                                break;
+                                let denied = err.downcast_ref::<reqwest::Error>()
+                                    .and_then(reqwest::Error::status)
+                                    .is_some_and(|status| status.as_u16() == 401 || status.as_u16() == 403);
+                                warn!(peer = %current.device_id, "peer session renewal failed ({err:#})");
+                                if denied {
+                                    abandon_peer_session(&state_for_task, &current.device_id).await;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -690,27 +701,14 @@ struct SessionRenewChallengeResp {
     server_device_id: String,
 }
 
-/// 拒绝从加密通道（https/wss）无声降级为明文（http/ws）。
-#[allow(dead_code)]
-fn validate_no_scheme_downgrade(previous_url: &str, next_url: &str) -> Result<()> {
-    let prev_secure = previous_url.starts_with("https://") || previous_url.starts_with("wss://");
-    let next_secure = next_url.starts_with("https://") || next_url.starts_with("wss://");
-    if prev_secure && !next_secure {
-        bail!(
-            "refusing silent transport downgrade from `{previous_url}` to `{next_url}`"
-        );
-    }
-    Ok(())
-}
-
 /// 用本机设备私钥向对端换发新的 `lv_session`，并把新 Cookie 写回活跃会话。
 async fn renew_peer_session(
     state: &Arc<FfiRuntimeState>,
     current: &ActivePeerSession,
 ) -> Result<ActivePeerSession> {
     let challenge_url = format!("{}/api/peers/session/challenge", current.endpoint_base_url);
-    let challenge_resp = state
-        .http_client
+    let challenge_resp = current
+        .http
         .post(&challenge_url)
         .json(&serde_json::json!({
             "device_id": state.client_device_id,
@@ -719,6 +717,7 @@ async fn renew_peer_session(
         .await
         .with_context(|| format!("session renewal challenge request to {challenge_url} failed"))?;
     if !challenge_resp.status().is_success() {
+        challenge_resp.error_for_status_ref()?;
         bail!(
             "session renewal challenge rejected with HTTP {}",
             challenge_resp.status().as_u16()
@@ -746,8 +745,8 @@ async fn renew_peer_session(
     );
     let signature = state.client_identity.sign(&message);
     let url = format!("{}/api/peers/session", current.endpoint_base_url);
-    let resp = state
-        .http_client
+    let resp = current
+        .http
         .post(&url)
         .json(&serde_json::json!({
             "device_id": state.client_device_id,
@@ -760,6 +759,7 @@ async fn renew_peer_session(
         .with_context(|| format!("session renewal request to {url} failed"))?;
 
     if !resp.status().is_success() {
+        resp.error_for_status_ref()?;
         bail!(
             "session renewal rejected with HTTP {}",
             resp.status().as_u16()
@@ -1021,6 +1021,8 @@ fn runtime_state_with_mode(explicit_daemon: bool) -> Result<Arc<FfiRuntimeState>
             .as_deref()
             != Some("0");
     let http_client = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .build()
@@ -1433,10 +1435,45 @@ struct PendingPairRequestsResponse {
     requests: Vec<PendingPairRequestDto>,
 }
 
+fn peer_http_client(fingerprint: PeerFingerprint) -> Result<Client> {
+    Ok(peer_http_builder(fingerprint)?.timeout(Duration::from_secs(10)).build()?)
+}
+
+fn trusted_peer_fingerprint(peer: &TrustedPeer) -> Result<PeerFingerprint> {
+    let key = peer.ed25519_pubkey.as_slice().try_into()
+        .map_err(|_| anyhow!("invalid public key for trusted device {}", peer.device_id))?;
+    Ok(PeerFingerprint::from_public_key(key))
+}
+
+fn pairing_target(state: &FfiRuntimeState, input: &str, port: u16) -> Result<(SocketAddr, PeerFingerprint)> {
+    let (host, supplied_pin) = match input.trim().split_once('#') {
+        Some((host, pin)) => (host, Some(pin.parse::<PeerFingerprint>()?)),
+        None => (input.trim(), None),
+    };
+    let ip: IpAddr = host.parse().context("invalid peer IP address")?;
+    if port == 0 {
+        bail!("peer port must be non-zero");
+    }
+    let addr = SocketAddr::new(ip, port);
+    if let Some(pin) = supplied_pin {
+        return Ok((addr, pin));
+    }
+    let mut matching = state.client_db.list_trusted_peers()?.into_iter().filter(|peer| {
+        peer.revoked_at.is_none()
+            && peer.last_ip.as_deref().and_then(|value| value.parse::<IpAddr>().ok()) == Some(ip)
+            && peer.last_port == Some(port)
+    });
+    match (matching.next(), matching.next()) {
+        (Some(peer), None) => Ok((addr, trusted_peer_fingerprint(&peer)?)),
+        _ => bail!("verify the fingerprint displayed on the other device before pairing"),
+    }
+}
+
 async fn finalize_paired_peer(
     state: &Arc<FfiRuntimeState>,
-    parsed_ip: IpAddr,
-    port: u16,
+    addr: SocketAddr,
+    fingerprint: PeerFingerprint,
+    http: Client,
     challenge: &str,
     kex: SessionKeyExchange,
     client_ed25519_pubkey: &[u8; 32],
@@ -1470,6 +1507,9 @@ async fn finalize_paired_peer(
     let server_public_key: [u8; 32] = server_ed25519_pubkey
         .try_into()
         .map_err(|_| anyhow!("invalid server Ed25519 public key length"))?;
+    if PeerFingerprint::from_public_key(&server_public_key) != fingerprint {
+        bail!("pairing identity does not match the TLS device fingerprint");
+    }
     let expected_server_device_id = format!(
         "lv-{}",
         &lanvault_core::public_key_fingerprint(&server_public_key)[..12]
@@ -1518,25 +1558,26 @@ async fn finalize_paired_peer(
         device_name: peer_device_name,
         os_type: peer_os_type,
         ed25519_pubkey: server_public_key.to_vec(),
-        last_ip: Some(parsed_ip.to_string()),
-        last_port: Some(port),
+        last_ip: Some(addr.ip().to_string()),
+        last_port: Some(addr.port()),
         auto_connect: state.reconnect.is_enabled(),
         paired_at,
         revoked_at: None,
     })?;
 
-    let socket_addr = SocketAddr::new(parsed_ip, port);
-    let endpoint_base_url = format!("http://{socket_addr}");
+    let endpoint_base_url = format!("https://{addr}");
     let default_vault_id = fetch_remote_default_vault_id(
-        &state.http_client,
+        &http,
         &endpoint_base_url,
         body.session_cookie.as_deref(),
     )
     .await;
     let session = ActivePeerSession {
         device_id: body.device_id.clone(),
-        addr: socket_addr,
+        addr,
         endpoint_base_url,
+        fingerprint,
+        http,
         session_cookie: body.session_cookie,
         channel_key,
         default_vault_id,
@@ -1565,20 +1606,15 @@ pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String>
     let _probe = lanvault_core::ProbeGuard::start(
         "rust.ffi",
         "ffi.pair_with_pin",
-        Some(format!("target={ip}:{port}")),
+        None,
     );
-    let parsed_ip: IpAddr = ip
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid peer IP address: `{ip}`"))?;
-    if port == 0 {
-        bail!("peer port must be non-zero");
-    }
     if pin.len() != 6 || !pin.chars().all(|c| c.is_ascii_digit()) {
         bail!("pairing PIN must be a 6-digit numeric string");
     }
 
     let state = runtime_state()?;
+    let (socket_addr, fingerprint) = pairing_target(&state, &ip, port)?;
+    let http = peer_http_client(fingerprint)?;
     let kex = SessionKeyExchange::new();
     let client_ed25519_pubkey = state.client_identity.public_key_bytes();
     let client_x25519_pubkey = kex.public_key_bytes();
@@ -1593,11 +1629,9 @@ pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String>
     );
     let client_signature = state.client_identity.sign(&identity_message);
 
-    let socket_addr = SocketAddr::new(parsed_ip, port);
-    let url = format!("http://{socket_addr}/api/peers/pair");
+    let url = format!("https://{socket_addr}/api/peers/pair");
 
-    let resp = state
-        .http_client
+    let resp = http
         .post(&url)
         .json(&PairPinRequest {
             pin: pin.clone(),
@@ -1621,8 +1655,9 @@ pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String>
     let body: PairPinResponse = resp.json().await.context("invalid pairing response JSON")?;
     let device_id = finalize_paired_peer(
         &state,
-        parsed_ip,
-        port,
+        socket_addr,
+        fingerprint,
+        http,
         &pin,
         kex,
         &client_ed25519_pubkey,
@@ -1641,17 +1676,12 @@ pub async fn request_pairing(ip: String, port: u16) -> Result<String> {
     let _probe = lanvault_core::ProbeGuard::start(
         "rust.ffi",
         "ffi.request_pairing",
-        Some(format!("target={ip}:{port}")),
+        None,
     );
-    let parsed_ip: IpAddr = ip
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid peer IP address: `{ip}`"))?;
-    if port == 0 {
-        bail!("peer port must be non-zero");
-    }
 
     let state = runtime_state()?;
+    let (socket_addr, fingerprint) = pairing_target(&state, &ip, port)?;
+    let http = peer_http_client(fingerprint)?;
     let kex = SessionKeyExchange::new();
     let client_ed25519_pubkey = state.client_identity.public_key_bytes();
     let client_x25519_pubkey = kex.public_key_bytes();
@@ -1669,10 +1699,8 @@ pub async fn request_pairing(ip: String, port: u16) -> Result<String> {
     );
     let client_signature = state.client_identity.sign(&identity_message);
 
-    let socket_addr = SocketAddr::new(parsed_ip, port);
-    let init_url = format!("http://{socket_addr}/api/peers/pair-request");
-    let init_resp = state
-        .http_client
+    let init_url = format!("https://{socket_addr}/api/peers/pair-request");
+    let init_resp = http
         .post(&init_url)
         .json(&PairRequestInitiatePayload {
             nonce: nonce.clone(),
@@ -1697,7 +1725,7 @@ pub async fn request_pairing(ip: String, port: u16) -> Result<String> {
         .json()
         .await
         .context("invalid pair-request response JSON")?;
-    let status_url = format!("http://{socket_addr}/api/peers/pair-status");
+    let status_url = format!("https://{socket_addr}/api/peers/pair-status");
     let deadline = Instant::now() + Duration::from_secs(init_body.expires_in_secs.clamp(10, 90));
 
     loop {
@@ -1706,8 +1734,7 @@ pub async fn request_pairing(ip: String, port: u16) -> Result<String> {
         }
         tokio::time::sleep(Duration::from_millis(750)).await;
 
-        let poll_resp = state
-            .http_client
+        let poll_resp = http
             .post(&status_url)
             .json(&PairRequestStatusPayload {
                 request_id: init_body.request_id.clone(),
@@ -1739,8 +1766,9 @@ pub async fn request_pairing(ip: String, port: u16) -> Result<String> {
                     .ok_or_else(|| anyhow!("approved pairing status missing response payload"))?;
                 let device_id = finalize_paired_peer(
                     &state,
-                    parsed_ip,
-                    port,
+                    socket_addr,
+                    fingerprint,
+                    http,
                     &nonce,
                     kex,
                     &client_ed25519_pubkey,
@@ -2276,7 +2304,7 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
         match peer.default_vault_id.clone() {
             Some(vault_id) => vault_id,
             None => fetch_remote_default_vault_id(
-                &state.http_client,
+                &peer.http,
                 &peer.endpoint_base_url,
                 peer.session_cookie.as_deref(),
             )
@@ -2325,8 +2353,8 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
     let environment = state.environment.read().await.clone();
     let engine = {
         let mut cache = state.sync_engine_cache.lock().await;
-        if let Some((cached_url, existing)) = cache.as_ref() {
-            if cached_url == &peer.endpoint_base_url {
+        if let Some((addr, pin, existing)) = cache.as_ref() {
+            if *addr == peer.addr && *pin == peer.fingerprint {
                 existing.update_session_cookie(peer.session_cookie.clone()).await;
                 existing.update_policy(policy.clone()).await;
                 existing.update_environment(environment.clone()).await;
@@ -2341,9 +2369,10 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
                     policy.clone(),
                     environment.clone(),
                     Some(Arc::clone(&state.rate_limiter)),
+                    peer.fingerprint,
                 )?);
                 created.set_fast_mode(state.fast_backup_mode.load(Ordering::Relaxed));
-                *cache = Some((peer.endpoint_base_url.clone(), Arc::clone(&created)));
+                *cache = Some((peer.addr, peer.fingerprint, Arc::clone(&created)));
                 created
             }
         } else {
@@ -2355,9 +2384,10 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
                 policy.clone(),
                 environment.clone(),
                 Some(Arc::clone(&state.rate_limiter)),
+                peer.fingerprint,
             )?);
             created.set_fast_mode(state.fast_backup_mode.load(Ordering::Relaxed));
-            *cache = Some((peer.endpoint_base_url.clone(), Arc::clone(&created)));
+            *cache = Some((peer.addr, peer.fingerprint, Arc::clone(&created)));
             created
         }
     };
@@ -2573,6 +2603,7 @@ pub async fn push_clipboard_text(target_device_id: Option<String>, text: String)
         peer.endpoint_base_url,
         peer.session_cookie,
         peer.channel_key,
+        peer.fingerprint,
     )?;
     let target_label = target_device_id
         .as_deref()
@@ -4202,7 +4233,7 @@ pub async fn list_snapshots(vault_id: Option<String>) -> Result<Vec<SnapshotSumm
 pub async fn set_fast_backup_mode(enabled: bool) -> Result<bool> {
     let state = runtime_state()?;
     state.fast_backup_mode.store(enabled, Ordering::Relaxed);
-    if let Some((_, engine)) = state.sync_engine_cache.lock().await.as_ref() {
+    if let Some((_, _, engine)) = state.sync_engine_cache.lock().await.as_ref() {
         engine.set_fast_mode(enabled);
     }
     Ok(enabled)
@@ -4220,7 +4251,7 @@ pub async fn trigger_bit_rot_scrub() -> Result<ScrubResultDto> {
             .clone()
             .ok_or_else(|| anyhow!("local server database is not initialized and no paired peer connected"))?;
         let url = format!("{}/api/scrub/trigger", peer.endpoint_base_url);
-        let mut req = state.http_client.post(&url);
+        let mut req = peer.http.post(&url);
         if let Some(ref c) = peer.session_cookie {
             req = req.header("Cookie", format!("lv_session={c}"));
         }
@@ -4457,6 +4488,7 @@ pub async fn push_clipboard_file(
     let transfer_client = lanvault_client::ResumableFileTransferClient::new(
         peer.endpoint_base_url.clone(),
         peer.session_cookie.clone(),
+        peer.fingerprint,
     )?;
     let send_res = transfer_client
         .send_file_resumable(Path::new(&trimmed_path))
@@ -4469,6 +4501,7 @@ pub async fn push_clipboard_file(
         let retry_client = lanvault_client::ResumableFileTransferClient::new(
             renewed.endpoint_base_url,
             renewed.session_cookie,
+            renewed.fingerprint,
         )?;
         retry_client
             .send_file_resumable(Path::new(&trimmed_path))
@@ -4711,8 +4744,7 @@ pub async fn restore_snapshot(
             .await
             .clone()
             .ok_or_else(|| anyhow!("local snapshot not found and no paired peer connected for remote restore"))?;
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
+        let http = peer_http_builder(peer.fingerprint)?
             .read_timeout(Duration::from_secs(30))
             .build()?;
         let manifest_url = format!("{}/api/snapshots/{}/manifest", peer.endpoint_base_url, snap_id);

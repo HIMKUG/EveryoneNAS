@@ -5,6 +5,7 @@ pub mod error;
 pub mod reconnect;
 pub mod scanner;
 pub mod sync_engine;
+pub mod transport;
 pub mod watcher;
 
 pub use clipboard::{

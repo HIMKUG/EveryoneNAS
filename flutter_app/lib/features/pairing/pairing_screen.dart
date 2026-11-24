@@ -148,85 +148,6 @@ class _PairingScreenState extends State<PairingScreen> {
     }
   }
 
-  Future<void> _initiateInteractivePairing(DiscoveredPeer peer) async {
-    var cancelled = false;
-    var dialogClosed = false;
-
-    unawaited(() async {
-      try {
-        await widget.bridge.requestPairing(ip: peer.ip, port: peer.port);
-        if (!mounted || cancelled) return;
-        if (!dialogClosed && Navigator.of(context, rootNavigator: true).canPop()) {
-          dialogClosed = true;
-          Navigator.of(context, rootNavigator: true).pop();
-        }
-        _stopScan(silent: true);
-        NeuToast.success(context, '已与 ${peer.deviceName} 完成配对');
-        setState(() => _activeTab = _DeviceTab.paired);
-        await _refreshPairedPeers();
-      } catch (err) {
-        if (!mounted || cancelled) return;
-        if (!dialogClosed && Navigator.of(context, rootNavigator: true).canPop()) {
-          dialogClosed = true;
-          Navigator.of(context, rootNavigator: true).pop();
-        }
-        NeuToast.error(context, LanVaultBridge.formatUserError(err));
-      }
-    }());
-
-    await showNeuDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) {
-        return NeuDialog(
-          title: '正在等待对方确认配对',
-          subtitle: '请在 ${peer.deviceName} (${peer.ip}) 的弹窗中点击“同意配对”',
-          actions: <Widget>[
-            NeuButton(
-              label: '使用 PIN 配对',
-              onPressed: () {
-                cancelled = true;
-                dialogClosed = true;
-                Navigator.of(dialogContext).pop();
-                _openPairDialog(initialIp: peer.ip, initialPort: peer.port);
-              },
-            ),
-            NeuButton(
-              label: '取消',
-              tone: NeuButtonTone.danger,
-              onPressed: () {
-                cancelled = true;
-                dialogClosed = true;
-                Navigator.of(dialogContext).pop();
-              },
-            ),
-          ],
-          child: NeuCard(
-            inset: true,
-            padding: const EdgeInsets.all(16),
-            child: Row(
-              children: <Widget>[
-                const SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(strokeWidth: 2.5),
-                ),
-                const SizedBox(width: 14),
-                Expanded(
-                  child: Text(
-                    '已向 ${peer.deviceName} 发送配对邀请，无需手动输入配对码…',
-                    style: Theme.of(dialogContext).textTheme.bodyMedium,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-    dialogClosed = true;
-  }
-
   Future<void> _openPairDialog({String? initialIp, int? initialPort}) async {
     final paired = await showNeuDialog<bool>(
       context: context,
@@ -567,7 +488,7 @@ class _PairingScreenState extends State<PairingScreen> {
                         label: '配对',
                         icon: Icons.link_rounded,
                         tone: NeuButtonTone.primary,
-                        onPressed: () => _initiateInteractivePairing(peer),
+                        onPressed: () => _openPairDialog(initialIp: peer.ip, initialPort: peer.port),
                       ),
                     ],
                   ),
@@ -605,6 +526,7 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     text: (widget.initialPort ?? LanVaultBridge.defaultServerPort).toString(),
   );
   final TextEditingController _pinController = TextEditingController();
+  final TextEditingController _fingerprintController = TextEditingController();
 
   PairingInfoModel? _localInfo;
   bool _loadingInfo = true;
@@ -627,6 +549,7 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     _ipController.dispose();
     _portController.dispose();
     _pinController.dispose();
+    _fingerprintController.dispose();
     super.dispose();
   }
 
@@ -646,18 +569,11 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     }
   }
 
-  Future<void> _submitInteractiveRequest() async {
-    final ip = _ipController.text.trim();
-    final port = int.tryParse(_portController.text.trim());
-    if (ip.isEmpty || port == null || port <= 0 || port > 65535) {
-      NeuToast.warning(context, '请输入有效的目标 IP 与端口（1–65535）');
-      return;
-    }
-
+  Future<void> _submitInteractiveRequest(String address, int port) async {
     setState(() => _pairing = true);
     try {
-      NeuToast.info(context, '已发送配对请求，请在对方设备弹窗中确认…');
-      final pairedId = await widget.bridge.requestPairing(ip: ip, port: port);
+      NeuToast.info(context, '请在对方设备确认配对');
+      final pairedId = await widget.bridge.requestPairing(ip: address, port: port);
       if (!mounted) return;
       NeuToast.success(context, '配对成功（设备：$pairedId）');
       Navigator.of(context).pop(true);
@@ -672,13 +588,19 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     final ip = _ipController.text.trim();
     final port = int.tryParse(_portController.text.trim());
     final pin = _pinController.text.trim();
+    final fingerprint = _fingerprintController.text.trim();
 
     if (ip.isEmpty || port == null || port <= 0 || port > 65535) {
       NeuToast.warning(context, '请输入有效的目标 IP 与端口（1–65535）');
       return;
     }
+    if (!RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(fingerprint)) {
+      NeuToast.warning(context, '请从对方设备复制 32 位十六进制指纹');
+      return;
+    }
+    final address = '$ip#$fingerprint';
     if (pin.isEmpty) {
-      await _submitInteractiveRequest();
+      await _submitInteractiveRequest(address, port);
       return;
     }
     if (!RegExp(r'^\d{6}$').hasMatch(pin)) {
@@ -689,7 +611,7 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     setState(() => _pairing = true);
     try {
       final pairedId = await widget.bridge.pairWithPin(
-        ip: ip,
+        ip: address,
         port: port,
         pin: pin,
       );
@@ -707,6 +629,7 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
     final info = _localInfo;
+    final localFingerprint = Uri.tryParse(info?.pairingQrUri ?? '')?.queryParameters['fp'];
 
     return NeuDialog(
       title: '配对新设备',
@@ -792,6 +715,17 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
                       ),
                     ],
                   ),
+                if (localFingerprint != null)
+                  NeuButton(
+                    label: '复制本机指纹',
+                    icon: Icons.fingerprint,
+                    onPressed: () async {
+                      await Clipboard.setData(ClipboardData(text: localFingerprint));
+                      if (context.mounted) {
+                        NeuToast.success(context, '已复制本机指纹');
+                      }
+                    },
+                  ),
               ],
             ),
           ),
@@ -820,6 +754,13 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 12),
+          NeuInsetField(
+            controller: _fingerprintController,
+            label: '对端设备指纹',
+            hint: '从对方设备的配对信息复制',
+            prefixIcon: Icons.fingerprint,
           ),
           const SizedBox(height: 12),
           NeuInsetField(
