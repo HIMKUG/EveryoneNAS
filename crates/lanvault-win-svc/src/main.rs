@@ -173,36 +173,34 @@ mod win_scm {
             .collect();
 
         let mut updated_count = 0usize;
-        for vault in db.list_vaults()? {
-            for vol in db.list_vault_volumes(&vault.vault_id)? {
-                let Some(guid) = vol.volume_guid.as_deref() else {
-                    continue;
-                };
-                match guid_to_mount.get(guid) {
-                    Some(current_root) => {
-                        let resolved = rebind_mount_path(&vol.mount_path, current_root);
-                        if resolved != vol.mount_path || !vol.is_online {
-                            db.update_volume_mount_path(&vol.volume_id, &resolved, true)?;
-                            info!(
-                                volume_id = %vol.volume_id,
-                                guid = %guid,
-                                old_path = %vol.mount_path,
-                                new_path = %resolved,
-                                "healed Windows volume mount path from Volume GUID"
-                            );
-                            updated_count += 1;
-                        }
+        for vol in db.list_all_volumes()? {
+            let Some(guid) = vol.volume_guid.as_deref() else {
+                continue;
+            };
+            match guid_to_mount.get(guid) {
+                Some(current_root) => {
+                    let resolved = rebind_mount_path(&vol.mount_path, current_root);
+                    if resolved != vol.mount_path || !vol.is_online {
+                        db.update_volume_mount_path(&vol.volume_id, &resolved, true)?;
+                        info!(
+                            volume_id = %vol.volume_id,
+                            guid = %guid,
+                            old_path = %vol.mount_path,
+                            new_path = %resolved,
+                            "healed Windows volume mount path from Volume GUID"
+                        );
+                        updated_count += 1;
                     }
-                    None => {
-                        if vol.is_online {
-                            db.update_volume_mount_path(&vol.volume_id, &vol.mount_path, false)?;
-                            warn!(
-                                volume_id = %vol.volume_id,
-                                guid = %guid,
-                                "marked missing Windows volume offline"
-                            );
-                            updated_count += 1;
-                        }
+                }
+                None => {
+                    if vol.is_online {
+                        db.update_volume_mount_path(&vol.volume_id, &vol.mount_path, false)?;
+                        warn!(
+                            volume_id = %vol.volume_id,
+                            guid = %guid,
+                            "marked missing Windows volume offline"
+                        );
+                        updated_count += 1;
                     }
                 }
             }
@@ -221,19 +219,17 @@ mod win_scm {
         }
         let db = Database::open(db_path)
             .with_context(|| format!("failed to open index.db at {}", db_path.display()))?;
-        for vault in db.list_vaults()? {
-            for volume in db.list_vault_volumes(&vault.vault_id)? {
-                if volume.volume_guid.is_some() {
-                    continue;
-                }
-                let guid = volume_guid::guid_for_mount_path(Path::new(&volume.mount_path))?;
-                db.update_volume_guid(&volume.volume_id, &guid)?;
-                info!(
-                    volume_id = %volume.volume_id,
-                    guid = %guid,
-                    "backfilled missing Windows Volume GUID"
-                );
+        for volume in db.list_all_volumes()? {
+            if volume.volume_guid.is_some() {
+                continue;
             }
+            let guid = volume_guid::guid_for_mount_path(Path::new(&volume.mount_path))?;
+            db.update_volume_guid(&volume.volume_id, &guid)?;
+            info!(
+                volume_id = %volume.volume_id,
+                guid = %guid,
+                "backfilled missing Windows Volume GUID"
+            );
         }
         Ok(())
     }

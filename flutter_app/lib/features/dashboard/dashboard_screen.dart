@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:material_ui/material_ui.dart';
 
@@ -8,9 +9,10 @@ import '../../bridge/system_env_helper.dart';
 import '../../theme/neu_theme.dart';
 import '../../theme/neu_toast.dart';
 
-/// 1. 总览页：
-/// 还原设计稿顶行 3 张 KPI 卡（系统健康绿盾牌卡、在线设备、已用空间）与
-/// 下方左右双栏（左：存储使用环形图与存储池分项；右：最近活动流与服务端快捷控制）。
+/// 总览页（重构版）：
+/// - 唯一重心：一眼确认系统是否正常、空间剩多少、最近发生了什么。
+/// - 彻底移除“最近活动”底部的重启/停止服务端/电池白名单堆砌按钮与截断的 Level 0/虚拟 IP 条。
+/// - 在线设备数与 pairedPeersNotifier 实时对齐，时间戳格式化为可读时间。
 class DashboardScreen extends StatefulWidget {
   const DashboardScreen({
     super.key,
@@ -18,457 +20,298 @@ class DashboardScreen extends StatefulWidget {
     this.onOpenSnapshots,
     this.onOpenVault,
     this.onOpenPairing,
+    this.onOpenSettings,
   });
 
   final LanVaultBridge bridge;
   final VoidCallback? onOpenSnapshots;
   final VoidCallback? onOpenVault;
   final VoidCallback? onOpenPairing;
+  final VoidCallback? onOpenSettings;
 
   @override
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
 class _DashboardScreenState extends State<DashboardScreen> {
-  static const Duration _syncErrorToastCooldown = Duration(seconds: 15);
-  static const List<Color> _vaultLegendColors = <Color>[
-    NeuTokens.accent,
-    NeuTokens.chartSky,
-    NeuTokens.chartIndigo,
-    NeuTokens.healthy,
-  ];
-
   SystemOverviewModel? _overview;
   List<VaultSummaryModel> _vaults = const <VaultSummaryModel>[];
-  KeepAliveLevel? _keepAliveLevel;
-  SyncProgressEvent? _latestSync;
+  SyncProgressEvent? _lastSync;
   StreamSubscription<SyncProgressEvent>? _syncSub;
-  DateTime? _lastSyncErrorToastAt;
-
+  Timer? _pollTimer;
   bool _loading = true;
-  bool _restarting = false;
-  bool _stopping = false;
+  bool _refreshing = false;
+  bool _batteryBannerDismissed = false;
 
   @override
   void initState() {
     super.initState();
-    widget.bridge.roleModeNotifier.addListener(_handleRoleModeChanged);
-    widget.bridge.serverStateVersion.addListener(_handleRoleModeChanged);
-    _refreshAll();
-    _subscribeTelemetry();
-  }
-
-  @override
-  void didUpdateWidget(covariant DashboardScreen oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.bridge != widget.bridge) {
-      oldWidget.bridge.roleModeNotifier.removeListener(_handleRoleModeChanged);
-      oldWidget.bridge.serverStateVersion.removeListener(_handleRoleModeChanged);
-      widget.bridge.roleModeNotifier.addListener(_handleRoleModeChanged);
-      widget.bridge.serverStateVersion.addListener(_handleRoleModeChanged);
-      _syncSub?.cancel();
-      _subscribeTelemetry();
-      _refreshAll();
-    }
+    _syncSub = widget.bridge.subscribeSyncProgress().listen((event) {
+      if (!mounted) return;
+      setState(() => _lastSync = event);
+    });
+    widget.bridge.serverStateVersion.addListener(_onExternalStateChange);
+    unawaited(_refreshAll(silent: false));
+    _pollTimer = Timer.periodic(
+      const Duration(seconds: 6),
+      (_) => unawaited(_refreshAll(silent: true)),
+    );
   }
 
   @override
   void dispose() {
-    widget.bridge.roleModeNotifier.removeListener(_handleRoleModeChanged);
-    widget.bridge.serverStateVersion.removeListener(_handleRoleModeChanged);
+    _pollTimer?.cancel();
     _syncSub?.cancel();
+    widget.bridge.serverStateVersion.removeListener(_onExternalStateChange);
     super.dispose();
   }
 
-  void _handleRoleModeChanged() {
+  void _onExternalStateChange() {
     if (!mounted) return;
-    _refreshAll();
+    unawaited(_refreshAll(silent: true));
   }
 
-  Future<void> _refreshAll() async {
-    setState(() => _loading = true);
+  Future<void> _refreshAll({required bool silent}) async {
+    if (_refreshing) return;
+    _refreshing = true;
+    if (!silent && mounted) setState(() => _loading = true);
     try {
       final results = await Future.wait<Object>(<Future<Object>>[
         widget.bridge.getSystemOverview(),
         widget.bridge.listVaults(),
-        widget.bridge.getRoleMode(),
-        widget.bridge.getAutoReconnect(),
       ]);
-      final overview = results[0] as SystemOverviewModel;
-      final vaults = results[1] as List<VaultSummaryModel>;
-      final mode = results[2] as RoleMode;
-
-      KeepAliveLevel? level;
-      if (mode.hasServer) {
-        level = await widget.bridge.detectKeepAliveLevel();
-      }
       if (!mounted) return;
       setState(() {
-        _overview = overview;
-        _vaults = vaults;
-        _keepAliveLevel = level;
+        _overview = results[0] as SystemOverviewModel;
+        _vaults = results[1] as List<VaultSummaryModel>;
         _loading = false;
       });
     } catch (err) {
       if (!mounted) return;
       setState(() => _loading = false);
-      NeuToast.error(context, '加载系统总览失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  void _subscribeTelemetry() {
-    try {
-      _syncSub = widget.bridge.subscribeSyncProgress().listen(
-        (event) {
-          if (!mounted) return;
-          setState(() => _latestSync = event);
-        },
-        onError: (Object err) {
-          if (!mounted) return;
-          final now = DateTime.now();
-          if (_lastSyncErrorToastAt == null ||
-              now.difference(_lastSyncErrorToastAt!) >=
-                  _syncErrorToastCooldown) {
-            _lastSyncErrorToastAt = now;
-            NeuToast.error(context, '同步状态更新中断：${LanVaultBridge.formatUserError(err)}');
-          }
-        },
-      );
-    } catch (err) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (mounted) {
-          NeuToast.error(context, '未连接到本地引擎：${LanVaultBridge.formatUserError(err)}');
-        }
-      });
-    }
-  }
-
-  Future<void> _handleGracefulRestart() async {
-    setState(() => _restarting = true);
-    NeuToast.info(context, '正在安全重启服务，请稍候…');
-    try {
-      final ok = await widget.bridge.executeGracefulRestart();
-      await _refreshAll();
-      if (!mounted) return;
-      setState(() => _restarting = false);
-      if (ok) {
-        NeuToast.success(context, '服务端已完成重启');
-      } else {
-        NeuToast.warning(context, '重启指令已下发，但守护进程尚未就绪');
+      if (!silent) {
+        NeuToast.error(context, LanVaultBridge.formatUserError(err));
       }
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _restarting = false);
-      NeuToast.error(context, '重启失败：${LanVaultBridge.formatUserError(err)}');
+    } finally {
+      _refreshing = false;
     }
   }
 
-  Future<void> _handleStopServer() async {
-    setState(() => _stopping = true);
-    try {
-      final stopped = await widget.bridge.stopLocalServer();
-      await _refreshAll();
-      if (!mounted) return;
-      setState(() => _stopping = false);
-      if (stopped) {
-        NeuToast.success(context, '本地服务端已停止');
-      } else {
-        NeuToast.warning(context, '未能停止本地服务端，请检查守护进程状态');
-      }
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _stopping = false);
-      NeuToast.error(context, '停止服务端失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _requestAndroidBatteryExemption() async {
+  Future<void> _requestBatteryWhitelist() async {
     try {
       final granted = await widget.bridge.requestBatteryExemption();
       if (!mounted) return;
       if (granted) {
-        NeuToast.success(context, '已获得电池优化豁免');
+        setState(() => _batteryBannerDismissed = true);
+        NeuToast.success(context, '已开启后台电池白名单');
       } else {
-        NeuToast.info(context, '请在系统设置中允许后台无限制运行');
+        NeuToast.info(context, '请在系统设置中允许 EveryoneNAS 后台无限制运行');
       }
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '请求电池优化豁免失败：${LanVaultBridge.formatUserError(err)}');
+      NeuToast.error(context, LanVaultBridge.formatUserError(err));
     }
   }
 
-  (String title, String subtitle, Color accent, Color softBg, IconData icon)
-      _resolveHealthVisual(SystemOverviewModel? overview) {
-    if (overview == null) {
-      return (
-        _loading ? '正在检测…' : '等待连接',
-        '正在读取本地引擎状态',
-        NeuTokens.textSecondary,
-        NeuTokens.insetSurface,
-        Icons.shield_outlined,
-      );
-    }
-    if (!overview.serverRunning) {
-      return (
-        '服务未启动',
-        '前往“存储”页启动本机存储服务',
-        NeuTokens.textSecondary,
-        NeuTokens.insetSurface,
-        Icons.shield_outlined,
-      );
-    }
-    final portSuffix =
-        overview.serverPort != null ? ' · 端口 :${overview.serverPort}' : '';
-    return switch (overview.bitRotHealth) {
-      BitRotHealth.healthy => (
-          '系统正常',
-          '所有服务运行正常$portSuffix',
-          NeuTokens.healthy,
-          NeuTokens.healthySoft,
-          Icons.verified_user_rounded,
-        ),
-      BitRotHealth.degraded => (
-          '状态降级',
-          '部分卷处于降级状态$portSuffix',
-          NeuTokens.warning,
-          NeuTokens.folderGoldSoft,
-          Icons.gpp_maybe_rounded,
-        ),
-      BitRotHealth.corrupted => (
-          '发现损坏块',
-          '检测到 ${overview.corruptedChunks} 个异常数据块，建议立即校验修复',
-          NeuTokens.danger,
-          NeuTokens.dangerSoft,
-          Icons.gpp_bad_rounded,
-        ),
-      BitRotHealth.unknown => (
-          '系统正常',
-          '服务端运行中$portSuffix · 尚待首次巡检',
-          NeuTokens.healthy,
-          NeuTokens.healthySoft,
-          Icons.verified_user_rounded,
-        ),
-    };
-  }
-
-  (IconData, Color, Color) _activityVisual(String kind) {
-    return switch (kind.toLowerCase()) {
-      'backup' || 'sync' => (
-          Icons.check_circle_rounded,
-          NeuTokens.healthy,
-          NeuTokens.healthySoft,
-        ),
-      'device' || 'pairing' => (
-          Icons.devices_rounded,
-          NeuTokens.accent,
-          NeuTokens.accentSoft,
-        ),
-      'scrub' || 'verify' => (
-          Icons.fact_check_rounded,
-          NeuTokens.chartIndigo,
-          NeuTokens.chartIndigoSoft,
-        ),
-      'error' || 'warning' => (
-          Icons.warning_amber_rounded,
-          NeuTokens.warning,
-          NeuTokens.folderGoldSoft,
-        ),
-      _ => (
-          Icons.bolt_rounded,
-          NeuTokens.accent,
-          NeuTokens.accentSoft,
-        ),
-    };
+  bool _isSyncActive(SyncProgressEvent? sync) {
+    if (sync == null) return false;
+    final st = sync.status.toLowerCase();
+    return st.contains('running') ||
+        st.contains('uploading') ||
+        st.contains('syncing');
   }
 
   @override
   Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    final isWide = MediaQuery.sizeOf(context).width >= 840;
-    final overview = _overview;
-    final sync = _latestSync;
-    final isSyncActive = sync != null &&
-        sync.status.isNotEmpty &&
-        sync.status.toLowerCase() != 'idle' &&
-        sync.status.toLowerCase() != 'up_to_date';
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
 
-    return ValueListenableBuilder<RoleMode>(
-      valueListenable: widget.bridge.roleModeNotifier,
-      builder: (context, roleMode, _) {
-        return SingleChildScrollView(
-          padding: EdgeInsets.all(isWide ? NeuSpace.lg : NeuSpace.md),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[
-              if (isWide) ...<Widget>[
-                Row(
-                  children: <Widget>[
-                    Expanded(
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: <Widget>[
-                          Text('总览', style: textTheme.headlineSmall),
-                          const SizedBox(height: 4),
-                          Text(
-                            '欢迎回来，数据正在安全守护中',
-                            style: textTheme.bodySmall,
-                          ),
-                        ],
+    return ValueListenableBuilder<List<PairedPeerModel>>(
+      valueListenable: widget.bridge.pairedPeersNotifier,
+      builder: (context, pairedPeers, _) {
+        final overview = _overview;
+        final liveOnlineCount = math.max(
+          overview?.onlinePeerCount ?? 0,
+          pairedPeers.where((p) => p.online).length,
+        );
+        final totalPeers = math.max(
+          overview?.pairedPeerCount ?? 0,
+          pairedPeers.length,
+        );
+
+        return RefreshIndicator(
+          onRefresh: () => _refreshAll(silent: false),
+          child: SingleChildScrollView(
+            physics: const AlwaysScrollableScrollPhysics(),
+            padding: EdgeInsets.all(isWide ? NeuSpace.lg : NeuSpace.md),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                if (isWide) ...<Widget>[
+                  Row(
+                    children: <Widget>[
+                      Text(
+                        '总览',
+                        style: Theme.of(context)
+                            .textTheme
+                            .headlineSmall
+                            ?.copyWith(fontWeight: FontWeight.w800),
                       ),
-                    ),
-                    NeuStatusBadge(
-                      label: roleMode.label,
-                      tone: NeuStatusTone.accent,
-                    ),
-                    const SizedBox(width: NeuSpace.sm),
-                    NeuButton(
-                      label: '刷新',
-                      icon: Icons.refresh_rounded,
-                      loading: _loading,
-                      onPressed: _refreshAll,
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 20),
-              ],
-              if (isWide) ...<Widget>[
-                _buildKpiRow(context, isWide, overview),
-                if (isSyncActive) ...<Widget>[
+                      const Spacer(),
+                      NeuButton(
+                        label: '刷新',
+                        icon: Icons.refresh_rounded,
+                        loading: _loading && overview != null,
+                        onPressed: () => _refreshAll(silent: false),
+                      ),
+                    ],
+                  ),
                   const SizedBox(height: NeuSpace.md),
-                  _buildLiveSyncBanner(context, sync),
+                ],
+                if (Platform.isAndroid &&
+                    !_batteryBannerDismissed &&
+                    (overview?.serverRunning ?? false)) ...<Widget>[
+                  _buildAndroidKeepAliveTip(context),
+                  const SizedBox(height: NeuSpace.md),
+                ],
+                if (isWide)
+                  _buildDesktopKpiRow(
+                    context,
+                    overview: overview,
+                    onlineCount: liveOnlineCount,
+                    totalPeers: totalPeers,
+                  )
+                else
+                  _buildMobileStatusSummary(
+                    context,
+                    overview: overview,
+                    onlineCount: liveOnlineCount,
+                    totalPeers: totalPeers,
+                  ),
+                if (_isSyncActive(_lastSync)) ...<Widget>[
+                  const SizedBox(height: NeuSpace.md),
+                  _buildActiveSyncBanner(context, _lastSync!),
                 ],
                 const SizedBox(height: NeuSpace.md),
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Expanded(
-                      flex: 11,
-                      child: _buildStorageUsageCard(context, overview),
-                    ),
-                    const SizedBox(width: NeuSpace.md),
-                    Expanded(
-                      flex: 10,
-                      child: _buildRecentActivitiesCard(
-                        context,
-                        overview,
-                        roleMode,
+                if (isWide)
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      Expanded(
+                        flex: 5,
+                        child: _buildStorageCard(context, overview),
                       ),
-                    ),
-                  ],
-                ),
-              ] else ...<Widget>[
-                _buildHealthCard(context, overview),
-                if (isSyncActive) ...<Widget>[
-                  const SizedBox(height: 12),
-                  _buildLiveSyncBanner(context, sync),
+                      const SizedBox(width: NeuSpace.md),
+                      Expanded(
+                        flex: 6,
+                        child: _buildRecentActivityCard(context, overview),
+                      ),
+                    ],
+                  )
+                else ...<Widget>[
+                  _buildStorageCard(context, overview),
+                  const SizedBox(height: NeuSpace.md),
+                  _buildDataHealthRow(context, overview),
+                  const SizedBox(height: NeuSpace.md),
+                  _buildRecentActivityCard(context, overview),
                 ],
-                const SizedBox(height: 12),
-                _buildStorageUsageCard(context, overview),
-                const SizedBox(height: 12),
-                _buildMobileCompactKpiRow(context, overview),
-                const SizedBox(height: 12),
-                _buildMobileDataHealthCard(context, overview),
-                const SizedBox(height: 12),
-                _buildRecentActivitiesCard(context, overview, roleMode),
               ],
-            ],
+            ),
           ),
         );
       },
     );
   }
 
-  Widget _buildHealthCard(
-    BuildContext context,
-    SystemOverviewModel? overview,
-  ) {
-    final (healthTitle, healthSub, healthColor, healthBg, healthIcon) =
-        _resolveHealthVisual(overview);
+  Widget _buildAndroidKeepAliveTip(BuildContext context) {
     return NeuCard(
-      onTap: (overview != null && !overview.serverRunning)
-          ? widget.onOpenVault
-          : widget.onOpenSnapshots,
-      backgroundColor: healthBg,
-      borderColor: healthColor.withValues(alpha: 0.22),
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      backgroundColor: NeuTokens.accentSoft,
+      borderColor: NeuTokens.accent.withValues(alpha: 0.2),
       child: Row(
         children: <Widget>[
-          Container(
-            width: 44,
-            height: 44,
-            decoration: BoxDecoration(
-              color: healthColor.withValues(alpha: 0.14),
-              borderRadius: const BorderRadius.all(Radius.circular(14)),
-            ),
-            child: Icon(healthIcon, size: 26, color: healthColor),
+          const Icon(
+            Icons.battery_saver_rounded,
+            size: 18,
+            color: NeuTokens.accent,
           ),
-          const SizedBox(width: 14),
+          const SizedBox(width: 10),
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text(
-                  healthTitle,
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        fontSize: 17,
-                        fontWeight: FontWeight.w700,
-                      ),
-                ),
-                const SizedBox(height: 3),
-                Text(
-                  healthSub,
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ],
+            child: Text(
+              '开启电池白名单可防止锁屏后后台服务休眠',
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                    color: NeuTokens.textPrimary,
+                  ),
             ),
+          ),
+          TextButton(
+            onPressed: _requestBatteryWhitelist,
+            child: const Text('去开启'),
+          ),
+          IconButton(
+            tooltip: '关闭提示',
+            icon: const Icon(Icons.close_rounded, size: 16),
+            visualDensity: VisualDensity.compact,
+            onPressed: () => setState(() => _batteryBannerDismissed = true),
           ),
         ],
       ),
     );
   }
 
-  Widget _buildMobileCompactKpiRow(
-    BuildContext context,
-    SystemOverviewModel? overview,
-  ) {
+  Widget _buildDesktopKpiRow(
+    BuildContext context, {
+    required SystemOverviewModel? overview,
+    required int onlineCount,
+    required int totalPeers,
+  }) {
+    final running = overview?.serverRunning ?? false;
+    final portText = overview?.serverPort != null
+        ? '端口 :${overview!.serverPort}'
+        : '等待启动';
+    final lanIp = overview?.lanIp ?? '';
+    final showIp = lanIp.isNotEmpty &&
+        !lanIp.startsWith('198.18.') &&
+        !lanIp.startsWith('172.19.');
+
     return Row(
       children: <Widget>[
         Expanded(
           child: NeuCard(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+            padding: const EdgeInsets.all(18),
+            backgroundColor: running ? NeuTokens.healthySoft : NeuTokens.surface,
+            borderColor: running
+                ? NeuTokens.healthy.withValues(alpha: 0.25)
+                : NeuTokens.hairlineBorder,
+            onTap: widget.onOpenSettings,
             child: Row(
               children: <Widget>[
-                Container(
-                  width: 36,
-                  height: 36,
-                  decoration: const BoxDecoration(
-                    color: NeuTokens.accentSoft,
-                    borderRadius: BorderRadius.all(Radius.circular(10)),
-                  ),
-                  child: const Icon(
-                    Icons.devices_rounded,
-                    size: 19,
-                    color: NeuTokens.accent,
-                  ),
+                NeuIconBadge(
+                  icon: running
+                      ? Icons.verified_user_rounded
+                      : Icons.pause_circle_outline_rounded,
+                  color: running ? NeuTokens.healthy : NeuTokens.warning,
+                  backgroundColor: running
+                      ? NeuTokens.healthy.withValues(alpha: 0.14)
+                      : NeuTokens.folderGoldSoft,
+                  size: 44,
+                  iconSize: 22,
                 ),
-                const SizedBox(width: 10),
+                const SizedBox(width: 14),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
                       Text(
-                        '${overview?.onlinePeerCount ?? 0}',
-                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                        running ? '系统正常' : '本地服务未启动',
+                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
                               fontWeight: FontWeight.w700,
-                              fontFeatures: const <FontFeature>[
-                                FontFeature.tabularFigures(),
-                              ],
                             ),
                       ),
+                      const SizedBox(height: 3),
                       Text(
-                        '在线设备',
+                        showIp ? '$portText · $lanIp' : portText,
+                        maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
@@ -479,42 +322,73 @@ class _DashboardScreenState extends State<DashboardScreen> {
             ),
           ),
         ),
-        const SizedBox(width: 12),
+        const SizedBox(width: NeuSpace.md),
         Expanded(
           child: NeuCard(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+            padding: const EdgeInsets.all(18),
+            onTap: widget.onOpenPairing,
             child: Row(
               children: <Widget>[
-                Container(
-                  width: 36,
-                  height: 36,
-                  decoration: const BoxDecoration(
-                    color: NeuTokens.accentSoft,
-                    borderRadius: BorderRadius.all(Radius.circular(10)),
-                  ),
-                  child: const Icon(
-                    Icons.cloud_sync_rounded,
-                    size: 19,
-                    color: NeuTokens.accent,
-                  ),
+                const NeuIconBadge(
+                  icon: Icons.devices_rounded,
+                  color: NeuTokens.accent,
+                  backgroundColor: NeuTokens.accentSoft,
+                  size: 44,
+                  iconSize: 22,
                 ),
-                const SizedBox(width: 10),
+                const SizedBox(width: 14),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
                       Text(
-                        '${overview?.syncRuleCount ?? 0}',
-                        style: Theme.of(context).textTheme.titleLarge?.copyWith(
-                              fontWeight: FontWeight.w700,
-                              fontFeatures: const <FontFeature>[
-                                FontFeature.tabularFigures(),
-                              ],
-                            ),
+                        '$onlineCount',
+                        style:
+                            Theme.of(context).textTheme.headlineSmall?.copyWith(
+                                  fontWeight: FontWeight.w800,
+                                ),
                       ),
                       Text(
-                        '备份任务',
-                        overflow: TextOverflow.ellipsis,
+                        '在线设备 · 共 $totalPeers 台',
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(width: NeuSpace.md),
+        Expanded(
+          child: NeuCard(
+            padding: const EdgeInsets.all(18),
+            onTap: widget.onOpenSnapshots,
+            child: Row(
+              children: <Widget>[
+                const NeuIconBadge(
+                  icon: Icons.cloud_done_rounded,
+                  color: NeuTokens.chartIndigo,
+                  backgroundColor: NeuTokens.chartIndigoSoft,
+                  size: 44,
+                  iconSize: 22,
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: <Widget>[
+                      Text(
+                        SystemEnvHelper.formatBytes(
+                          overview?.vaultUsedBytes ?? 0,
+                        ),
+                        style:
+                            Theme.of(context).textTheme.headlineSmall?.copyWith(
+                                  fontWeight: FontWeight.w800,
+                                ),
+                      ),
+                      Text(
+                        '已保护 · ${overview?.syncRuleCount ?? 0} 个备份任务',
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
                     ],
@@ -528,192 +402,158 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  Widget _buildMobileDataHealthCard(
-    BuildContext context,
-    SystemOverviewModel? overview,
-  ) {
-    final (_, _, healthColor, healthBg, _) = _resolveHealthVisual(overview);
-    final summary = overview == null
-        ? '点击查看快照与完整性校验'
-        : (overview.corruptedChunks > 0
-            ? '检测到 ${overview.corruptedChunks} 个异常块 · 点击修复'
-            : '最近巡检正常 · 点击进入快照与校验');
-    return NeuCard(
-      onTap: widget.onOpenSnapshots,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        child: Row(
-          children: <Widget>[
-            Container(
-              width: 38,
-              height: 38,
-              decoration: BoxDecoration(
-                color: healthBg,
-                borderRadius: const BorderRadius.all(Radius.circular(10)),
-              ),
-              child: Icon(
-                Icons.health_and_safety_rounded,
-                size: 20,
-                color: healthColor,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Text('数据健康', style: Theme.of(context).textTheme.titleSmall),
-                  const SizedBox(height: 2),
-                  Text(
-                    summary,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                ],
-              ),
-            ),
-            const Icon(
-              Icons.chevron_right_rounded,
-              color: NeuTokens.textSecondary,
-            ),
-          ],
-        ),
-      );
-  }
-
-  Widget _buildKpiRow(
-    BuildContext context,
-    bool isWide,
-    SystemOverviewModel? overview,
-  ) {
-    final healthCard = _buildHealthCard(context, overview);
-    final devicesCard = NeuCard(
-      onTap: widget.onOpenPairing,
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
-      child: Row(
-        children: <Widget>[
-          Container(
-            width: 42,
-            height: 42,
-            decoration: const BoxDecoration(
-              color: NeuTokens.accentSoft,
-              borderRadius: BorderRadius.all(Radius.circular(12)),
-            ),
-            child: const Icon(
-              Icons.devices_rounded,
-              size: 22,
-              color: NeuTokens.accent,
-            ),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text(
-                  '${overview?.onlinePeerCount ?? 0}',
-                  style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                        fontSize: 22,
-                        fontFeatures: const <FontFeature>[
-                          FontFeature.tabularFigures(),
-                        ],
-                      ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  '在线设备 · 共 ${overview?.pairedPeerCount ?? 0} 台',
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-
-    final spaceCard = NeuCard(
-      onTap: widget.onOpenVault,
-      padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
-      child: Row(
-        children: <Widget>[
-          Container(
-            width: 42,
-            height: 42,
-            decoration: const BoxDecoration(
-              color: NeuTokens.accentSoft,
-              borderRadius: BorderRadius.all(Radius.circular(12)),
-            ),
-            child: const Icon(
-              Icons.layers_rounded,
-              size: 22,
-              color: NeuTokens.accent,
-            ),
-          ),
-          const SizedBox(width: 14),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text(
-                  SystemEnvHelper.formatBytes(overview?.vaultUsedBytes ?? 0),
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                        fontSize: 22,
-                        fontFeatures: const <FontFeature>[
-                          FontFeature.tabularFigures(),
-                        ],
-                      ),
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  '已用空间 · ${overview?.syncRuleCount ?? 0} 个备份任务',
-                  overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-
-    if (isWide) {
-      return Row(
-        children: <Widget>[
-          Expanded(flex: 12, child: healthCard),
-          const SizedBox(width: NeuSpace.md),
-          Expanded(flex: 9, child: devicesCard),
-          const SizedBox(width: NeuSpace.md),
-          Expanded(flex: 10, child: spaceCard),
-        ],
-      );
-    }
+  Widget _buildMobileStatusSummary(
+    BuildContext context, {
+    required SystemOverviewModel? overview,
+    required int onlineCount,
+    required int totalPeers,
+  }) {
+    final running = overview?.serverRunning ?? false;
+    final portText = overview?.serverPort != null
+        ? '端口 :${overview!.serverPort}'
+        : '点击进入设置启动';
 
     return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
-        healthCard,
-        const SizedBox(height: 12),
+        NeuCard(
+          padding: const EdgeInsets.all(16),
+          backgroundColor: running ? NeuTokens.healthySoft : NeuTokens.surface,
+          borderColor: running
+              ? NeuTokens.healthy.withValues(alpha: 0.25)
+              : NeuTokens.hairlineBorder,
+          onTap: widget.onOpenSettings,
+          child: Row(
+            children: <Widget>[
+              NeuIconBadge(
+                icon: running
+                    ? Icons.verified_user_rounded
+                    : Icons.pause_circle_outline_rounded,
+                color: running ? NeuTokens.healthy : NeuTokens.warning,
+                backgroundColor: running
+                    ? NeuTokens.healthy.withValues(alpha: 0.14)
+                    : NeuTokens.folderGoldSoft,
+                size: 42,
+                iconSize: 21,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      running ? '系统正常' : '本地服务未启动',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w700,
+                          ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      running ? '所有服务运行正常 · $portText' : portText,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: NeuSpace.sm + 4),
         Row(
           children: <Widget>[
-            Expanded(child: devicesCard),
-            const SizedBox(width: 12),
-            Expanded(child: spaceCard),
+            Expanded(
+              child: NeuCard(
+                padding: const EdgeInsets.all(14),
+                onTap: widget.onOpenPairing,
+                child: Row(
+                  children: <Widget>[
+                    const NeuIconBadge(
+                      icon: Icons.devices_rounded,
+                      color: NeuTokens.accent,
+                      backgroundColor: NeuTokens.accentSoft,
+                      size: 36,
+                      iconSize: 18,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Text(
+                            '$onlineCount / $totalPeers',
+                            style: Theme.of(context)
+                                .textTheme
+                                .titleMedium
+                                ?.copyWith(fontWeight: FontWeight.w800),
+                          ),
+                          Text(
+                            '在线设备',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(width: NeuSpace.sm + 4),
+            Expanded(
+              child: NeuCard(
+                padding: const EdgeInsets.all(14),
+                onTap: widget.onOpenSnapshots,
+                child: Row(
+                  children: <Widget>[
+                    const NeuIconBadge(
+                      icon: Icons.cloud_sync_rounded,
+                      color: NeuTokens.chartIndigo,
+                      backgroundColor: NeuTokens.chartIndigoSoft,
+                      size: 36,
+                      iconSize: 18,
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Text(
+                            '${overview?.syncRuleCount ?? 0}',
+                            style: Theme.of(context)
+                                .textTheme
+                                .titleMedium
+                                ?.copyWith(fontWeight: FontWeight.w800),
+                          ),
+                          Text(
+                            '备份任务',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           ],
         ),
       ],
     );
   }
 
-  Widget _buildLiveSyncBanner(BuildContext context, SyncProgressEvent sync) {
-    final throughput = sync.throughputBps > 0
+  Widget _buildActiveSyncBanner(BuildContext context, SyncProgressEvent sync) {
+    final fileName = sync.filePath.isNotEmpty
+        ? SystemEnvHelper.folderDisplayName(sync.filePath)
+        : sync.ruleId;
+    final speed = sync.throughputBps > 0
         ? '${SystemEnvHelper.formatBytes(sync.throughputBps)}/s'
-        : '计算速率中';
+        : '同步中';
+    final ratio = sync.totalBytes > 0
+        ? (sync.bytesProcessed / sync.totalBytes).clamp(0.0, 1.0)
+        : 0.0;
+
     return NeuCard(
+      padding: const EdgeInsets.all(14),
       backgroundColor: NeuTokens.accentSoft,
       borderColor: NeuTokens.accent.withValues(alpha: 0.25),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
@@ -721,96 +561,75 @@ class _DashboardScreenState extends State<DashboardScreen> {
             children: <Widget>[
               const Icon(
                 Icons.sync_rounded,
-                size: 18,
+                size: 16,
                 color: NeuTokens.accent,
               ),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(
-                  '正在同步：${sync.filePath.isEmpty ? sync.ruleId : SystemEnvHelper.folderDisplayName(sync.filePath)}',
+                  '正在同步：$fileName',
+                  maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                  style: Theme.of(context).textTheme.labelLarge?.copyWith(
                         color: NeuTokens.accent,
+                        fontWeight: FontWeight.w600,
                       ),
                 ),
               ),
-              Text(
-                throughput,
-                style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                      color: NeuTokens.accent,
-                    ),
-              ),
+              const SizedBox(width: 8),
+              NeuStatusBadge(label: speed, tone: NeuStatusTone.accent),
             ],
           ),
-          const SizedBox(height: 8),
-          NeuProgressBar(
-            value: sync.progressRatio,
-            height: 7,
-            semanticLabel: '当前同步进度',
-          ),
+          const SizedBox(height: 10),
+          NeuProgressBar(value: ratio, height: 6, showPercentage: true),
         ],
       ),
     );
   }
 
-  Widget _buildStorageUsageCard(
+  Widget _buildStorageCard(
     BuildContext context,
     SystemOverviewModel? overview,
   ) {
-    final textTheme = Theme.of(context).textTheme;
-    final usedStr = SystemEnvHelper.formatBytes(overview?.vaultUsedBytes ?? 0);
-    final quotaStr =
-        SystemEnvHelper.formatBytes(overview?.vaultQuotaBytes ?? 0);
+    final used = overview?.vaultUsedBytes ?? 0;
+    final quota = overview?.vaultQuotaBytes ?? 0;
+    final ratio = quota > 0 ? (used / quota).clamp(0.0, 1.0) : 0.0;
+    final pct = (ratio * 100).round();
 
     return NeuCard(
       padding: const EdgeInsets.all(20),
+      onTap: widget.onOpenVault,
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: <Widget>[
-              Text('存储使用', style: textTheme.titleMedium),
+              Text('存储使用', style: Theme.of(context).textTheme.titleMedium),
               Text(
-                '$usedStr / $quotaStr',
-                style: textTheme.bodySmall?.copyWith(
-                  fontWeight: FontWeight.w600,
-                  fontFeatures: const <FontFeature>[
-                    FontFeature.tabularFigures(),
-                  ],
-                ),
+                '${SystemEnvHelper.formatBytes(used)} / ${SystemEnvHelper.formatBytes(quota)}',
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                      color: NeuTokens.textSecondary,
+                    ),
               ),
             ],
           ),
           const SizedBox(height: 18),
           Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
             children: <Widget>[
               StorageDonutRing(
-                ratio: overview?.storageRatio ?? 0.0,
-                size: 112,
+                ratio: ratio,
+                size: 108,
                 strokeWidth: 11,
-                centerLabel: '已使用',
               ),
-              const SizedBox(width: 22),
+              const SizedBox(width: 20),
               Expanded(
                 child: _vaults.isEmpty
-                    ? Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: <Widget>[
-                          Text(
-                            '暂无存储池',
-                            style: textTheme.titleSmall,
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            '前往“存储”页创建或挂载您的本地加密存储池。',
-                            style: textTheme.bodySmall,
-                          ),
-                        ],
+                    ? Text(
+                        '暂无存储池，点击前往新建存储池。',
+                        style: Theme.of(context).textTheme.bodySmall,
                       )
                     : Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: <Widget>[
                           for (var i = 0; i < _vaults.length; i++) ...<Widget>[
                             Row(
@@ -819,32 +638,28 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                   width: 8,
                                   height: 8,
                                   decoration: BoxDecoration(
-                                    color: _vaultLegendColors[
-                                        i % _vaultLegendColors.length],
                                     shape: BoxShape.circle,
+                                    color: i == 0
+                                        ? NeuTokens.accent
+                                        : NeuTokens.chartSky,
                                   ),
                                 ),
                                 const SizedBox(width: 8),
                                 Expanded(
                                   child: Text(
                                     _vaults[i].name,
+                                    maxLines: 1,
                                     overflow: TextOverflow.ellipsis,
-                                    style: textTheme.bodyMedium?.copyWith(
-                                      fontSize: 13.5,
-                                    ),
+                                    style:
+                                        Theme.of(context).textTheme.bodyMedium,
                                   ),
                                 ),
-                                const SizedBox(width: 8),
                                 Text(
                                   SystemEnvHelper.formatBytes(
                                     _vaults[i].usedBytes,
                                   ),
-                                  style: textTheme.labelMedium?.copyWith(
-                                    color: NeuTokens.textPrimary,
-                                    fontFeatures: const <FontFeature>[
-                                      FontFeature.tabularFigures(),
-                                    ],
-                                  ),
+                                  style:
+                                      Theme.of(context).textTheme.labelMedium,
                                 ),
                               ],
                             ),
@@ -856,54 +671,65 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ),
             ],
           ),
-          if (_keepAliveLevel != null) ...<Widget>[
-            const SizedBox(height: 18),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
-              decoration: BoxDecoration(
-                color: NeuTokens.insetSurface,
-                borderRadius: const BorderRadius.all(Radius.circular(10)),
-              ),
-              child: Row(
-                children: <Widget>[
-                  const Icon(
-                    Icons.memory_rounded,
-                    size: 16,
-                    color: NeuTokens.accent,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      '保活等级：${_keepAliveLevel!.displayLabel}',
-                      overflow: TextOverflow.ellipsis,
-                      style: textTheme.bodySmall?.copyWith(
-                        color: NeuTokens.textPrimary,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ),
-                  if (overview != null && overview.lanIp.isNotEmpty)
-                    Text(
-                      overview.lanIp,
-                      style: textTheme.labelMedium?.copyWith(
-                        color: NeuTokens.textSecondary,
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ],
         ],
       ),
     );
   }
 
-  Widget _buildRecentActivitiesCard(
+  Widget _buildDataHealthRow(
     BuildContext context,
     SystemOverviewModel? overview,
-    RoleMode roleMode,
   ) {
-    final textTheme = Theme.of(context).textTheme;
+    final corrupted = overview?.corruptedChunks ?? 0;
+    final healthy = corrupted == 0;
+
+    return NeuCard(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      onTap: widget.onOpenSnapshots,
+      child: Row(
+        children: <Widget>[
+          NeuIconBadge(
+            icon: healthy
+                ? Icons.health_and_safety_rounded
+                : Icons.warning_amber_rounded,
+            color: healthy ? NeuTokens.healthy : NeuTokens.warning,
+            backgroundColor:
+                healthy ? NeuTokens.healthySoft : NeuTokens.folderGoldSoft,
+            size: 38,
+            iconSize: 20,
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  '数据健康与历史版本',
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  healthy
+                      ? '最近检查正常 · 点击查看历史版本'
+                      : '检测到 $corrupted 个异常块 · 点击处理',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
+          const Icon(
+            Icons.chevron_right_rounded,
+            color: NeuTokens.textSecondary,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRecentActivityCard(
+    BuildContext context,
+    SystemOverviewModel? overview,
+  ) {
     final activities = overview?.recentActivities ?? const <RecentActivityModel>[];
 
     return NeuCard(
@@ -914,78 +740,64 @@ class _DashboardScreenState extends State<DashboardScreen> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: <Widget>[
-              Text('最近活动', style: textTheme.titleMedium),
+              Text('最近活动', style: Theme.of(context).textTheme.titleMedium),
               Text(
                 '${activities.length} 条记录',
-                style: textTheme.labelMedium,
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                      color: NeuTokens.textSecondary,
+                    ),
               ),
             ],
           ),
           const SizedBox(height: 14),
           if (activities.isEmpty)
-            Container(
-              width: double.infinity,
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 20),
-              decoration: BoxDecoration(
-                color: NeuTokens.insetSurface,
-                borderRadius: const BorderRadius.all(Radius.circular(12)),
-              ),
-              child: Text(
-                '暂无最近活动记录。开始备份、配对设备或执行完整性校验后将在此实时显示。',
-                style: textTheme.bodySmall,
-              ),
+            const NeuEmptyState(
+              icon: Icons.bolt_rounded,
+              title: '暂无最近活动',
+              subtitle: '开始备份、配对设备或校验数据后将在此显示。',
             )
           else
             for (var i = 0; i < activities.length; i++) ...<Widget>[
-              Builder(
-                builder: (context) {
-                  final item = activities[i];
-                  final (icon, fg, bg) = _activityVisual(item.kind);
-                  return Row(
-                    crossAxisAlignment: CrossAxisAlignment.center,
-                    children: <Widget>[
-                      Container(
-                        width: 32,
-                        height: 32,
-                        decoration: BoxDecoration(
-                          color: bg,
-                          borderRadius:
-                              const BorderRadius.all(Radius.circular(10)),
+              Row(
+                children: <Widget>[
+                  NeuIconBadge(
+                    icon: _iconForActivity(activities[i].kind),
+                    color: NeuTokens.accent,
+                    backgroundColor: NeuTokens.accentSoft,
+                    size: 36,
+                    iconSize: 18,
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(
+                          activities[i].title,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: Theme.of(context).textTheme.titleSmall,
                         ),
-                        child: Icon(icon, size: 17, color: fg),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: <Widget>[
-                            Text(
-                              item.title,
-                              overflow: TextOverflow.ellipsis,
-                              style: textTheme.titleSmall,
-                            ),
-                            if (item.detail.isNotEmpty)
-                              Text(
-                                item.detail,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: textTheme.bodySmall,
-                              ),
-                          ],
+                        if (activities[i].detail.isNotEmpty) ...<Widget>[
+                          const SizedBox(height: 2),
+                          Text(
+                            activities[i].detail,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    LanVaultBridge.formatRelativeTime(activities[i].timestamp),
+                    style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                          color: NeuTokens.textSecondary,
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        item.timestamp,
-                        style: textTheme.labelMedium?.copyWith(
-                          fontFeatures: const <FontFeature>[
-                            FontFeature.tabularFigures(),
-                          ],
-                        ),
-                      ),
-                    ],
-                  );
-                },
+                  ),
+                ],
               ),
               if (i < activities.length - 1)
                 const Padding(
@@ -993,40 +805,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   child: Divider(height: 1),
                 ),
             ],
-          if (roleMode.hasServer) ...<Widget>[
-            const SizedBox(height: 18),
-            const Divider(height: 1),
-            const SizedBox(height: 14),
-            Wrap(
-              spacing: NeuSpace.sm,
-              runSpacing: NeuSpace.sm,
-              children: <Widget>[
-                NeuButton(
-                  label: '重启服务端',
-                  icon: Icons.restart_alt_rounded,
-                  tone: NeuButtonTone.primary,
-                  loading: _restarting,
-                  onPressed: _handleGracefulRestart,
-                ),
-                NeuButton(
-                  label: '停止服务端',
-                  icon: Icons.stop_circle_outlined,
-                  tone: NeuButtonTone.danger,
-                  loading: _stopping,
-                  onPressed:
-                      overview?.serverRunning == true ? _handleStopServer : null,
-                ),
-                if (Platform.isAndroid)
-                  NeuButton(
-                    label: '电池白名单',
-                    icon: Icons.battery_saver_outlined,
-                    onPressed: _requestAndroidBatteryExemption,
-                  ),
-              ],
-            ),
-          ],
         ],
       ),
     );
+  }
+
+  IconData _iconForActivity(String kind) {
+    final lower = kind.toLowerCase();
+    if (lower.contains('pair') || lower.contains('device')) {
+      return Icons.devices_rounded;
+    }
+    if (lower.contains('scrub') || lower.contains('health')) {
+      return Icons.verified_user_outlined;
+    }
+    if (lower.contains('backup') || lower.contains('sync')) {
+      return Icons.cloud_done_outlined;
+    }
+    return Icons.history_rounded;
   }
 }

@@ -11,7 +11,6 @@
 //! └── staging/<uuid>.tmp
 //! ```
 
-use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -63,6 +62,10 @@ pub struct ChunkReplicaReport {
 /// Content-addressed multi-volume vault manager.
 pub struct VaultStore {
     db: Arc<Database>,
+    /// Serializes *metadata-destructive* operations only (heal overwrite, GC delete).
+    /// Ordinary chunk ingestion must never take this lock: the staging→`chunks/` rename
+    /// is atomic and idempotent per content hash, so concurrent uploads of different
+    /// chunks (or the same chunk) are safe and stay fully parallel.
     write_lock: Mutex<()>,
 }
 
@@ -120,25 +123,26 @@ impl VaultStore {
             ));
         }
 
-        let mut mount_paths = HashSet::new();
-        mount_paths.insert(normalized_mount_key(&primary_mount_path)?);
+        let mut mount_paths: Vec<PathBuf> = Vec::with_capacity(1 + extra_volumes.len());
+        let primary_key = normalized_mount_key(&primary_mount_path)?;
+        mount_paths.push(primary_key);
         for extra in &extra_volumes {
-            if !mount_paths.insert(normalized_mount_key(&extra.mount_path)?) {
+            let extra_key = normalized_mount_key(&extra.mount_path)?;
+            if mount_paths.iter().any(|existing| paths_overlap(existing, &extra_key)) {
                 return Err(LanVaultError::InvalidInput(
-                    "vault volumes must use distinct mount paths".to_string(),
+                    "vault volumes must use distinct, non-overlapping mount paths".to_string(),
                 ));
             }
+            mount_paths.push(extra_key);
         }
-        for existing_vault in self.db.list_vaults()? {
-            for existing in self.db.list_vault_volumes(&existing_vault.vault_id)? {
-                let existing_path = normalized_mount_key(&existing.mount_path)?;
-                for requested in &mount_paths {
-                    if paths_overlap(&existing_path, requested) {
-                        return Err(LanVaultError::InvalidInput(format!(
-                            "mount path overlaps existing volume {}",
-                            existing.mount_path
-                        )));
-                    }
+        for existing in self.db.list_all_volumes()? {
+            let existing_path = normalized_mount_key(&existing.mount_path)?;
+            for requested in &mount_paths {
+                if paths_overlap(&existing_path, requested) {
+                    return Err(LanVaultError::InvalidInput(format!(
+                        "mount path overlaps existing volume {}",
+                        existing.mount_path
+                    )));
                 }
             }
         }
@@ -200,7 +204,12 @@ impl VaultStore {
             write_vault_meta_atomic(Path::new(&vol.mount_path), &meta)?;
         }
 
-        self.db.insert_vault(&vault, &volumes)?;
+        if let Err(err) = self.db.insert_vault(&vault, &volumes) {
+            for vol in &volumes {
+                let _ = fs::remove_file(Path::new(&vol.mount_path).join("vault.meta.json"));
+            }
+            return Err(err);
+        }
         Ok((vault, volumes))
     }
 
@@ -215,6 +224,11 @@ impl VaultStore {
     ///
     /// Verifies the BLAKE3 hash of `stored_bytes` at the boundary and enforces quota limits.
     /// Returns `true` if a new chunk was stored, or `false` if deduplicated.
+    ///
+    /// Deliberately lock-free with respect to other uploads: the staging→`chunks/`
+    /// rename is atomic and content addressing makes concurrent writers idempotent.
+    /// Bit-Rot scrubbing is what re-verifies bytes on disk; the hot path only does an
+    /// O(1) `stat`, never a full re-read of a 1 MiB chunk per duplicate.
     pub fn put_chunk(
         &self,
         vault_id: &str,
@@ -222,15 +236,28 @@ impl VaultStore {
         raw_size: u64,
         stored_bytes: &[u8],
     ) -> Result<bool> {
+        self.put_chunk_with_compression(vault_id, expected_hash, raw_size, stored_bytes, "zstd")
+    }
+
+    pub fn put_chunk_with_compression(
+        &self,
+        vault_id: &str,
+        expected_hash: &[u8; 32],
+        raw_size: u64,
+        stored_bytes: &[u8],
+        compression: &str,
+    ) -> Result<bool> {
+        if !matches!(compression, "zstd" | "raw") {
+            return Err(LanVaultError::InvalidInput(format!(
+                "unsupported chunk compression: `{compression}`"
+            )));
+        }
         let mut _probe = lanvault_core::ProbeGuard::start(
             "server.vault",
             "vault.put_chunk",
             Some(format!("vault={vault_id}")),
         );
         _probe.add_bytes(stored_bytes.len() as u64);
-        let _guard = self.write_lock.lock().map_err(|_| {
-            LanVaultError::InvalidState("vault write lock poisoned".to_string())
-        })?;
         let actual_hash = blake3_hash(stored_bytes);
         if actual_hash != *expected_hash {
             return Err(LanVaultError::CorruptedChunk {
@@ -243,15 +270,29 @@ impl VaultStore {
             .get_vault(vault_id)?
             .ok_or_else(|| LanVaultError::NotFound(format!("vault {vault_id}")))?;
         let stored_size = stored_bytes.len() as u64;
+        let hash_hex = hex::encode(expected_hash);
+        let volumes = self.online_volumes(vault_id)?;
 
-        // Deduplicate only when the registered bytes can still be read and verified.
+        // Deduplicate on metadata only (hash + placement + a cheap size check), while verifying
+        // that the immutable compression metadata matches so retries never corrupt decode tags.
         let existing = self.db.get_chunk(vault_id, expected_hash)?;
         if let Some(existing) = existing.as_ref() {
+            let existing_comp = self.db.get_chunk_compression(vault_id, expected_hash);
+            if !existing_comp.eq_ignore_ascii_case(compression) {
+                return Err(LanVaultError::InvalidState(format!(
+                    "chunk compression conflict for {hash_hex}: stored as `{existing_comp}`, requested `{compression}`"
+                )));
+            }
             if existing.scrub_status == lanvault_core::ScrubStatus::Ok
-                && self.get_chunk(vault_id, expected_hash).is_ok()
+                && self.chunk_intact_on_pool(&vault, &volumes, &hash_hex, stored_size)
             {
-                self.db
-                    .upsert_chunk(vault_id, expected_hash, raw_size, stored_size)?;
+                self.db.upsert_chunk_with_compression(
+                    vault_id,
+                    expected_hash,
+                    raw_size,
+                    stored_size,
+                    compression,
+                )?;
                 return Ok(false);
             }
         }
@@ -263,9 +304,6 @@ impl VaultStore {
                 available,
             });
         }
-
-        let volumes = self.online_volumes(vault_id)?;
-        let hash_hex = hex::encode(expected_hash);
 
         match vault.pool_mode {
             PoolMode::Single => {
@@ -296,23 +334,28 @@ impl VaultStore {
             }
         }
 
-        let is_new = match self
-            .db
-            .upsert_chunk(vault_id, expected_hash, raw_size, stored_size)
+        let is_new = match self.db.upsert_chunk_with_quota_and_compression(
+            vault_id,
+            expected_hash,
+            raw_size,
+            stored_size,
+            compression,
+        )
         {
             Ok(is_new) => is_new,
             Err(err) => {
-                if existing.is_none() {
+                if existing.is_none()
+                    && self.db.get_chunk(vault_id, expected_hash).ok().flatten().is_none()
+                {
                     let _ = self.delete_chunk_files(vault_id, expected_hash);
                 }
                 return Err(err);
             }
         };
-        if is_new {
-            self.db
-                .update_vault_used_bytes(vault_id, stored_size as i64)?;
-        }
-        Ok(is_new)
+        // `upsert_chunk` 对"索引里已有、但磁盘文件缺失/被截断"的情况返回 false，
+        // 而我们刚刚确实重写了物理文件。返回值必须反映"本次是否写入了新字节"，
+        // 否则损坏修复会被上报成"去重命中"，调用方与测试都会误判。
+        Ok(is_new || existing.is_some())
     }
 
     /// Reads a chunk from the vault and verifies its BLAKE3 integrity.
@@ -352,12 +395,31 @@ impl VaultStore {
                 Err(LanVaultError::NotFound(format!("chunk {hash_hex}")))
             }
             PoolMode::MirrorRaid1 => {
-                for vol in volumes.iter().filter(|volume| {
-                    matches!(volume.role, VolumeRole::Primary | VolumeRole::Mirror)
-                }) {
+                let candidates: Vec<&VaultVolumeRecord> = volumes
+                    .iter()
+                    .filter(|volume| matches!(volume.role, VolumeRole::Primary | VolumeRole::Mirror))
+                    .collect();
+                for vol in &candidates {
                     if let Ok(bytes) =
                         read_verified_chunk(Path::new(&vol.mount_path), &hash_hex, hash)
                     {
+                        if vol.role == VolumeRole::Mirror {
+                            if let Some(primary) =
+                                candidates.iter().find(|v| v.role == VolumeRole::Primary)
+                            {
+                                if let Err(err) = write_chunk_atomic(
+                                    Path::new(&primary.mount_path),
+                                    &hash_hex,
+                                    &bytes,
+                                ) {
+                                    tracing::warn!(
+                                        vault_id = %vault_id,
+                                        hash = %hash_hex,
+                                        "failed to self-heal primary chunk from mirror: {err}"
+                                    );
+                                }
+                            }
+                        }
                         return Ok(bytes);
                     }
                 }
@@ -374,6 +436,19 @@ impl VaultStore {
             }
             Err(err) => Err(err),
         }
+    }
+
+    /// O(1) 轻量级块完整性检查：验证索引记录与磁盘文件长度，避免快照提交时全盘重读和重复 BLAKE3 导致超时。
+    pub fn has_intact_chunk(&self, vault_id: &str, hash: &[u8; 32]) -> Result<bool> {
+        let Some(vault) = self.db.get_vault(vault_id)? else {
+            return Ok(false);
+        };
+        let Some(record) = self.db.get_chunk(vault_id, hash)? else {
+            return Ok(false);
+        };
+        let volumes = self.online_volumes(vault_id)?;
+        let hash_hex = hex::encode(hash);
+        Ok(self.chunk_intact_on_pool(&vault, &volumes, &hash_hex, record.stored_size))
     }
 
     pub fn manifest_backup_roots(&self, vault_id: &str) -> Result<Vec<PathBuf>> {
@@ -542,7 +617,7 @@ impl VaultStore {
         Ok(())
     }
 
-    fn online_volumes(&self, vault_id: &str) -> Result<Vec<VaultVolumeRecord>> {
+    pub(crate) fn online_volumes(&self, vault_id: &str) -> Result<Vec<VaultVolumeRecord>> {
         let volumes: Vec<VaultVolumeRecord> = self
             .db
             .list_vault_volumes(vault_id)?
@@ -555,6 +630,46 @@ impl VaultStore {
             )));
         }
         Ok(volumes)
+    }
+
+    /// O(1) `stat` 层面的"块已完整落盘"判断（配额与去重快路径用，不做整块回读）。
+    ///
+    /// 校验的是**文件长度等于存储字节数**，而不只是"文件存在"：去掉逐块 `fsync` 之后，
+    /// 断电可能留下被截断的文件，只判断存在会把唯一的好副本判成"已存在"而跳过重传。
+    fn chunk_intact_on_pool(
+        &self,
+        vault: &VaultRecord,
+        volumes: &[VaultVolumeRecord],
+        hash_hex: &str,
+        expected_stored_size: u64,
+    ) -> bool {
+        let intact = |volume: &VaultVolumeRecord| {
+            chunk_file_path(Path::new(&volume.mount_path), hash_hex)
+                .metadata()
+                .map(|meta| meta.is_file() && meta.len() == expected_stored_size)
+                .unwrap_or(false)
+        };
+        match vault.pool_mode {
+            PoolMode::Single => volumes
+                .iter()
+                .find(|volume| volume.role == VolumeRole::Primary)
+                .is_some_and(intact),
+            PoolMode::Striped => {
+                let Some(first_byte) = hex::decode(&hash_hex[..2])
+                    .ok()
+                    .and_then(|bytes| bytes.first().copied())
+                else {
+                    return false;
+                };
+                volumes
+                    .get(first_byte as usize % volumes.len().max(1))
+                    .is_some_and(intact)
+            }
+            PoolMode::MirrorRaid1 => volumes
+                .iter()
+                .filter(|volume| matches!(volume.role, VolumeRole::Primary | VolumeRole::Mirror))
+                .all(intact),
+        }
     }
 }
 
@@ -576,30 +691,60 @@ fn write_vault_meta_atomic(root: &Path, meta: &VaultMetaFile) -> Result<()> {
         file.write_all(&payload)?;
         file.sync_all()?;
     }
-    fs::rename(&tmp_path, &final_path)?;
+    // Windows 上偶发杀毒软件扫描短暂锁住新目录项，短退避重试并在内容寻址已落盘时幂等放行。
+    let mut last_err = None;
+    for attempt in 0..4u32 {
+        match fs::rename(&tmp_path, &final_path) {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied && attempt < 3 => {
+                last_err = Some(err);
+                std::thread::sleep(std::time::Duration::from_millis(25u64 << attempt));
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err.into());
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
     Ok(())
 }
 
 /// Computes `<root>/chunks/<first_2_hex>/<full_hex>`.
 pub fn chunk_file_path(volume_root: &Path, hash_hex: &str) -> PathBuf {
-    let bucket = &hash_hex[..2];
+    let bucket = hash_hex.get(..2).unwrap_or("00");
     volume_root.join("chunks").join(bucket).join(hash_hex)
 }
 
 fn write_chunk_atomic(volume_root: &Path, hash_hex: &str, bytes: &[u8]) -> Result<()> {
     let staging_dir = volume_root.join("staging");
-    fs::create_dir_all(&staging_dir)?;
-
     let final_path = chunk_file_path(volume_root, hash_hex);
-    if let Some(parent) = final_path.parent() {
-        fs::create_dir_all(parent)?;
+    let bucket_dir = final_path
+        .parent()
+        .ok_or_else(|| LanVaultError::InvalidInput("chunk path has no parent".to_string()))?;
+    // Two `create_dir_all` calls per chunk dominated small-chunk ingest; the bucket exists
+    // after the first write in that 256-way prefix, so only create what is missing.
+    if !bucket_dir.exists() {
+        fs::create_dir_all(bucket_dir)?;
+    }
+    if !staging_dir.exists() {
+        fs::create_dir_all(&staging_dir)?;
     }
 
+    // Chunk payloads are content-addressed and BLAKE3-verified on every read plus by the
+    // Bit-Rot scrubber, so per-chunk `fsync` only bought latency (~1 disk flush per MiB).
+    // Landing in the page cache and renaming atomically is what lets a 2.5 GbE link be the
+    // bottleneck instead of the spindle; a torn file after power loss is detected and healed.
     let tmp_path = staging_dir.join(format!("{}.{}.tmp", hash_hex, Uuid::new_v4()));
     {
         let mut file = File::create(&tmp_path)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
     }
     fs::rename(&tmp_path, &final_path)?;
     Ok(())
@@ -634,20 +779,42 @@ fn normalized_mount_key(raw: &str) -> Result<PathBuf> {
             "vault mount path must be an absolute path".to_string(),
         ));
     }
-    let mut resolved = path.to_path_buf();
-    if resolved.exists() {
-        resolved = fs::canonicalize(&resolved)?;
-    }
+    let mut resolved = if path.exists() {
+        fs::canonicalize(path)?
+    } else {
+        // Walk up to the longest existing ancestor so `..` or symlinks cannot bypass overlap checks.
+        let mut ancestor = path.to_path_buf();
+        let mut tail: Vec<std::ffi::OsString> = Vec::new();
+        while !ancestor.exists() {
+            let Some(name) = ancestor.file_name() else {
+                break;
+            };
+            let name_str = name.to_string_lossy();
+            if name_str == ".." {
+                return Err(LanVaultError::InvalidInput(
+                    "vault mount path must not contain parent '..' segments".to_string(),
+                ));
+            }
+            if name_str != "." {
+                tail.push(name.to_os_string());
+            }
+            if !ancestor.pop() {
+                break;
+            }
+        }
+        let mut base = if ancestor.exists() {
+            fs::canonicalize(&ancestor)?
+        } else {
+            ancestor
+        };
+        for seg in tail.into_iter().rev() {
+            base.push(seg);
+        }
+        base
+    };
     #[cfg(windows)]
     {
-        let s = resolved.to_string_lossy();
-        let stripped = if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
-            format!(r"\\{unc}")
-        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-            rest.to_string()
-        } else {
-            s.into_owned()
-        };
+        let stripped = lanvault_core::strip_windows_verbatim(&resolved.to_string_lossy());
         resolved = PathBuf::from(stripped.to_lowercase());
     }
     Ok(resolved)
@@ -661,6 +828,9 @@ fn striped_target_volume<'a>(
     volumes: &'a [VaultVolumeRecord],
     hash: &[u8; 32],
 ) -> Result<&'a VaultVolumeRecord> {
+    if volumes.is_empty() {
+        return Err(LanVaultError::NotFound("no online volumes in vault".to_string()));
+    }
     let idx = (hash[0] as usize) % volumes.len();
     Ok(&volumes[idx])
 }
@@ -670,4 +840,36 @@ pub(crate) fn unix_timestamp_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_vault_rejects_nested_self_overlapping_extra_volumes() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("lanvault-vault-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let db = Arc::new(Database::open(&temp_dir.join("index.db")).unwrap());
+        let store = VaultStore::new(db);
+
+        let primary = temp_dir.join("primary");
+        let nested_mirror = primary.join("mirror_sub");
+        let res = store.create_vault(
+            "Test Pool".to_string(),
+            primary.to_string_lossy().into_owned(),
+            None,
+            PoolMode::MirrorRaid1,
+            1024 * 1024,
+            true,
+            vec![ExtraVolumeSpec {
+                mount_path: nested_mirror.to_string_lossy().into_owned(),
+                volume_guid: None,
+                role: VolumeRole::Mirror,
+            }],
+        );
+        assert!(matches!(res, Err(LanVaultError::InvalidInput(_))));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }

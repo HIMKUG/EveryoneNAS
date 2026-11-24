@@ -14,6 +14,14 @@
  * - Unified Apple motion: press 220ms, state 280ms, reduced 120ms, ease-apple cubic-bezier(0.22, 1, 0.36, 1)
  */
 
+@font-face {
+  font-family: "SourceHanSansSC";
+  src: url("../assets/fonts/SourceHanSansSC-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
 :root {
   /* Surface & Ink Palette */
   --lv-bg: #E6E9EF;
@@ -63,7 +71,7 @@
   /* Touch & Typography */
   --lv-touch-min: 44px;
   --lv-touch-mobile: 48px;
-  --lv-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --lv-font-sans: "SourceHanSansSC", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --lv-font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 
   /* Unified Apple HIG Motion Tokens (1:1 with Flutter NeuMotion) */

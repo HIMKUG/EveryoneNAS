@@ -54,9 +54,13 @@ pub fn remove_firewall_rules() -> Result<()> {
 
 #[cfg(windows)]
 fn add_inbound_rule(name: &str, protocol: &str, port: u16) -> Result<()> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
 
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let output = Command::new("netsh")
+        .creation_flags(CREATE_NO_WINDOW)
         .args([
             "advfirewall",
             "firewall",
@@ -81,9 +85,13 @@ fn add_inbound_rule(name: &str, protocol: &str, port: u16) -> Result<()> {
 
 #[cfg(windows)]
 fn rule_exists(name: &str) -> Result<bool> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
 
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let output = Command::new("netsh")
+        .creation_flags(CREATE_NO_WINDOW)
         .args([
             "advfirewall",
             "firewall",
@@ -98,13 +106,17 @@ fn rule_exists(name: &str) -> Result<bool> {
 
 #[cfg(windows)]
 fn delete_rule_if_present(name: &str) -> Result<()> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     if !rule_exists(name)? {
         return Ok(());
     }
 
     let output = Command::new("netsh")
+        .creation_flags(CREATE_NO_WINDOW)
         .args([
             "advfirewall",
             "firewall",

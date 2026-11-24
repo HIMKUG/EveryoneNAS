@@ -71,9 +71,22 @@ pub(super) async fn handle_clear_debug_logs(
 }
 
 pub(super) async fn handle_report_client_log(
-    Extension(_session): Extension<SessionInfo>,
+    Extension(session): Extension<SessionInfo>,
     Json(req): Json<ClientLogRequest>,
 ) -> Response {
-    lanvault_core::record_frontend_log(&req.level, &req.source, req.message, req.detail);
+    if !session.is_admin && session.device_id.is_none() {
+        return unauthorized_response();
+    }
+    if req.message.trim().is_empty() {
+        return map_domain_error(LanVaultError::InvalidInput(
+            "client log message must not be empty".to_string(),
+        ));
+    }
+    let source = if let Some(dev_id) = session.device_id.as_deref() {
+        format!("peer.{dev_id}.{}", req.source.trim())
+    } else {
+        req.source
+    };
+    lanvault_core::record_frontend_log(&req.level, &source, req.message, req.detail);
     (StatusCode::ACCEPTED, Json(serde_json::json!({ "recorded": true }))).into_response()
 }

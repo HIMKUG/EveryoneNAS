@@ -155,7 +155,7 @@ pub fn reconcile_directory(
                 stack.push(path);
                 continue;
             }
-            if !file_type.is_file() {
+            if !file_type.is_file() || is_ignored_file(&path) {
                 continue;
             }
 
@@ -180,6 +180,13 @@ pub fn reconcile_directory(
                 }
                 Err(err) => return Err(err),
             };
+            if is_file_still_writing(&meta) {
+                if stored_map.remove(&snapshot.rel_path).is_some() {
+                    diff.unchanged_count += 1;
+                }
+                debug!(path = %path.display(), "deferring recently modified file still being written");
+                continue;
+            }
 
             match stored_map.remove(&snapshot.rel_path) {
                 None => diff.added.push(snapshot),
@@ -343,4 +350,34 @@ fn extract_file_id(meta: &Metadata) -> Option<i64> {
 #[cfg(not(any(unix, windows)))]
 fn extract_file_id(_meta: &Metadata) -> Option<i64> {
     None
+}
+
+/// 过滤临时文件、下载半成品与系统缩略图垃圾文件。
+fn is_ignored_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    if lower == ".ds_store"
+        || lower == "thumbs.db"
+        || lower == "desktop.ini"
+        || lower.starts_with("~$")
+    {
+        return true;
+    }
+    matches!(
+        Path::new(&lower).extension().and_then(|e| e.to_str()),
+        Some("tmp" | "part" | "crdownload" | "downloading" | "swp" | "swo")
+    )
+}
+
+/// 写入防抖：若文件在最近 1.5 秒内刚被修改，暂缓本次扫描读取，等待外部写入稳定。
+fn is_file_still_writing(meta: &Metadata) -> bool {
+    let Ok(modified) = meta.modified() else {
+        return false;
+    };
+    let Ok(elapsed) = std::time::SystemTime::now().duration_since(modified) else {
+        return false;
+    };
+    elapsed.as_millis() < 1500
 }

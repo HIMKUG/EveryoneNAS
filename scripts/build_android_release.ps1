@@ -7,7 +7,7 @@
     随后执行 R8 Full Mode + Dart 混淆与符号剥离的 Flutter Android Release 构建，
     并将最终 APK（及可选 AAB）归档至 dist/android-release/。
 .PARAMETER BuildAab
-    在生成 split-per-abi APK 的同时额外构建 Play Store / 分发用 App Bundle (.aab)。
+    在生成 ARM64 APK 的同时额外构建 Play Store / 分发用 App Bundle (.aab)。
 .PARAMETER Clean
     构建前清理 dist/android-release/ 目录。
 #>
@@ -71,14 +71,21 @@ if ($Clean -and (Test-Path $DistDir)) {
 }
 
 # 2. 通过 cargo-ndk 编译 arm64-v8a 原生 .so
+$GradleApp = Get-Content -LiteralPath (Join-Path $FlutterDir "android/app/build.gradle.kts") -Raw
+$MinSdk = [regex]::Match($GradleApp, '(?m)^\s*minSdk\s*=\s*(\d+)\b')
+if (-not $MinSdk.Success) {
+    throw "无法从 Android 应用配置解析原生库的 minSdk"
+}
 Push-Location $RepoRoot
 try {
     $CargoNdkArgs = @(
         "ndk",
         "-t", "arm64-v8a",
+        "--platform", $MinSdk.Groups[1].Value,
         "-o", "flutter_app/android/app/src/main/jniLibs",
         "build",
         "--release",
+        "--lib",
         "-p", "lanvault-ffi",
         "-j", "16"
     )
@@ -106,7 +113,6 @@ try {
         "build", "apk",
         "--release",
         "--target-platform", "android-arm64",
-        "--split-per-abi",
         "--obfuscate",
         "--split-debug-info=$SymbolsDir"
     )
@@ -139,7 +145,7 @@ finally {
 New-Item -ItemType Directory -Path $DistDir -Force | Out-Null
 
 $ApkOutDir = Join-Path $FlutterDir "build\app\outputs\flutter-apk"
-$Arm64Apk = Join-Path $ApkOutDir "app-arm64-v8a-release.apk"
+$Arm64Apk = Join-Path $ApkOutDir "app-release.apk"
 if (-not (Test-Path $Arm64Apk)) {
     throw "未找到构建产物: $Arm64Apk"
 }

@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>草稿到作品 · EveryoneNAS 体检与重构方案</title>
+  <style>
+    :root {
+      --paper: #f7f4ee;
+      --surface: #fffdf9;
+      --ink: #1b1a17;
+      --muted: #6e6a61;
+      --rule: #e2ddd3;
+      --pro: #27593a; --pro-bg: #edf5ef;
+      --semi: #945d1f; --semi-bg: #faf3e8;
+      --draft: #993730; --draft-bg: #faecea;
+      --fast: #1e4e68; --fast-bg: #eaf3f8;
+      --opus: #4c2a6b; --opus-bg: #f3edf8;
+      --ease: cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--paper); color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+      line-height: 1.68; -webkit-font-smoothing: antialiased; padding: 44px 24px 96px;
+    }
+    .page { max-width: 960px; margin: 0 auto; }
+    .serif { font-family: Georgia, "Songti SC", "Noto Serif SC", serif; }
+    .mono { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 0.88em; }
+
+    header.masthead { border-top: 2px solid var(--ink); border-bottom: 1px solid var(--rule); padding: 24px 0 18px; margin-bottom: 28px; }
+    .kicker { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+    h1.title { font-size: 28px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.02em; }
+    .meta-line { color: var(--muted); font-size: 13px; margin: 0; }
+
+    .reveal { opacity: 0; transform: translateY(12px); transition: opacity 0.55s var(--ease), transform 0.55s var(--ease); }
+    .reveal.visible { opacity: 1; transform: translateY(0); }
+
+    .hero-card { background: var(--surface); border: 1px solid var(--rule); padding: 28px 30px; margin-bottom: 22px; }
+    .summary-spread { display: grid; grid-template-columns: 190px 1fr; gap: 32px; align-items: center; }
+    .ring-wrap { position: relative; width: 156px; height: 156px; margin: 0 auto; }
+    .ring-wrap svg { transform: rotate(-90deg); width: 156px; height: 156px; }
+    .ring-track { fill: none; stroke: var(--rule); stroke-width: 6; }
+    .ring-fill { fill: none; stroke: var(--ink); stroke-width: 6; stroke-linecap: round; stroke-dasharray: 440; stroke-dashoffset: 440; transition: stroke-dashoffset 1s var(--ease); }
+    .ring-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+    .ring-num { font-size: 40px; font-weight: 600; line-height: 1; }
+    .ring-label { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+    .tldr { border-left: 2px solid var(--ink); padding: 2px 0 2px 14px; font-size: 14px; margin: 0 0 16px; }
+
+    .kpi-quartet { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 18px; }
+    .kpi { background: var(--paper); border: 1px solid var(--rule); padding: 10px 12px; }
+    .kpi-val { font-size: 20px; font-weight: 600; line-height: 1.2; }
+    .kpi-lbl { font-size: 11.5px; color: var(--muted); }
+
+    .dim-row { display: grid; grid-template-columns: 180px 1fr 48px; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 12.5px; }
+    .dim-track { height: 5px; background: #e8e3d9; overflow: hidden; }
+    .dim-fill { height: 100%; width: 0%; background: var(--ink); transition: width 0.85s var(--ease); }
+
+    .action-box { background: var(--surface); border: 1px solid var(--rule); padding: 26px 30px; margin-bottom: 24px; }
+    .sec-head { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+    .sec-head h2 { font-size: 19px; margin: 0; font-weight: 600; }
+    .sec-sub { font-size: 13px; color: var(--muted); margin: 0; }
+
+    details.drawer { background: var(--surface); border: 1px solid var(--rule); margin-bottom: 12px; }
+    details.drawer > summary {
+      cursor: pointer; list-style: none; padding: 16px 22px; font-size: 15.5px; font-weight: 600;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    details.drawer > summary::-webkit-details-marker { display: none; }
+    details.drawer > summary::after { content: "展开细节 ▾"; font-size: 12px; font-weight: 400; color: var(--muted); }
+    details.drawer[open] > summary::after { content: "收起 ▴"; }
+    .drawer-body { padding: 4px 22px 22px; border-top: 1px solid var(--rule); }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+    th { font-size: 11.5px; color: var(--muted); font-weight: 500; }
+
+    .tag { display: inline-block; padding: 2px 7px; font-size: 11.5px; font-weight: 500; white-space: nowrap; }
+    .tag-pro { color: var(--pro); background: var(--pro-bg); }
+    .tag-semi { color: var(--semi); background: var(--semi-bg); }
+    .tag-draft { color: var(--draft); background: var(--draft-bg); }
+    .tag-fast { color: var(--fast); background: var(--fast-bg); }
+    .tag-opus { color: var(--opus); background: var(--opus-bg); }
+
+    .arch-layer { background: var(--paper); border: 1px solid var(--rule); padding: 10px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .res-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 14px; }
+    .res-card { border-top: 2px solid var(--ink); padding-top: 8px; }
+    .res-card h3 { font-size: 13.5px; margin: 0 0 4px; }
+    .res-card p { font-size: 12.5px; color: var(--muted); margin: 0; }
+
+    details.tree-node { margin-left: 16px; border-left: 1px solid var(--rule); padding-left: 12px; margin-top: 4px; }
+    details.tree-node > summary { cursor: pointer; list-style: none; font-size: 13px; padding: 3px 0; }
+    .tree-leaf { margin-left: 16px; padding: 3px 0 3px 12px; border-left: 1px solid var(--rule); font-size: 13px; }
+
+    @media (max-width: 760px) {
+      .summary-spread, .kpi-quartet, .res-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="masthead reveal">
+      <div class="kicker">Draft-to-Opus · Bottom-Up Codebase Audit</div>
+      <h1 class="title serif" id="project-title">EveryoneNAS · 体检与重构方案</h1>
+      <p class="meta-line" id="project-meta">三阶渐进审查（已锁定备份标签 pre-audit-20261124）</p>
+    </header>
+
+    <section class="hero-card reveal">
+      <div class="summary-spread">
+        <div class="ring-wrap">
+          <svg viewBox="0 0 160 160">
+            <circle class="ring-track" cx="80" cy="80" r="70" />
+            <circle class="ring-fill" id="score-ring" cx="80" cy="80" r="70" />
+          </svg>
+          <div class="ring-center">
+            <div class="ring-num serif" id="score-num">0</div>
+            <div class="ring-label" id="score-verdict">评估中</div>
+          </div>
+        </div>
+        <div>
+          <p class="tldr" id="plain-summary"></p>
+          <div class="kpi-quartet" id="kpi-quartet"></div>
+          <div id="dim-bars"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="action-box reveal">
+      <div class="sec-head">
+        <h2 class="serif">优先改造清单（按风险 × 收益与模型算力分级）</h2>
+        <p class="sec-sub">低风险、中风险与「高风险高收益」建议修；「高风险中低收益」自动豁免不修</p>
+      </div>
+      <table>
+        <thead><tr><th>改造项</th><th>风险 × 收益</th><th>推荐模型</th><th>执行方式与人话说明</th></tr></thead>
+        <tbody id="action-body"></tbody>
+      </table>
+    </section>
+
+    <details class="drawer reveal" open>
+      <summary class="serif">01 · 架构分层、抗风险三问与工程发布门禁</summary>
+      <div class="drawer-body">
+        <div id="arch-stack"></div>
+        <div class="res-grid" id="resilience-cards"></div>
+      </div>
+    </details>
+
+    <details class="drawer reveal">
+      <summary class="serif">02 · 前端控件大类盘点（令牌统一 vs 组件合并）</summary>
+      <div class="drawer-body">
+        <table>
+          <thead><tr><th>控件大类</th><th>现状</th><th>建议</th><th>说明</th></tr></thead>
+          <tbody id="frontend-body"></tbody>
+        </table>
+      </div>
+    </details>
+
+    <details class="drawer reveal">
+      <summary class="serif">03 · 后端模块血统树与中等模块异味</summary>
+      <div class="drawer-body">
+        <p style="font-size:12.5px;color:var(--muted);margin:8px 0 12px;">
+          <span class="tag tag-pro">专业</span> 可复用 · <span class="tag tag-semi">半手写</span> 带补丁 · <span class="tag tag-draft">手写草稿</span> 建议重写
+        </p>
+        <div id="backend-tree"></div>
+      </div>
+    </details>
+
+    <details class="drawer reveal">
+      <summary class="serif">04 · 性能热点、数学损失与资源浪费</summary>
+      <div class="drawer-body">
+        <table>
+          <thead><tr><th>类型与位置</th><th>问题</th><th>改良方案</th><th>实际影响</th></tr></thead>
+          <tbody id="perf-body"></tbody>
+        </table>
+      </div>
+    </details>
+
+    <details class="drawer reveal">
+      <summary class="serif">05 · 安全边界、数据状态机、可观测性与豁免区</summary>
+      <div class="drawer-body">
+        <table>
+          <thead><tr><th>审查域与位置</th><th>问题</th><th>修复建议</th><th>潜在后果</th></tr></thead>
+          <tbody id="audit-body"></tbody>
+        </table>
+        <h4 style="font-size:13.5px;margin:18px 0 8px;">虽然丑但别乱动（高风险 × 中低收益豁免）</h4>
+        <ul id="exemption-list" style="margin:0;padding-left:18px;font-size:13px;color:var(--muted);"></ul>
+      </div>
+    </details>
+  </div>
+
+  <script>
+    window.REPORT_DATA = {
+      projectName: "EveryoneNAS",
+      scanDate: "2026-11-24",
+      totalScore: 58,
+      verdict: "成长期 · 核心扎实但体验与一致性待收敛",
+      plainSummary: "密码学、FastCDC 分块与 WAL 存储骨架扎实；但存在配对缺双向实时确认、Windows 频繁弹窗/PowerShell 选目录极慢、移动端双导航栏与窄屏挤压、存储服务门禁缺失、GC 竞态及若干阻塞与 IDOR 漏洞，需按优先级分批收敛修复。",
+      kpis: [
+        { val: "18 项", lbl: "建议修复" },
+        { val: "6 项", lbl: "高风险高收益" },
+        { val: "8 项", lbl: "轻量模型可修" },
+        { val: "4 项", lbl: "高风险豁免不修" }
+      ],
+      dimensions: [
+        { name: "UI 控件收敛度", score: 9, max: 15 },
+        { name: "非补丁与模块化", score: 8, max: 15 },
+        { name: "性能与数学健康度", score: 11, max: 20 },
+        { name: "架构秩序与抗风险", score: 12, max: 20 },
+        { name: "安全、数据与可观测", score: 12, max: 20 },
+        { name: "发布就绪与可测性", score: 6, max: 10 }
+      ],
+      actions: [
+        { name: "Windows 原生文件/目录选择 + 消除 cmd 黑框", riskPayoff: "低风险 · 高收益", model: "fast", desc: "在 Windows Runner C++ 层实现 IFileOpenDialog MethodChannel 替代 PowerShell；所有 Command 调用加 CREATE_NO_WINDOW，Wi-Fi 扫描迁入 Rust 消除 15 秒闪窗。" },
+        { name: "Android 恢复 NoTitleBar 主题 + 全端字库嵌入", riskPayoff: "低风险 · 高收益", model: "fast", desc: "AndroidManifest 绑定 LaunchTheme/NormalTheme 去掉顶部黑栏；集成思源黑体并用 WOFF2 压缩（WebUI 直连 WOFF2，Flutter 端按规范加载）。" },
+        { name: "存储服务未启动时新建存储池置灰+Toast", riskPayoff: "低风险 · 高收益", model: "fast", desc: "修复 Windows 分支缺失的 _notifyStateChanged()；VaultScreen 监听服务状态，未启动时按钮置深灰/黑并在点击时弹出 Toast 提示。" },
+        { name: "对标设计稿重塑移动端 & 桌面端自适应布局", riskPayoff: "中风险 · 高收益", model: "opus", desc: "收敛 NeuDialog/NeuIconBadge/NeuKeyValueRow/NeuEmptyState；修复备份页单字竖排、设置页标签裁切、总览 IP 碰撞与传输页输入框挤压。" },
+        { name: "双向实时确认配对协议（请求/同意/拒绝）", riskPayoff: "高风险 · 高收益", model: "opus", desc: "后端新增 pair-request 队列、WS/FFI 推送与 respond 接口；接收方全局弹窗展示发起方信息并一键同意或拒绝，无需手输 PIN。" },
+        { name: "修复 GC 误删上传中分块、快照恢复与解绑重配锁死", riskPayoff: "高风险 · 高收益", model: "opus", desc: "GC 增加孤儿分块宽限期；restore_snapshot 改为按 manifest 目录树重建；重新配对时清理 auth.revoked_devices。" },
+        { name: "修复 IDOR/鉴权缺口、write_lock 阻塞与 N+1 查询", riskPayoff: "高风险 · 高收益", model: "opus", desc: "校验 PUT chunk 与 client log 权限；快照校验移出全局 write_lock；SQL 批量查询与分页替代内存全量过滤；阻塞 IO 迁入 spawn_blocking。" },
+        { name: "修复 Toast 动画、Key 缺失、重复 1s 轮询与死代码", riskPayoff: "低风险 · 中收益", model: "fast", desc: "接入 Toast _scale 动画与减弱动态兼容；列表项补 ValueKey；复用 Bridge 同步进度流与 reqwest::Client 连接池。" }
+      ],
+      archLayers: [
+        { title: "跨端界面层 (Flutter / WebUI)", items: ["7 大功能页", "NeuTheme 令牌", "Web 控制台"], note: "当前存在原生控件混用、Android 缺 Theme、PC 端调 PowerShell 问题" },
+        { title: "原生桥接与保活层 (FFI / Runner)", items: ["lanvault-ffi", "Android Service", "Win32 Runner"], note: "api.rs 3415 行过胖；每次 FFI 轮询重复 open 动态库" },
+        { title: "核心业务与传输层 (Client / Server)", items: ["sync_engine", "vault", "web/mod.rs", "auth", "gc/scrub"], note: "web/mod.rs 1956 行过胖；同步 SQLite 阻塞 Tokio 线程" },
+        { title: "基础原语与持久层 (Core / WinSvc)", items: ["crypto", "chunker", "protocol", "db", "volume_guid"], note: "密码学与分块达到专业级；db.rs 1818 行缺部分索引与无界查询" }
+      ],
+      resilience: [
+        { title: "关键处能否自愈", body: "断线退避重连与 Android 4 级保活存在；但解绑后重新配对会被 revoked_devices 永久拦截，RAID1 读备盘故障未按文档回写修复主盘。" },
+        { title: "能不能保证下线", body: "WAL 模式和分块原子写入稳定；但全局 write_lock 跨全量校验持有、GC 误删未提交分块、sync_engine 缺 connect_timeout 与重试预算。" },
+        { title: "极端情况是否会崩", body: "多处 unwrap/expect 遇异常或锁中毒会 panic；无界 SELECT 与 discovered_peers 易膨胀；restore_snapshot 将去重块直拼导致还原文件损坏。" }
+      ],
+      frontendInventory: [
+        { category: "弹窗 Overlay", variants: "showDialog 与 showNeuDialog 混用，4 处手写 Dialog 头部", action: "合并标准组件", note: "收敛为统一 NeuDialog 并内置滚动保护，防止小屏溢出。" },
+        { category: "标签与筛选导航", variants: "NeuSegmentedControl 与设置页手写水平胶囊条并存", action: "合并标准组件", note: "修复设置页右侧标签裁切、设备页分段文本截断与 15px 芯片关闭热区。" },
+        { category: "列表行与状态展示", variants: "4 套信息行实现、7 处手写空状态盒、20+ 处图标徽章", action: "合并标准组件", note: "提取 NeuIconBadge / NeuKeyValueRow / NeuEmptyState，消除备份页单字竖排挤压。" },
+        { category: "基础令牌与反馈", variants: "NeuToast 未用 _scale、多处硬编码色值与间距", action: "仅统一令牌", note: "收敛到 NeuTokens / NeuMotion，修正 healthy 按钮白字对比度。" }
+      ],
+      backendTree: {
+        name: "lanvault-ffi / api.rs (3415行)", provenance: "draft", desc: "God 文件；含同步 IO 阻塞、重复 Database::open 与损坏的 restore_snapshot",
+        children: [
+          { name: "lanvault-core / crypto & chunker & protocol", provenance: "pro", desc: "零化密钥、AEAD、FastCDC 与长度前缀签名" },
+          { name: "lanvault-core / db.rs (1818行)", provenance: "semi", desc: "WAL 索引扎实，但含无界查询与未校验符号转换" },
+          { name: "lanvault-server / web/mod.rs (1956行)", provenance: "draft", desc: "路由/状态/DTO 混杂；同步查库阻塞与全局 write_lock 争用" },
+          { name: "lanvault-server / vault & gc & scrub & auth", provenance: "semi", desc: "存在路径自重叠、GC 竞态、RAID1 未自愈与重配锁死" },
+          { name: "lanvault-client / sync_engine & clipboard & scanner", provenance: "semi", desc: "流式管线良好；cache.clear() 悬崖与文件名未清洗" },
+          { name: "lanvault-win-svc / main & firewall & volume_guid", provenance: "semi", desc: "Win32 卷标处理专业；netsh 缺 CREATE_NO_WINDOW" }
+        ]
+      },
+      perfLosses: [
+        { category: "进程弹窗与冷启动", location: "system_env_helper.dart:128,194,242", issue: "每次选目录/文件拉起 PowerShell 编译 C#；15s 轮询拉起 cmd/netsh", fix: "C++ Runner 原生 IFileOpenDialog + Rust CREATE_NO_WINDOW", impact: "选择目录从数秒降至毫秒级，彻底消除后台闪窗。" },
+        { category: "FFI 与轮询开销", location: "lanvault_bridge.dart:1020; dashboard/backup", issue: "每次 FFI 调用 Isolate.run 重新 open 动态库；双页各开 1s 轮询", fix: "共享 Bridge 进度流与后端共享 reqwest::Client", impact: "大幅减少桌面与手机 CPU/内存抖动。" },
+        { category: "锁竞争与阻塞异步", location: "web/mod.rs:1107; api.rs:745,2484", issue: "异步线程跑同步 SQLite/ipconfig/Argon2；write_lock 跨全快照校验", fix: "迁入 spawn_blocking，校验与落盘解耦锁粒度", impact: "消除高并发上传或状态轮询时的全服务卡顿。" },
+        { category: "N+1 与无界集合", location: "web/mod.rs:154,995; gc.rs:153; sync_engine.rs:562", issue: "每秒 WS 状态 N+1 查卷；内存过滤全量快照；10万缓存整表 clear()", fix: "新增 list_all_volumes、SQL 分页与渐进淘汰", impact: "大库下内存可控且不发生吞吐骤降。" }
+      ],
+      deepAudit: [
+        { domain: "交互契约缺失", location: "web/mod.rs:1521; pairing_screen.dart:114", issue: "仅支持发起方手输 PIN，被配对端无任何弹窗通知", fix: "新增 pair-request 队列、WS/FFI 事件与全局同意/拒绝弹窗", impact: "解决“发起配对另一方毫无反应”的核心痛点。" },
+        { domain: "授权与数据隔离", location: "web/mod.rs:900; debug_routes.rs:73", issue: "PUT chunk 未校权限与配额；client 日志上报缺管理员约束", fix: "补齐会话与目标存储池边界校验及限流", impact: "防止非授权已配对设备写满或污染存储池。" },
+        { domain: "数据完整性", location: "api.rs:3289; gc.rs:144; vault.rs:123", issue: "restore_snapshot 直拼去重块；GC 删 ref_count=0 上传中块；同池子目录未判重", fix: "按 manifest 重建目录；GC 加宽限期；路径规范化后判重", impact: "保证快照恢复可用、上传不丢块、多盘路径不踩踏。" },
+        { domain: "凭据与路径安全", location: "auth.rs:386; clipboard.rs:155; web/mod.rs:1658", issue: "解绑重配永久 401；剪贴板远端文件名未剥离路径穿越；全局剪贴板密钥未轮换", fix: "重配移除吊销集；清洗文件名；解绑时轮换/隔离密钥", impact: "防止设备锁死与任意路径写入风险。" }
+      ],
+      exemptions: [
+        "加密核心 (crates/lanvault-core/src/crypto.rs · 高风险 × 低收益)：Ed25519/X25519/ChaCha20 与 Zeroize 已完备且含单测，保持不动。",
+        "FastCDC 分块核心 (crates/lanvault-core/src/chunker.rs · 高风险 × 低收益)：边界校验与流式封包已稳定且含单测，保持不动。",
+        "Win32 卷 GUID 解析 (crates/lanvault-win-svc/src/volume_guid.rs · 高风险 × 低收益)：Win32 FFI 与 RAII 句柄处理严谨，保持不动。",
+        "Android 底层 JNI / Shizuku / Root 提权桥接 (c_abi.rs JNI 与 privilege/*.kt · 高风险 × 中收益)：已针对 R8 调通且设备端实测可用，本次仅补齐边界不做大改。"
+      ]
+    };
+
+    const provMap = { pro: ["tag-pro", "专业"], semi: ["tag-semi", "半手写"], draft: ["tag-draft", "手写草稿"] };
+    const modelMap = { fast: ["tag-fast", "轻量快速模型"], opus: ["tag-opus", "高阶推理模型"] };
+
+    function renderAll() {
+      const d = window.REPORT_DATA;
+      document.getElementById("project-title").textContent = `${d.projectName} · 体检与重构方案`;
+      document.getElementById("project-meta").textContent = `扫描日期：${d.scanDate} · 三阶渐进审查（已锁定回滚锚点 pre-audit-20261124）`;
+      document.getElementById("score-verdict").textContent = `满分 100 · ${d.verdict}`;
+      document.getElementById("plain-summary").textContent = d.plainSummary || "";
+
+      const ring = document.getElementById("score-ring");
+      setTimeout(() => { ring.style.strokeDashoffset = 440 - (440 * d.totalScore) / 100; }, 100);
+      let cur = 0;
+      const timer = setInterval(() => {
+        cur = Math.min(d.totalScore, cur + Math.max(1, Math.ceil(d.totalScore / 28)));
+        document.getElementById("score-num").textContent = cur;
+        if (cur >= d.totalScore) clearInterval(timer);
+      }, 24);
+
+      document.getElementById("kpi-quartet").innerHTML = (d.kpis || []).map(k =>
+        `<div class="kpi"><div class="kpi-val serif">${k.val}</div><div class="kpi-lbl">${k.lbl}</div></div>`).join("");
+
+      document.getElementById("dim-bars").innerHTML = d.dimensions.map(dim => `
+        <div class="dim-row">
+          <span>${dim.name}</span>
+          <div class="dim-track"><div class="dim-fill" data-pct="${(dim.score / dim.max) * 100}"></div></div>
+          <span class="mono" style="text-align:right">${dim.score}/${dim.max}</span>
+        </div>`).join("");
+      setTimeout(() => { document.querySelectorAll(".dim-fill").forEach(el => { el.style.width = el.dataset.pct + "%"; }); }, 160);
+
+      document.getElementById("action-body").innerHTML = (d.actions || []).map(a => {
+        const [mCls, mLbl] = modelMap[a.model] || modelMap.fast;
+        return `<tr><td><strong>${a.name}</strong></td><td>${a.riskPayoff}</td><td><span class="tag ${mCls}">${mLbl}</span></td><td>${a.desc}</td></tr>`;
+      }).join("");
+
+      document.getElementById("arch-stack").innerHTML = (d.archLayers || []).map(l =>
+        `<div class="arch-layer"><div><strong>${l.title}</strong> <span style="color:var(--muted);font-size:12px;">${l.note || ""}</span></div><div class="mono" style="font-size:12px;">${(l.items || []).join(" · ")}</div></div>`).join("");
+
+      document.getElementById("resilience-cards").innerHTML = (d.resilience || []).map(r =>
+        `<div class="res-card"><h3>${r.title}</h3><p>${r.body}</p></div>`).join("");
+
+      document.getElementById("frontend-body").innerHTML = (d.frontendInventory || []).map(f =>
+        `<tr><td><strong>${f.category}</strong></td><td>${f.variants}</td><td>${f.action}</td><td>${f.note}</td></tr>`).join("");
+
+      function buildTree(node) {
+        const [cls, lbl] = provMap[node.provenance] || provMap.draft;
+        const badge = `<span class="tag ${cls}">${lbl}</span>`;
+        if (!node.children || !node.children.length) return `<div class="tree-leaf">${node.name} ${badge} <span style="color:var(--muted)">${node.desc || ""}</span></div>`;
+        return `<details class="tree-node" open><summary>${node.name} ${badge} <span style="color:var(--muted)">${node.desc || ""}</span></summary>${node.children.map(buildTree).join("")}</details>`;
+      }
+      document.getElementById("backend-tree").innerHTML = buildTree(d.backendTree);
+
+      document.getElementById("perf-body").innerHTML = (d.perfLosses || []).map(p =>
+        `<tr><td><strong>${p.category}</strong><div class="mono">${p.location}</div></td><td>${p.issue}</td><td>${p.fix}</td><td>${p.impact}</td></tr>`).join("");
+
+      document.getElementById("audit-body").innerHTML = (d.deepAudit || []).map(a =>
+        `<tr><td><strong>${a.domain}</strong><div class="mono">${a.location}</div></td><td>${a.issue}</td><td>${a.fix}</td><td>${a.impact}</td></tr>`).join("");
+
+      document.getElementById("exemption-list").innerHTML = (d.exemptions || []).map(e => `<li>${e}</li>`).join("");
+    }
+
+    const io = new IntersectionObserver(entries => {
+      entries.forEach((e, i) => { if (e.isIntersecting) { setTimeout(() => e.target.classList.add("visible"), i * 50); io.unobserve(e.target); } });
+    }, { threshold: 0.06 });
+    document.querySelectorAll(".reveal").forEach(el => io.observe(el));
+    renderAll();
+  </script>
+</body>
+</html>

@@ -36,8 +36,13 @@ pub struct DebugLogEntry {
     pub detail: Option<String>,
 }
 
+struct RingEntry {
+    entry: DebugLogEntry,
+    bytes: usize,
+}
+
 struct TelemetrySink {
-    ring: VecDeque<DebugLogEntry>,
+    ring: VecDeque<RingEntry>,
     ring_bytes: usize,
     log_file_path: Option<PathBuf>,
 }
@@ -185,11 +190,12 @@ fn push_ring_entry(guard: &mut TelemetrySink, entry: &DebugLogEntry) {
         let Some(removed) = guard.ring.pop_front() else {
             break;
         };
-        guard.ring_bytes = guard
-            .ring_bytes
-            .saturating_sub(serialized_entry_bytes(&removed));
+        guard.ring_bytes = guard.ring_bytes.saturating_sub(removed.bytes);
     }
-    guard.ring.push_back(entry.clone());
+    guard.ring.push_back(RingEntry {
+        entry: entry.clone(),
+        bytes: entry_bytes,
+    });
     guard.ring_bytes = guard.ring_bytes.saturating_add(entry_bytes);
 }
 
@@ -296,7 +302,7 @@ pub fn get_debug_logs(limit: usize) -> Vec<DebugLogEntry> {
     };
     let len = guard.ring.len();
     let skip = len.saturating_sub(cap);
-    guard.ring.iter().skip(skip).cloned().collect()
+    guard.ring.iter().skip(skip).map(|item| item.entry.clone()).collect()
 }
 
 /// Clears the in-memory ring buffer.

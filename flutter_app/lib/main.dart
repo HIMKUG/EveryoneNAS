@@ -5,16 +5,38 @@ import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
 import 'bridge/lanvault_bridge.dart';
+import 'bridge/window_chrome.dart';
 import 'features/backup/backup_screen.dart';
 import 'features/clipboard/clipboard_screen.dart';
 import 'features/dashboard/dashboard_screen.dart';
 import 'features/pairing/pairing_screen.dart';
 import 'features/settings/settings_screen.dart';
-import 'features/snapshots/snapshots_screen.dart';
 import 'features/vault/vault_screen.dart';
 import 'theme/neu_theme.dart';
+import 'theme/neu_toast.dart';
+import 'widgets/device_switcher_pill.dart';
+import 'widgets/windows_title_bar.dart';
 
 bool _isReportingError = false;
+bool _bundledFontLoaded = false;
+
+Future<void> _loadBundledAppFont() async {
+  if (_bundledFontLoaded) return;
+  try {
+    final woff2 =
+        await rootBundle.load('assets/fonts/SourceHanSansSC-Regular.woff2');
+    final sfnt = await LanVaultBridge.decodeWoff2ToSfnt(
+      woff2.buffer.asUint8List(woff2.offsetInBytes, woff2.lengthInBytes),
+    );
+    if (sfnt.isEmpty) return;
+    final loader = FontLoader(NeuTokens.appFontFamily);
+    loader.addFont(Future<ByteData>.value(ByteData.sublistView(sfnt)));
+    await loader.load();
+    _bundledFontLoaded = true;
+  } catch (error) {
+    debugPrint('SourceHanSansSC WOFF2 font load skipped: $error');
+  }
+}
 
 void _safeReportUnhandledError(
   LanVaultBridge? bridge, {
@@ -44,7 +66,7 @@ void main() {
   LanVaultBridge? appBridge;
 
   runZonedGuarded<void>(
-    () {
+    () async {
       WidgetsFlutterBinding.ensureInitialized();
       final bridge = LanVaultBridge();
       appBridge = bridge;
@@ -71,6 +93,10 @@ void main() {
         return true;
       };
 
+      await _loadBundledAppFont().timeout(
+        const Duration(seconds: 3),
+        onTimeout: () {},
+      );
       runApp(LanVaultApp(bridge: bridge));
     },
     (Object error, StackTrace stack) {
@@ -113,13 +139,15 @@ class _LanVaultAppState extends State<LanVaultApp> {
   }
 }
 
-/// 严格对齐设计稿顺序的 7 个功能页签。
+/// 收敛后的 5 个顶级目的地：
+/// - 桌面侧栏展示全部 5 项（总览 / 备份 / 存储 / 传输 / 设置）；
+/// - 移动端底栏严控 4 项（总览 / 备份 / 存储 / 传输），右上角齿轮进入设置；
+/// - 设备切换升格为顶栏全局胶囊，精细设备管理与配对从胶囊底一键进入；
+/// - 历史版本与完整性校验收口进“备份”页内二级视角。
 enum _ShellTab {
   dashboard,
-  devices,
   backup,
   storage,
-  snapshots,
   transfer,
   settings,
 }
@@ -138,9 +166,6 @@ class _NavItem {
   final IconData selectedIcon;
 }
 
-/// 跨平台自适应主导航壳层：
-/// - 桌面端（>= 840px）：左侧 216px 固定导航栏，7 个导航项依次排布，激活项为实心蓝渐变胶囊。
-/// - 移动端（< 840px）：顶部标题栏 + 右上角一键进入“设置”齿轮按钮；底部 6 项紧凑导航栏。
 class LanVaultShell extends StatefulWidget {
   const LanVaultShell({super.key, required this.bridge});
 
@@ -159,12 +184,6 @@ class _LanVaultShellState extends State<LanVaultShell> {
       selectedIcon: Icons.home_rounded,
     ),
     _NavItem(
-      tab: _ShellTab.devices,
-      label: '设备',
-      icon: Icons.devices_outlined,
-      selectedIcon: Icons.devices_rounded,
-    ),
-    _NavItem(
       tab: _ShellTab.backup,
       label: '备份',
       icon: Icons.cloud_sync_outlined,
@@ -177,16 +196,10 @@ class _LanVaultShellState extends State<LanVaultShell> {
       selectedIcon: Icons.layers_rounded,
     ),
     _NavItem(
-      tab: _ShellTab.snapshots,
-      label: '快照',
-      icon: Icons.history_rounded,
-      selectedIcon: Icons.history_rounded,
-    ),
-    _NavItem(
       tab: _ShellTab.transfer,
       label: '传输',
-      icon: Icons.send_outlined,
-      selectedIcon: Icons.send_rounded,
+      icon: Icons.chat_bubble_outline_rounded,
+      selectedIcon: Icons.chat_bubble_rounded,
     ),
     _NavItem(
       tab: _ShellTab.settings,
@@ -196,62 +209,89 @@ class _LanVaultShellState extends State<LanVaultShell> {
     ),
   ];
 
-  static const List<_NavItem> _mobileDestinations = <_NavItem>[
-    _NavItem(
-      tab: _ShellTab.dashboard,
-      label: '总览',
-      icon: Icons.home_outlined,
-      selectedIcon: Icons.home_rounded,
-    ),
-    _NavItem(
-      tab: _ShellTab.devices,
-      label: '设备',
-      icon: Icons.devices_outlined,
-      selectedIcon: Icons.devices_rounded,
-    ),
-    _NavItem(
-      tab: _ShellTab.backup,
-      label: '备份',
-      icon: Icons.cloud_sync_outlined,
-      selectedIcon: Icons.cloud_sync_rounded,
-    ),
-    _NavItem(
-      tab: _ShellTab.storage,
-      label: '存储',
-      icon: Icons.layers_outlined,
-      selectedIcon: Icons.layers_rounded,
-    ),
-    _NavItem(
-      tab: _ShellTab.snapshots,
-      label: '快照',
-      icon: Icons.history_rounded,
-      selectedIcon: Icons.history_rounded,
-    ),
-    _NavItem(
-      tab: _ShellTab.transfer,
-      label: '传输',
-      icon: Icons.send_outlined,
-      selectedIcon: Icons.send_rounded,
-    ),
-  ];
+  static final List<_NavItem> _mobileDestinations = _desktopDestinations
+      .where((item) => item.tab != _ShellTab.settings)
+      .toList(growable: false);
 
   final GlobalKey _pagesStackKey = GlobalKey();
+  final ValueNotifier<int> _backupSubTabNotifier = ValueNotifier<int>(0);
   late List<Widget> _pages;
   _ShellTab _selectedTab = _ShellTab.dashboard;
+  String? _activePairDialogRequestId;
+  final Set<String> _handledPairRequestIds = <String>{};
+
+  void _openDeviceManager() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (routeCtx) => Scaffold(
+          backgroundColor: NeuTokens.canvas,
+          appBar: WindowChrome.isSupported
+              ? null
+              : AppBar(
+                  backgroundColor: NeuTokens.canvas,
+                  surfaceTintColor: Colors.transparent,
+                  elevation: 0,
+                  title: const Text('设备管理'),
+                  leading: IconButton(
+                    tooltip: '返回',
+                    icon: const Icon(Icons.arrow_back_rounded),
+                    onPressed: () => Navigator.of(routeCtx).pop(),
+                  ),
+                ),
+          body: WindowChrome.isSupported
+              ? Column(
+                  children: <Widget>[
+                    const WindowsTitleBar(),
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+                      child: Row(
+                        children: <Widget>[
+                          NeuButton(
+                            label: '返回',
+                            icon: Icons.arrow_back_rounded,
+                            onPressed: () => Navigator.of(routeCtx).pop(),
+                          ),
+                          const SizedBox(width: 12),
+                          Text(
+                            '设备管理',
+                            style: Theme.of(routeCtx).textTheme.titleLarge,
+                          ),
+                        ],
+                      ),
+                    ),
+                    Expanded(child: PairingScreen(bridge: widget.bridge)),
+                  ],
+                )
+              : PairingScreen(bridge: widget.bridge),
+        ),
+      ),
+    );
+  }
 
   List<Widget> _buildPages(LanVaultBridge bridge) {
     return <Widget>[
       DashboardScreen(
         bridge: bridge,
-        onOpenSnapshots: () => setState(() => _selectedTab = _ShellTab.snapshots),
+        onOpenSnapshots: () {
+          _backupSubTabNotifier.value = 1;
+          setState(() => _selectedTab = _ShellTab.backup);
+        },
         onOpenVault: () => setState(() => _selectedTab = _ShellTab.storage),
-        onOpenPairing: () => setState(() => _selectedTab = _ShellTab.devices),
+        onOpenPairing: _openDeviceManager,
+        onOpenSettings: () => setState(() => _selectedTab = _ShellTab.settings),
       ),
-      PairingScreen(bridge: bridge),
-      BackupScreen(bridge: bridge),
-      VaultScreen(bridge: bridge),
-      SnapshotsScreen(bridge: bridge),
-      ClipboardScreen(bridge: bridge),
+      BackupScreen(
+        bridge: bridge,
+        subTabNotifier: _backupSubTabNotifier,
+      ),
+      VaultScreen(
+        bridge: bridge,
+        onOpenSettings: () => setState(() => _selectedTab = _ShellTab.settings),
+      ),
+      ClipboardScreen(
+        bridge: bridge,
+        onOpenDeviceManager: _openDeviceManager,
+      ),
       SettingsScreen(bridge: bridge),
     ];
   }
@@ -260,105 +300,286 @@ class _LanVaultShellState extends State<LanVaultShell> {
   void initState() {
     super.initState();
     _pages = _buildPages(widget.bridge);
+    widget.bridge.pendingPairRequestsNotifier
+        .addListener(_onPendingPairRequests);
+    unawaited(_hydratePersistedSettings());
   }
 
   @override
   void didUpdateWidget(covariant LanVaultShell oldWidget) {
     super.didUpdateWidget(oldWidget);
     if (oldWidget.bridge != widget.bridge) {
+      oldWidget.bridge.pendingPairRequestsNotifier
+          .removeListener(_onPendingPairRequests);
+      widget.bridge.pendingPairRequestsNotifier
+          .addListener(_onPendingPairRequests);
       _pages = _buildPages(widget.bridge);
     }
   }
 
+  @override
+  void dispose() {
+    widget.bridge.pendingPairRequestsNotifier
+        .removeListener(_onPendingPairRequests);
+    _backupSubTabNotifier.dispose();
+    super.dispose();
+  }
+
+  Future<void> _hydratePersistedSettings() async {
+    try {
+      final role = await widget.bridge.getRoleMode();
+      await widget.bridge.getAutoReconnect();
+      await widget.bridge.refreshPairedPeers();
+      if (role.hasServer && !widget.bridge.serverRunningNotifier.value) {
+        final autostart = await widget.bridge.getAutostartServer();
+        if (autostart) {
+          await widget.bridge.autostartLocalServer();
+        }
+      }
+    } catch (_) {
+      // 持久化读取失败时保留默认内存状态。
+    }
+  }
+
+  void _onPendingPairRequests() {
+    if (!mounted) return;
+    if (_activePairDialogRequestId != null) return;
+    final pending = widget.bridge.pendingPairRequestsNotifier.value;
+    PendingPairRequestModel? nextRequest;
+    for (final item in pending) {
+      if (!_handledPairRequestIds.contains(item.requestId)) {
+        nextRequest = item;
+        break;
+      }
+    }
+    if (nextRequest == null) return;
+
+    final chosen = nextRequest;
+    _activePairDialogRequestId = chosen.requestId;
+    Future<void>.microtask(() {
+      if (!mounted) return;
+      unawaited(_showIncomingPairDialog(chosen));
+    });
+  }
+
+  Future<void> _showIncomingPairDialog(PendingPairRequestModel request) async {
+    var submitting = false;
+    var resolved = false;
+    try {
+      await showNeuDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (context, setDialogState) {
+              return NeuDialog(
+                title: '收到设备配对请求',
+                subtitle: '确认后对方设备将自动完成安全配对，无需手动输入配对码',
+                actions: <Widget>[
+                  NeuButton(
+                    label: '拒绝',
+                    tone: NeuButtonTone.neutral,
+                    onPressed: submitting
+                        ? null
+                        : () async {
+                            setDialogState(() => submitting = true);
+                            resolved = true;
+                            _handledPairRequestIds.add(request.requestId);
+                            try {
+                              await widget.bridge.respondPairRequest(
+                                requestId: request.requestId,
+                                accept: false,
+                              );
+                            } catch (_) {}
+                            if (dialogContext.mounted) {
+                              Navigator.of(dialogContext).pop();
+                            }
+                            if (mounted) {
+                              NeuToast.info(
+                                this.context,
+                                '已拒绝 ${request.deviceName} 的配对请求',
+                              );
+                            }
+                          },
+                  ),
+                  NeuButton(
+                    label: '同意配对',
+                    icon: Icons.verified_user_rounded,
+                    tone: NeuButtonTone.primary,
+                    loading: submitting,
+                    onPressed: submitting
+                        ? null
+                        : () async {
+                            setDialogState(() => submitting = true);
+                            resolved = true;
+                            _handledPairRequestIds.add(request.requestId);
+                            try {
+                              await widget.bridge.respondPairRequest(
+                                requestId: request.requestId,
+                                accept: true,
+                              );
+                              if (dialogContext.mounted) {
+                                Navigator.of(dialogContext).pop();
+                              }
+                              if (mounted) {
+                                NeuToast.success(
+                                  this.context,
+                                  '已同意与 ${request.deviceName} 配对',
+                                );
+                              }
+                            } catch (error) {
+                              if (dialogContext.mounted) {
+                                Navigator.of(dialogContext).pop();
+                              }
+                              if (mounted) {
+                                NeuToast.error(
+                                  this.context,
+                                  LanVaultBridge.formatUserError(error),
+                                );
+                              }
+                            }
+                          },
+                  ),
+                ],
+                child: NeuCard(
+                  inset: true,
+                  padding: const EdgeInsets.all(14),
+                  child: Row(
+                    children: <Widget>[
+                      NeuIconBadge(
+                        icon: request.osType.toLowerCase().contains('android')
+                            ? Icons.phone_android_rounded
+                            : Icons.computer_rounded,
+                        color: NeuTokens.accent,
+                        backgroundColor: NeuTokens.accentSoft,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            Text(
+                              request.deviceName,
+                              style: Theme.of(context).textTheme.titleSmall,
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              request.fingerprint.isEmpty
+                                  ? '${request.osType} · ${request.remoteIp}'
+                                  : '${request.osType} · ${request.remoteIp} · 指纹 ${request.fingerprint}',
+                              style: Theme.of(context).textTheme.bodySmall,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          );
+        },
+      );
+    } finally {
+      if (!resolved) {
+        _handledPairRequestIds.add(request.requestId);
+      }
+      _activePairDialogRequestId = null;
+      _onPendingPairRequests();
+    }
+  }
+
   String _titleForTab(_ShellTab tab) {
-    return _desktopDestinations
-        .firstWhere((item) => item.tab == tab)
-        .label;
+    return _desktopDestinations.firstWhere((item) => item.tab == tab).label;
+  }
+
+  Widget _buildAnimatedPageContent() {
+    return RepaintBoundary(
+      child: TweenAnimationBuilder<double>(
+        key: ValueKey<_ShellTab>(_selectedTab),
+        tween: Tween<double>(begin: 0.0, end: 1.0),
+        duration: const Duration(milliseconds: 160),
+        curve: Curves.linearToEaseOut,
+        builder: (context, t, child) {
+          final reduced = NeuMotion.isReduced(context);
+          return Opacity(
+            opacity: 0.92 + 0.08 * t,
+            child: Transform.translate(
+              offset: Offset(0, reduced ? 0 : (1 - t) * 5),
+              child: child,
+            ),
+          );
+        },
+        child: IndexedStack(
+          key: _pagesStackKey,
+          index: _selectedTab.index,
+          children: _pages,
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    final isWide = MediaQuery.sizeOf(context).width >= 840;
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
+    final hasCustomChrome = WindowChrome.isSupported;
+
+    final Widget content = isWide
+        ? Row(
+            children: <Widget>[
+              _DesktopNavRail(
+                bridge: widget.bridge,
+                destinations: _desktopDestinations,
+                selectedTab: _selectedTab,
+                showBrandHeader: !hasCustomChrome,
+                onSelected: (tab) => setState(() => _selectedTab = tab),
+                onOpenDeviceManager: _openDeviceManager,
+              ),
+              Expanded(child: _buildAnimatedPageContent()),
+            ],
+          )
+        : Column(
+            children: <Widget>[
+              _MobileTopBar(
+                title: _titleForTab(_selectedTab),
+                inSettings: _selectedTab == _ShellTab.settings,
+                devicePill: _selectedTab == _ShellTab.settings
+                    ? null
+                    : DeviceSwitcherPill(
+                        bridge: widget.bridge,
+                        compact: true,
+                        onOpenDeviceManager: _openDeviceManager,
+                      ),
+                onToggleSettings: () {
+                  setState(() {
+                    _selectedTab = _selectedTab == _ShellTab.settings
+                        ? _ShellTab.dashboard
+                        : _ShellTab.settings;
+                  });
+                },
+              ),
+              Expanded(child: _buildAnimatedPageContent()),
+            ],
+          );
 
     return Scaffold(
       backgroundColor: NeuTokens.canvas,
-      body: SafeArea(
-        child: isWide
-            ? Row(
-                children: <Widget>[
-                  _DesktopNavRail(
-                    destinations: _desktopDestinations,
-                    selectedTab: _selectedTab,
-                    onSelected: (tab) => setState(() => _selectedTab = tab),
+      body: hasCustomChrome
+          ? Column(
+              children: <Widget>[
+                WindowsTitleBar(
+                  centerWidget: DeviceSwitcherPill(
+                    bridge: widget.bridge,
+                    onOpenDeviceManager: _openDeviceManager,
                   ),
-                  Expanded(
-                    child: RepaintBoundary(
-                      child: TweenAnimationBuilder<double>(
-                        key: ValueKey<_ShellTab>(_selectedTab),
-                        tween: Tween<double>(begin: 0.0, end: 1.0),
-                        duration: const Duration(milliseconds: 160),
-                        curve: Curves.linearToEaseOut,
-                        builder: (context, t, child) {
-                          final reduced = NeuMotion.isReduced(context);
-                          return Opacity(
-                            opacity: 0.92 + 0.08 * t,
-                            child: Transform.translate(
-                              offset: Offset(0, reduced ? 0 : (1 - t) * 5),
-                              child: child,
-                            ),
-                          );
-                        },
-                        child: IndexedStack(
-                          key: _pagesStackKey,
-                          index: _selectedTab.index,
-                          children: _pages,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              )
-            : Column(
-                children: <Widget>[
-                  _MobileTopBar(
-                    title: _titleForTab(_selectedTab),
-                    inSettings: _selectedTab == _ShellTab.settings,
-                    onToggleSettings: () {
-                      setState(() {
-                        _selectedTab = _selectedTab == _ShellTab.settings
-                            ? _ShellTab.dashboard
-                            : _ShellTab.settings;
-                      });
-                    },
-                  ),
-                  Expanded(
-                    child: RepaintBoundary(
-                      child: TweenAnimationBuilder<double>(
-                        key: ValueKey<_ShellTab>(_selectedTab),
-                        tween: Tween<double>(begin: 0.0, end: 1.0),
-                        duration: const Duration(milliseconds: 160),
-                        curve: Curves.linearToEaseOut,
-                        builder: (context, t, child) {
-                          final reduced = NeuMotion.isReduced(context);
-                          return Opacity(
-                            opacity: 0.92 + 0.08 * t,
-                            child: Transform.translate(
-                              offset: Offset(0, reduced ? 0 : (1 - t) * 5),
-                              child: child,
-                            ),
-                          );
-                        },
-                        child: IndexedStack(
-                          key: _pagesStackKey,
-                          index: _selectedTab.index,
-                          children: _pages,
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-      ),
+                ),
+                Expanded(
+                  child: SafeArea(top: false, child: content),
+                ),
+              ],
+            )
+          : SafeArea(child: content),
       bottomNavigationBar: isWide
           ? null
           : _MobileNavBar(
@@ -375,55 +596,59 @@ class _MobileTopBar extends StatelessWidget {
     required this.title,
     required this.inSettings,
     required this.onToggleSettings,
+    this.devicePill,
   });
 
   final String title;
   final bool inSettings;
   final VoidCallback onToggleSettings;
+  final Widget? devicePill;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      padding: const EdgeInsets.fromLTRB(20, 12, 14, 8),
+      padding: const EdgeInsets.fromLTRB(20, 10, 16, 6),
       color: NeuTokens.canvas,
       child: Row(
         children: <Widget>[
-          const BrandLogoMark(size: 26),
+          Text(
+            title,
+            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                  fontSize: 23,
+                  fontWeight: FontWeight.w800,
+                ),
+          ),
           const SizedBox(width: 10),
           Expanded(
-            child: Text(
-              title,
-              style: Theme.of(context).textTheme.headlineSmall?.copyWith(
-                    fontSize: 22,
-                  ),
-            ),
+            child: devicePill != null
+                ? Center(child: devicePill!)
+                : const SizedBox.shrink(),
           ),
+          const SizedBox(width: 10),
           Semantics(
             button: true,
             label: inSettings ? '返回总览' : '打开设置',
             child: InkWell(
               onTap: onToggleSettings,
-              borderRadius: const BorderRadius.all(Radius.circular(12)),
+              borderRadius:
+                  const BorderRadius.all(Radius.circular(NeuRadius.pill)),
               child: Container(
-                width: 40,
-                height: 40,
+                width: NeuTokens.minMobileTouchTarget,
+                height: NeuTokens.minMobileTouchTarget,
                 decoration: BoxDecoration(
                   color: inSettings ? NeuTokens.accentSoft : NeuTokens.surface,
-                  borderRadius: const BorderRadius.all(Radius.circular(12)),
+                  shape: BoxShape.circle,
                   border: Border.all(
                     color: inSettings
                         ? NeuTokens.accent.withValues(alpha: 0.35)
                         : NeuTokens.hairlineBorder,
                   ),
+                  boxShadow: NeuTokens.controlShadows,
                 ),
                 child: Icon(
-                  inSettings
-                      ? Icons.close_rounded
-                      : Icons.settings_outlined,
+                  inSettings ? Icons.close_rounded : Icons.settings_outlined,
                   size: 20,
-                  color: inSettings
-                      ? NeuTokens.accent
-                      : NeuTokens.textPrimary,
+                  color: inSettings ? NeuTokens.accent : NeuTokens.textPrimary,
                 ),
               ),
             ),
@@ -436,20 +661,26 @@ class _MobileTopBar extends StatelessWidget {
 
 class _DesktopNavRail extends StatelessWidget {
   const _DesktopNavRail({
+    required this.bridge,
     required this.destinations,
     required this.selectedTab,
     required this.onSelected,
+    required this.onOpenDeviceManager,
+    this.showBrandHeader = true,
   });
 
+  final LanVaultBridge bridge;
   final List<_NavItem> destinations;
   final _ShellTab selectedTab;
   final ValueChanged<_ShellTab> onSelected;
+  final VoidCallback onOpenDeviceManager;
+  final bool showBrandHeader;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: 216,
-      padding: const EdgeInsets.fromLTRB(16, 20, 16, 18),
+      width: 212,
+      padding: const EdgeInsets.fromLTRB(14, 18, 14, 16),
       decoration: const BoxDecoration(
         color: Color(0xFFFAFBFD),
         border: Border(
@@ -459,38 +690,47 @@ class _DesktopNavRail extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-            child: Row(
-              children: <Widget>[
-                const BrandLogoMark(size: 30),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Text(
-                        'EveryoneNAS',
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: -0.3,
-                            ),
-                      ),
-                      Text(
-                        'v${LanVaultBridge.appVersion}',
-                        style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                              fontSize: 11,
-                              color: NeuTokens.textSecondary,
-                            ),
-                      ),
-                    ],
+          if (showBrandHeader) ...<Widget>[
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+              child: Row(
+                children: <Widget>[
+                  const BrandLogoMark(size: 30),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        Text(
+                          'EveryoneNAS',
+                          overflow: TextOverflow.ellipsis,
+                          style:
+                              Theme.of(context).textTheme.titleMedium?.copyWith(
+                                    fontWeight: FontWeight.w800,
+                                    letterSpacing: -0.3,
+                                  ),
+                        ),
+                        Text(
+                          'v${LanVaultBridge.appVersion}',
+                          style:
+                              Theme.of(context).textTheme.labelMedium?.copyWith(
+                                    fontSize: 11,
+                                    color: NeuTokens.textSecondary,
+                                  ),
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-              ],
+                ],
+              ),
             ),
-          ),
-          const SizedBox(height: 22),
+            const SizedBox(height: 12),
+            DeviceSwitcherPill(
+              bridge: bridge,
+              onOpenDeviceManager: onOpenDeviceManager,
+            ),
+            const SizedBox(height: 18),
+          ],
           Builder(
             builder: (context) {
               const itemHeight = 44.0;
@@ -535,33 +775,51 @@ class _DesktopNavRail extends StatelessWidget {
             },
           ),
           const Spacer(),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            decoration: BoxDecoration(
-              color: NeuTokens.insetSurface,
-              borderRadius: const BorderRadius.all(Radius.circular(12)),
-              border: Border.all(color: NeuTokens.hairlineBorder),
-            ),
-            child: Row(
-              children: <Widget>[
-                const Icon(
-                  Icons.verified_user_outlined,
-                  size: 16,
-                  color: NeuTokens.healthy,
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    '局域网零知识加密',
-                    overflow: TextOverflow.ellipsis,
-                    style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                          color: NeuTokens.textSecondary,
-                          fontSize: 11.5,
+          ValueListenableBuilder<bool>(
+            valueListenable: bridge.serverRunningNotifier,
+            builder: (context, running, _) {
+              return InkWell(
+                onTap: () => onSelected(_ShellTab.settings),
+                borderRadius: const BorderRadius.all(Radius.circular(12)),
+                child: Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  decoration: BoxDecoration(
+                    color: NeuTokens.insetSurface,
+                    borderRadius: const BorderRadius.all(Radius.circular(12)),
+                    border: Border.all(color: NeuTokens.hairlineBorder),
+                  ),
+                  child: Row(
+                    children: <Widget>[
+                      Container(
+                        width: 8,
+                        height: 8,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: running
+                              ? NeuTokens.healthy
+                              : NeuTokens.textSecondary.withValues(alpha: 0.4),
                         ),
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          running
+                              ? '本地服务运行中 :${LanVaultBridge.defaultServerPort}'
+                              : '本地服务未启动',
+                          overflow: TextOverflow.ellipsis,
+                          style:
+                              Theme.of(context).textTheme.labelMedium?.copyWith(
+                                    color: NeuTokens.textSecondary,
+                                    fontSize: 11.5,
+                                  ),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-              ],
-            ),
+              );
+            },
           ),
         ],
       ),
@@ -722,7 +980,7 @@ class _MobileNavBar extends StatelessWidget {
       child: SafeArea(
         top: false,
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 6),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           child: Row(
             children: <Widget>[
               for (final item in destinations)
@@ -741,10 +999,21 @@ class _MobileNavBar extends StatelessWidget {
                             mainAxisSize: MainAxisSize.min,
                             mainAxisAlignment: MainAxisAlignment.center,
                             children: <Widget>[
-                              AnimatedScale(
-                                scale: item.tab == selectedTab ? 1.12 : 1.0,
-                                duration: NeuMotion.resolvePress(context),
-                                curve: NeuMotion.resolvePressCurve(context),
+                              AnimatedContainer(
+                                duration: NeuMotion.resolveState(context),
+                                curve: NeuMotion.resolveStateCurve(context),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 16,
+                                  vertical: 5,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: item.tab == selectedTab
+                                      ? NeuTokens.accentSoft
+                                      : Colors.transparent,
+                                  borderRadius: const BorderRadius.all(
+                                    Radius.circular(NeuRadius.pill),
+                                  ),
+                                ),
                                 child: Icon(
                                   item.tab == selectedTab
                                       ? item.selectedIcon
@@ -755,7 +1024,7 @@ class _MobileNavBar extends StatelessWidget {
                                       : NeuTokens.textSecondary,
                                 ),
                               ),
-                              const SizedBox(height: 3),
+                              const SizedBox(height: 2),
                               Text(
                                 item.label,
                                 maxLines: 1,

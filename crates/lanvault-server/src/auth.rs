@@ -380,7 +380,20 @@ impl AuthManager {
             .remove(token)
             .map(|(_, record)| record.expires_at)
             .unwrap_or_else(|| Instant::now() + Duration::from_secs(SESSION_TTL_SECS));
+        if self.revoked_tokens.len() >= MAX_SESSIONS {
+            let now = Instant::now();
+            self.revoked_tokens.retain(|_, exp| *exp > now);
+        }
         self.revoked_tokens.insert(token.to_string(), expires_at);
+    }
+
+    /// Removes a previously revoked device ID when the peer legitimately re-pairs.
+    pub fn unrevoke_device(&self, device_id: &str) {
+        self.revoked_devices.remove(device_id);
+    }
+
+    pub fn validate_session_device_active(&self, device_id: &str) -> bool {
+        !self.revoked_devices.contains(device_id)
     }
 
     pub fn revoke_device_sessions(&self, device_id: &str) {
@@ -479,5 +492,25 @@ mod tests {
             auth.check_and_record_pair_attempt(ip, true),
             AuthOutcome::LockedOut { .. }
         ));
+    }
+
+    #[test]
+    fn unrevoke_device_restores_session_validation_after_repair() {
+        let auth = AuthManager::from_plaintext_password(
+            "secret-pass",
+            Arc::new(DeviceIdentity::generate()),
+        )
+        .unwrap();
+        let dev_id = "lv-0123456789ab";
+        let t1 = auth.issue_peer_session(dev_id.to_string());
+        assert!(auth.validate_session(&t1).is_some());
+
+        auth.revoke_device_sessions(dev_id);
+        let t2 = auth.issue_peer_session(dev_id.to_string());
+        assert!(auth.validate_session(&t2).is_none());
+
+        auth.unrevoke_device(dev_id);
+        let t3 = auth.issue_peer_session(dev_id.to_string());
+        assert!(auth.validate_session(&t3).is_some());
     }
 }

@@ -25,6 +25,8 @@ class PairingScreen extends StatefulWidget {
 class _PairingScreenState extends State<PairingScreen> {
   final Map<String, DiscoveredPeer> _discovered = <String, DiscoveredPeer>{};
   StreamSubscription<DiscoveredPeer>? _scanSub;
+  Timer? _refreshTimer;
+  Timer? _scanTimeoutTimer;
 
   _DeviceTab _activeTab = _DeviceTab.paired;
   bool _scanning = false;
@@ -37,13 +39,45 @@ class _PairingScreenState extends State<PairingScreen> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // 定期刷新已配对列表，让"在线/离线"随握手租约（45s）及时收敛，
+    // 用户不需要切页或重启就能看到两端状态一致。
+    _refreshTimer ??= Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => unawaited(_refreshPairedPeers(silent: true)),
+    );
+  }
+
+  @override
   void dispose() {
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    _scanTimeoutTimer?.cancel();
+    _scanTimeoutTimer = null;
     _scanSub?.cancel();
+    _scanSub = null;
     super.dispose();
   }
 
-  Future<void> _refreshPairedPeers() async {
-    setState(() => _loadingPaired = true);
+  void _stopScan({bool silent = true}) {
+    _scanTimeoutTimer?.cancel();
+    _scanTimeoutTimer = null;
+    _scanSub?.cancel();
+    _scanSub = null;
+    if (_scanning && mounted) {
+      setState(() => _scanning = false);
+      if (!silent) {
+        NeuToast.info(context, '已停止局域网设备扫描');
+      }
+    } else {
+      _scanning = false;
+    }
+  }
+
+  Future<void> _refreshPairedPeers({bool silent = false}) async {
+    if (_loadingPaired) return;
+    if (!silent) setState(() => _loadingPaired = true);
     try {
       await widget.bridge.refreshPairedPeers();
       if (!mounted) return;
@@ -51,18 +85,23 @@ class _PairingScreenState extends State<PairingScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _loadingPaired = false);
-      NeuToast.error(context, '读取已配对设备失败：${LanVaultBridge.formatUserError(err)}');
+      if (!silent) {
+        NeuToast.error(context, '读取已配对设备失败：${LanVaultBridge.formatUserError(err)}');
+      }
     }
   }
 
   void _toggleScan() {
     if (_scanning) {
-      _scanSub?.cancel();
-      _scanSub = null;
-      setState(() => _scanning = false);
-      NeuToast.info(context, '已停止局域网设备扫描');
+      _stopScan(silent: false);
       return;
     }
+    _scanTimeoutTimer?.cancel();
+    _scanTimeoutTimer = Timer(const Duration(seconds: 20), () {
+      if (!mounted || !_scanning) return;
+      _stopScan(silent: true);
+      NeuToast.info(context, '局域网扫描已完成，如需继续可点击重新扫描');
+    });
 
     setState(() {
       _scanning = true;
@@ -77,22 +116,20 @@ class _PairingScreenState extends State<PairingScreen> {
           setState(() => _discovered[peer.deviceId] = peer);
         },
         onError: (Object err) {
-          _scanSub?.cancel();
-          _scanSub = null;
+          _stopScan(silent: true);
           if (!mounted) return;
-          setState(() => _scanning = false);
           NeuToast.error(context, '扫描失败：${LanVaultBridge.formatUserError(err)}');
         },
         onDone: () {
-          _scanSub = null;
-          if (!mounted) return;
-          setState(() => _scanning = false);
+          _stopScan(silent: true);
         },
         cancelOnError: true,
       );
     } catch (err) {
-      setState(() => _scanning = false);
-      NeuToast.error(context, '启动扫描失败：${LanVaultBridge.formatUserError(err)}');
+      _stopScan(silent: true);
+      if (mounted) {
+        NeuToast.error(context, '启动扫描失败：${LanVaultBridge.formatUserError(err)}');
+      }
     }
   }
 
@@ -111,6 +148,85 @@ class _PairingScreenState extends State<PairingScreen> {
     }
   }
 
+  Future<void> _initiateInteractivePairing(DiscoveredPeer peer) async {
+    var cancelled = false;
+    var dialogClosed = false;
+
+    unawaited(() async {
+      try {
+        await widget.bridge.requestPairing(ip: peer.ip, port: peer.port);
+        if (!mounted || cancelled) return;
+        if (!dialogClosed && Navigator.of(context, rootNavigator: true).canPop()) {
+          dialogClosed = true;
+          Navigator.of(context, rootNavigator: true).pop();
+        }
+        _stopScan(silent: true);
+        NeuToast.success(context, '已与 ${peer.deviceName} 完成配对');
+        setState(() => _activeTab = _DeviceTab.paired);
+        await _refreshPairedPeers();
+      } catch (err) {
+        if (!mounted || cancelled) return;
+        if (!dialogClosed && Navigator.of(context, rootNavigator: true).canPop()) {
+          dialogClosed = true;
+          Navigator.of(context, rootNavigator: true).pop();
+        }
+        NeuToast.error(context, LanVaultBridge.formatUserError(err));
+      }
+    }());
+
+    await showNeuDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) {
+        return NeuDialog(
+          title: '正在等待对方确认配对',
+          subtitle: '请在 ${peer.deviceName} (${peer.ip}) 的弹窗中点击“同意配对”',
+          actions: <Widget>[
+            NeuButton(
+              label: '使用 PIN 配对',
+              onPressed: () {
+                cancelled = true;
+                dialogClosed = true;
+                Navigator.of(dialogContext).pop();
+                _openPairDialog(initialIp: peer.ip, initialPort: peer.port);
+              },
+            ),
+            NeuButton(
+              label: '取消',
+              tone: NeuButtonTone.danger,
+              onPressed: () {
+                cancelled = true;
+                dialogClosed = true;
+                Navigator.of(dialogContext).pop();
+              },
+            ),
+          ],
+          child: NeuCard(
+            inset: true,
+            padding: const EdgeInsets.all(16),
+            child: Row(
+              children: <Widget>[
+                const SizedBox(
+                  width: 24,
+                  height: 24,
+                  child: CircularProgressIndicator(strokeWidth: 2.5),
+                ),
+                const SizedBox(width: 14),
+                Expanded(
+                  child: Text(
+                    '已向 ${peer.deviceName} 发送配对邀请，无需手动输入配对码…',
+                    style: Theme.of(dialogContext).textTheme.bodyMedium,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+    dialogClosed = true;
+  }
+
   Future<void> _openPairDialog({String? initialIp, int? initialPort}) async {
     final paired = await showNeuDialog<bool>(
       context: context,
@@ -121,6 +237,8 @@ class _PairingScreenState extends State<PairingScreen> {
       ),
     );
     if (paired == true && mounted) {
+      _stopScan(silent: true);
+      setState(() => _activeTab = _DeviceTab.paired);
       await _refreshPairedPeers();
     }
   }
@@ -151,12 +269,41 @@ class _PairingScreenState extends State<PairingScreen> {
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
-    final isWide = MediaQuery.sizeOf(context).width >= 840;
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
     final discoveredList = _discovered.values.toList(growable: false);
 
     return ValueListenableBuilder<List<PairedPeerModel>>(
       valueListenable: widget.bridge.pairedPeersNotifier,
       builder: (context, pairedPeers, _) {
+        final segmentControl = NeuSegmentedControl<_DeviceTab>(
+          semanticLabel: '设备列表分类',
+          value: _activeTab,
+          onChanged: (tab) {
+            if (tab == _DeviceTab.paired && _scanning) {
+              _stopScan(silent: true);
+            }
+            setState(() => _activeTab = tab);
+          },
+          segments: <NeuSegment<_DeviceTab>>[
+            NeuSegment<_DeviceTab>(
+              value: _DeviceTab.paired,
+              label: '我的设备 (${pairedPeers.length})',
+            ),
+            NeuSegment<_DeviceTab>(
+              value: _DeviceTab.discovered,
+              label: '局域网发现 (${discoveredList.length})',
+            ),
+          ],
+        );
+        final scanButton = NeuButton(
+          label: _scanning ? '停止扫描' : '扫描局域网',
+          icon: _scanning ? Icons.stop_rounded : Icons.radar_rounded,
+          tone: _scanning ? NeuButtonTone.danger : NeuButtonTone.neutral,
+          expanded: !isWide,
+          onPressed: _toggleScan,
+        );
+
         return SingleChildScrollView(
           padding: EdgeInsets.all(isWide ? NeuSpace.lg : NeuSpace.md),
           child: Column(
@@ -196,39 +343,28 @@ class _PairingScreenState extends State<PairingScreen> {
                 ],
               ),
               const SizedBox(height: 18),
-              Row(
-                children: <Widget>[
-                  Expanded(
-                    child: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 360),
-                      child: NeuSegmentedControl<_DeviceTab>(
-                        semanticLabel: '设备列表分类',
-                        value: _activeTab,
-                        onChanged: (tab) => setState(() => _activeTab = tab),
-                        segments: <NeuSegment<_DeviceTab>>[
-                          NeuSegment<_DeviceTab>(
-                            value: _DeviceTab.paired,
-                            label: '我的设备 (${pairedPeers.length})',
-                          ),
-                          NeuSegment<_DeviceTab>(
-                            value: _DeviceTab.discovered,
-                            label: '局域网发现 (${discoveredList.length})',
-                          ),
-                        ],
+              if (isWide)
+                Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 380),
+                        child: segmentControl,
                       ),
                     ),
-                  ),
-                  const SizedBox(width: NeuSpace.sm),
-                  NeuButton(
-                    label: _scanning ? '停止扫描' : '扫描局域网',
-                    icon: _scanning ? Icons.stop_rounded : Icons.radar_rounded,
-                    tone: _scanning
-                        ? NeuButtonTone.danger
-                        : NeuButtonTone.neutral,
-                    onPressed: _toggleScan,
-                  ),
+                    if (_activeTab == _DeviceTab.discovered) ...<Widget>[
+                      const SizedBox(width: NeuSpace.sm),
+                      scanButton,
+                    ],
+                  ],
+                )
+              else ...<Widget>[
+                segmentControl,
+                if (_activeTab == _DeviceTab.discovered) ...<Widget>[
+                  const SizedBox(height: NeuSpace.sm),
+                  scanButton,
                 ],
-              ),
+              ],
               const SizedBox(height: NeuSpace.md),
               if (_activeTab == _DeviceTab.paired)
                 _buildPairedListCard(context, pairedPeers)
@@ -255,33 +391,10 @@ class _PairingScreenState extends State<PairingScreen> {
       );
     }
     if (peers.isEmpty) {
-      return NeuCard(
-        padding: const EdgeInsets.all(28),
-        child: Column(
-          children: <Widget>[
-            Container(
-              width: 52,
-              height: 52,
-              decoration: const BoxDecoration(
-                color: NeuTokens.accentSoft,
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.devices_other_rounded,
-                size: 26,
-                color: NeuTokens.accent,
-              ),
-            ),
-            const SizedBox(height: 12),
-            Text('暂无已配对设备', style: textTheme.titleMedium),
-            const SizedBox(height: 4),
-            Text(
-              '点击右上角“+ 配对新设备”查看本机 6 位 PIN 或输入对端 IP 进行配对。',
-              textAlign: TextAlign.center,
-              style: textTheme.bodySmall,
-            ),
-          ],
-        ),
+      return const NeuEmptyState(
+        icon: Icons.devices_other_rounded,
+        title: '暂无已配对设备',
+        subtitle: '点击“扫描局域网”发现设备发起配对，或点击“+ 配对新设备”查看本机配对信息。',
       );
     }
 
@@ -291,23 +404,27 @@ class _PairingScreenState extends State<PairingScreen> {
         children: <Widget>[
           for (var i = 0; i < peers.length; i++) ...<Widget>[
             Builder(
+              key: ValueKey<String>('paired_${peers[i].deviceId}'),
               builder: (context) {
                 final peer = peers[i];
                 final (icon, fg, bg) = _deviceIcon(peer.osType);
                 final hasIp = peer.ip != null && peer.ip!.isNotEmpty;
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
+                return InkWell(
+                  onTap: () {
+                    widget.bridge.selectPeer(peer.deviceId);
+                    NeuToast.success(context, '已切换当前目标设备为 ${peer.deviceName}');
+                  },
+                  borderRadius: const BorderRadius.all(Radius.circular(12)),
+                  child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
                   child: Row(
                     children: <Widget>[
-                      Container(
-                        width: 44,
-                        height: 44,
-                        decoration: BoxDecoration(
-                          color: bg,
-                          borderRadius:
-                              const BorderRadius.all(Radius.circular(12)),
-                        ),
-                        child: Icon(icon, size: 22, color: fg),
+                      NeuIconBadge(
+                        icon: icon,
+                        color: fg,
+                        backgroundColor: bg,
+                        size: 44,
+                        iconSize: 22,
                       ),
                       const SizedBox(width: 14),
                       Expanded(
@@ -318,6 +435,8 @@ class _PairingScreenState extends State<PairingScreen> {
                               peer.deviceName.trim().isEmpty
                                   ? peer.deviceId
                                   : peer.deviceName,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
                               style: textTheme.titleSmall?.copyWith(
                                 fontSize: 15,
                               ),
@@ -374,6 +493,7 @@ class _PairingScreenState extends State<PairingScreen> {
                       ),
                     ],
                   ),
+                  ),
                 );
               },
             ),
@@ -390,38 +510,12 @@ class _PairingScreenState extends State<PairingScreen> {
   ) {
     final textTheme = Theme.of(context).textTheme;
     if (peers.isEmpty) {
-      return NeuCard(
-        padding: const EdgeInsets.all(28),
-        child: Column(
-          children: <Widget>[
-            Container(
-              width: 52,
-              height: 52,
-              decoration: const BoxDecoration(
-                color: NeuTokens.accentSoft,
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.radar_rounded,
-                size: 26,
-                color: NeuTokens.accent,
-              ),
-            ),
-            const SizedBox(height: 12),
-            Text(
-              _scanning ? '正在搜索局域网设备…' : '尚未发现局域网设备',
-              style: textTheme.titleMedium,
-            ),
-            const SizedBox(height: 4),
-            Text(
-              _scanning
-                  ? '请确保目标设备的 EveryoneNAS 处于同一局域网并已运行。'
-                  : '点击“扫描局域网”以通过 mDNS 发现周边 Windows / Android 设备。',
-              textAlign: TextAlign.center,
-              style: textTheme.bodySmall,
-            ),
-          ],
-        ),
+      return NeuEmptyState(
+        icon: Icons.radar_rounded,
+        title: _scanning ? '正在搜索局域网设备…' : '尚未发现局域网设备',
+        subtitle: _scanning
+            ? '请确保目标设备的 EveryoneNAS 处于同一局域网并已运行。'
+            : '点击“扫描局域网”以通过 mDNS 发现周边 Windows / Android 设备。',
       );
     }
 
@@ -431,6 +525,7 @@ class _PairingScreenState extends State<PairingScreen> {
         children: <Widget>[
           for (var i = 0; i < peers.length; i++) ...<Widget>[
             Builder(
+              key: ValueKey<String>('discovered_${peers[i].deviceId}'),
               builder: (context) {
                 final peer = peers[i];
                 final (icon, fg, bg) = _deviceIcon(peer.osType);
@@ -438,15 +533,12 @@ class _PairingScreenState extends State<PairingScreen> {
                   padding: const EdgeInsets.symmetric(vertical: 12),
                   child: Row(
                     children: <Widget>[
-                      Container(
-                        width: 44,
-                        height: 44,
-                        decoration: BoxDecoration(
-                          color: bg,
-                          borderRadius:
-                              const BorderRadius.all(Radius.circular(12)),
-                        ),
-                        child: Icon(icon, size: 22, color: fg),
+                      NeuIconBadge(
+                        icon: icon,
+                        color: fg,
+                        backgroundColor: bg,
+                        size: 44,
+                        iconSize: 22,
                       ),
                       const SizedBox(width: 14),
                       Expanded(
@@ -455,6 +547,8 @@ class _PairingScreenState extends State<PairingScreen> {
                           children: <Widget>[
                             Text(
                               peer.deviceName,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
                               style: textTheme.titleSmall?.copyWith(
                                 fontSize: 15,
                               ),
@@ -473,10 +567,7 @@ class _PairingScreenState extends State<PairingScreen> {
                         label: '配对',
                         icon: Icons.link_rounded,
                         tone: NeuButtonTone.primary,
-                        onPressed: () => _openPairDialog(
-                          initialIp: peer.ip,
-                          initialPort: peer.port,
-                        ),
+                        onPressed: () => _initiateInteractivePairing(peer),
                       ),
                     ],
                   ),
@@ -522,11 +613,17 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
   @override
   void initState() {
     super.initState();
+    _pinController.addListener(_onPinChanged);
     _loadLocalPairingInfo();
+  }
+
+  void _onPinChanged() {
+    if (mounted) setState(() {});
   }
 
   @override
   void dispose() {
+    _pinController.removeListener(_onPinChanged);
     _ipController.dispose();
     _portController.dispose();
     _pinController.dispose();
@@ -549,6 +646,28 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     }
   }
 
+  Future<void> _submitInteractiveRequest() async {
+    final ip = _ipController.text.trim();
+    final port = int.tryParse(_portController.text.trim());
+    if (ip.isEmpty || port == null || port <= 0 || port > 65535) {
+      NeuToast.warning(context, '请输入有效的目标 IP 与端口（1–65535）');
+      return;
+    }
+
+    setState(() => _pairing = true);
+    try {
+      NeuToast.info(context, '已发送配对请求，请在对方设备弹窗中确认…');
+      final pairedId = await widget.bridge.requestPairing(ip: ip, port: port);
+      if (!mounted) return;
+      NeuToast.success(context, '配对成功（设备：$pairedId）');
+      Navigator.of(context).pop(true);
+    } catch (err) {
+      if (!mounted) return;
+      setState(() => _pairing = false);
+      NeuToast.error(context, LanVaultBridge.formatUserError(err));
+    }
+  }
+
   Future<void> _submitPair() async {
     final ip = _ipController.text.trim();
     final port = int.tryParse(_portController.text.trim());
@@ -556,6 +675,10 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
 
     if (ip.isEmpty || port == null || port <= 0 || port > 65535) {
       NeuToast.warning(context, '请输入有效的目标 IP 与端口（1–65535）');
+      return;
+    }
+    if (pin.isEmpty) {
+      await _submitInteractiveRequest();
       return;
     }
     if (!RegExp(r'^\d{6}$').hasMatch(pin)) {
@@ -585,141 +708,129 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     final textTheme = Theme.of(context).textTheme;
     final info = _localInfo;
 
-    return Dialog(
-      child: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 480),
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: <Widget>[
-                  Text('配对新设备', style: textTheme.titleMedium?.copyWith(fontSize: 18)),
-                  IconButton(
-                    icon: const Icon(Icons.close_rounded, size: 20),
-                    onPressed: () => Navigator.of(context).pop(false),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              NeuCard(
-                inset: true,
-                padding: const EdgeInsets.all(14),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+    return NeuDialog(
+      title: '配对新设备',
+      maxWidth: 480,
+      actions: <Widget>[
+        NeuButton(
+          label: '取消',
+          onPressed: _pairing ? null : () => Navigator.of(context).pop(false),
+        ),
+        NeuButton(
+          label: _pinController.text.trim().isEmpty ? '发起配对请求' : '验证 PIN 并配对',
+          icon: Icons.verified_user_outlined,
+          tone: NeuButtonTone.primary,
+          loading: _pairing,
+          onPressed: _submitPair,
+        ),
+      ],
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          NeuCard(
+            inset: true,
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: <Widget>[
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: <Widget>[
-                        Text('本机配对信息', style: textTheme.titleSmall),
-                        NeuStatusBadge(
-                          label: info?.serverRunning == true ? '等待连接' : '服务未启动',
-                          tone: info?.serverRunning == true
-                              ? NeuStatusTone.healthy
-                              : NeuStatusTone.neutral,
-                        ),
-                      ],
+                    Text('本机配对信息', style: textTheme.titleSmall),
+                    NeuStatusBadge(
+                      label: info?.serverRunning == true ? '等待连接' : '服务未启动',
+                      tone: info?.serverRunning == true
+                          ? NeuStatusTone.healthy
+                          : NeuStatusTone.neutral,
                     ),
-                    const SizedBox(height: 10),
-                    if (_loadingInfo)
-                      Text('正在获取本机 6 位配对 PIN…', style: textTheme.bodySmall)
-                    else if (info != null) ...<Widget>[
-                      Row(
-                        children: <Widget>[
-                          Expanded(
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: <Widget>[
-                                Text(
-                                  info.pairingPin.isEmpty
-                                      ? '------'
-                                      : info.pairingPin.split('').join(' '),
-                                  style: textTheme.headlineSmall?.copyWith(
-                                    color: NeuTokens.accent,
-                                    letterSpacing: 3,
-                                    fontFeatures: const <FontFeature>[
-                                      FontFeature.tabularFigures(),
-                                    ],
-                                  ),
-                                ),
-                                const SizedBox(height: 4),
-                                Text(
-                                  '局域网地址：${info.lanIp}:${info.port}',
-                                  style: textTheme.bodySmall,
-                                ),
-                              ],
-                            ),
-                          ),
-                          NeuButton(
-                            label: '复制 PIN',
-                            icon: Icons.copy_rounded,
-                            onPressed: info.pairingPin.isEmpty
-                                ? null
-                                : () async {
-                                    await Clipboard.setData(
-                                      ClipboardData(text: info.pairingPin),
-                                    );
-                                    if (context.mounted) {
-                                      NeuToast.success(context, '已复制本机配对 PIN');
-                                    }
-                                  },
-                          ),
-                        ],
-                      ),
-                    ],
                   ],
                 ),
-              ),
-              const SizedBox(height: 18),
-              Text('连接其他设备', style: textTheme.titleSmall),
-              const SizedBox(height: 10),
-              Row(
-                children: <Widget>[
-                  Expanded(
-                    flex: 3,
-                    child: NeuInsetField(
-                      controller: _ipController,
-                      label: '对端局域网 IP',
-                      hint: '192.168.1.100',
-                      prefixIcon: Icons.lan_outlined,
-                    ),
+                const SizedBox(height: 10),
+                if (_loadingInfo)
+                  Text('正在获取本机 6 位配对 PIN…', style: textTheme.bodySmall)
+                else if (info != null)
+                  Row(
+                    children: <Widget>[
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: <Widget>[
+                            Text(
+                              info.pairingPin.isEmpty
+                                  ? '------'
+                                  : info.pairingPin.split('').join(' '),
+                              style: textTheme.headlineSmall?.copyWith(
+                                color: NeuTokens.accent,
+                                letterSpacing: 3,
+                                fontFeatures: const <FontFeature>[
+                                  FontFeature.tabularFigures(),
+                                ],
+                              ),
+                            ),
+                            const SizedBox(height: 4),
+                            Text(
+                              '局域网地址：${info.lanIp}:${info.port}',
+                              style: textTheme.bodySmall,
+                            ),
+                          ],
+                        ),
+                      ),
+                      NeuButton(
+                        label: '复制 PIN',
+                        icon: Icons.copy_rounded,
+                        onPressed: info.pairingPin.isEmpty
+                            ? null
+                            : () async {
+                                await Clipboard.setData(
+                                  ClipboardData(text: info.pairingPin),
+                                );
+                                if (context.mounted) {
+                                  NeuToast.success(context, '已复制本机配对 PIN');
+                                }
+                              },
+                      ),
+                    ],
                   ),
-                  const SizedBox(width: NeuSpace.sm),
-                  Expanded(
-                    flex: 2,
-                    child: NeuInsetField(
-                      controller: _portController,
-                      label: '端口',
-                      hint: '7842',
-                      keyboardType: TextInputType.number,
-                    ),
-                  ),
-                ],
+              ],
+            ),
+          ),
+          const SizedBox(height: 18),
+          Text('连接其他设备', style: textTheme.titleSmall),
+          const SizedBox(height: 10),
+          Row(
+            children: <Widget>[
+              Expanded(
+                flex: 3,
+                child: NeuInsetField(
+                  controller: _ipController,
+                  label: '对端局域网 IP',
+                  hint: '192.168.1.100',
+                  prefixIcon: Icons.lan_outlined,
+                ),
               ),
-              const SizedBox(height: 12),
-              NeuInsetField(
-                controller: _pinController,
-                label: '6 位动态 PIN',
-                hint: '输入对端显示的 6 位数字',
-                keyboardType: TextInputType.number,
-                prefixIcon: Icons.pin_outlined,
-                onSubmitted: (_) => _submitPair(),
-              ),
-              const SizedBox(height: 18),
-              NeuButton(
-                label: '验证 PIN 并配对',
-                icon: Icons.verified_user_outlined,
-                tone: NeuButtonTone.primary,
-                loading: _pairing,
-                expanded: true,
-                onPressed: _submitPair,
+              const SizedBox(width: NeuSpace.sm),
+              Expanded(
+                flex: 2,
+                child: NeuInsetField(
+                  controller: _portController,
+                  label: '端口',
+                  hint: '7842',
+                  keyboardType: TextInputType.number,
+                ),
               ),
             ],
           ),
-        ),
+          const SizedBox(height: 12),
+          NeuInsetField(
+            controller: _pinController,
+            label: '6 位动态 PIN（选填，留空则向对方发送确认弹窗）',
+            hint: '留空即发起一键确认请求，或输入对端 6 位数字',
+            keyboardType: TextInputType.number,
+            prefixIcon: Icons.pin_outlined,
+            onSubmitted: (_) => _submitPair(),
+          ),
+        ],
       ),
     );
   }
