@@ -14,7 +14,7 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lanvault_core::{
@@ -62,22 +62,40 @@ pub struct ChunkReplicaReport {
 /// Content-addressed multi-volume vault manager.
 pub struct VaultStore {
     db: Arc<Database>,
-    write_lock: Mutex<()>,
+    /// GC and snapshot publication exclude uploads. Unrelated chunks can upload in parallel.
+    write_lock: RwLock<()>,
+    chunk_locks: [Mutex<()>; 256],
 }
 
 impl VaultStore {
     pub fn new(db: Arc<Database>) -> Self {
         Self {
             db,
-            write_lock: Mutex::new(()),
+            write_lock: RwLock::new(()),
+            chunk_locks: std::array::from_fn(|_| Mutex::new(())),
         }
     }
 
     pub fn with_write_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         let _guard = self
             .write_lock
-            .lock()
+            .write()
             .map_err(|_| LanVaultError::InvalidState("vault write lock poisoned".to_string()))?;
+        operation()
+    }
+
+    fn with_chunk_lock<T>(
+        &self,
+        hash: &[u8; 32],
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _vault = self
+            .write_lock
+            .read()
+            .map_err(|_| LanVaultError::InvalidState("vault write lock poisoned".to_string()))?;
+        let _chunk = self.chunk_locks[usize::from(hash[0])]
+            .lock()
+            .map_err(|_| LanVaultError::InvalidState("chunk write lock poisoned".to_string()))?;
         operation()
     }
 
@@ -98,7 +116,7 @@ impl VaultStore {
     ) -> Result<(VaultRecord, Vec<VaultVolumeRecord>)> {
         let _guard = self
             .write_lock
-            .lock()
+            .write()
             .map_err(|_| LanVaultError::InvalidState("vault write lock poisoned".to_string()))?;
         if name.trim().is_empty() {
             return Err(LanVaultError::InvalidInput(
@@ -220,6 +238,11 @@ impl VaultStore {
     ///
     /// Verifies the BLAKE3 hash of `stored_bytes` at the boundary and enforces quota limits.
     /// Returns `true` if a new chunk was stored, or `false` if deduplicated.
+    ///
+    /// Deliberately lock-free with respect to other uploads: the staging→`chunks/`
+    /// rename is atomic and content addressing makes concurrent writers idempotent.
+    /// Bit-Rot scrubbing is what re-verifies bytes on disk; the hot path only does an
+    /// O(1) `stat`, never a full re-read of a 1 MiB chunk per duplicate.
     pub fn put_chunk(
         &self,
         vault_id: &str,
@@ -233,9 +256,6 @@ impl VaultStore {
             Some(format!("vault={vault_id}")),
         );
         _probe.add_bytes(stored_bytes.len() as u64);
-        let _guard = self.write_lock.lock().map_err(|_| {
-            LanVaultError::InvalidState("vault write lock poisoned".to_string())
-        })?;
         let actual_hash = blake3_hash(stored_bytes);
         if actual_hash != *expected_hash {
             return Err(LanVaultError::CorruptedChunk {
@@ -243,34 +263,46 @@ impl VaultStore {
             });
         }
 
+        self.with_chunk_lock(expected_hash, || {
+            self.store_verified_chunk(vault_id, expected_hash, raw_size, stored_bytes)
+        })
+    }
+
+    fn store_verified_chunk(
+        &self,
+        vault_id: &str,
+        expected_hash: &[u8; 32],
+        raw_size: u64,
+        stored_bytes: &[u8],
+    ) -> Result<bool> {
         let vault = self
             .db
             .get_vault(vault_id)?
             .ok_or_else(|| LanVaultError::NotFound(format!("vault {vault_id}")))?;
         let stored_size = stored_bytes.len() as u64;
+        let hash_hex = hex::encode(expected_hash);
+        let volumes = self.online_volumes(vault_id)?;
 
-        // Deduplicate only when the registered bytes can still be read and verified.
         let existing = self.db.get_chunk(vault_id, expected_hash)?;
         if let Some(existing) = existing.as_ref() {
             if existing.scrub_status == lanvault_core::ScrubStatus::Ok
-                && self.get_chunk(vault_id, expected_hash).is_ok()
+                && self.chunk_present_on_pool(&vault, &volumes, expected_hash, |volume| {
+                    fs::read(chunk_file_path(Path::new(&volume.mount_path), &hash_hex))
+                        .is_ok_and(|bytes| bytes == stored_bytes)
+                })
             {
-                self.db
-                    .upsert_chunk(vault_id, expected_hash, raw_size, stored_size)?;
+                self.db.renew_orphan_chunk(vault_id, expected_hash)?;
                 return Ok(false);
             }
         }
 
         let available = vault.quota_bytes.saturating_sub(vault.used_bytes);
-        if stored_size > available {
+        if existing.is_none() && stored_size > available {
             return Err(LanVaultError::QuotaExceeded {
                 required: stored_size,
                 available,
             });
         }
-
-        let volumes = self.online_volumes(vault_id)?;
-        let hash_hex = hex::encode(expected_hash);
 
         match vault.pool_mode {
             PoolMode::Single => {
@@ -301,23 +333,16 @@ impl VaultStore {
             }
         }
 
-        let is_new = match self
+        if let Err(err) = self
             .db
             .upsert_chunk(vault_id, expected_hash, raw_size, stored_size)
         {
-            Ok(is_new) => is_new,
-            Err(err) => {
-                if existing.is_none() {
-                    let _ = self.delete_chunk_files(vault_id, expected_hash);
-                }
-                return Err(err);
+            if existing.is_none() {
+                let _ = self.delete_chunk_files(vault_id, expected_hash);
             }
-        };
-        if is_new {
-            self.db
-                .update_vault_used_bytes(vault_id, stored_size as i64)?;
+            return Err(err);
         }
-        Ok(is_new)
+        Ok(true)
     }
 
     /// Reads a chunk from the vault and verifies its BLAKE3 integrity.
@@ -325,6 +350,10 @@ impl VaultStore {
     /// Under `mirror_raid1`, if the primary copy is unreadable or corrupted, transparently
     /// reads from a healthy mirror and repairs the primary copy.
     pub fn get_chunk(&self, vault_id: &str, hash: &[u8; 32]) -> Result<Vec<u8>> {
+        self.with_chunk_lock(hash, || self.read_chunk(vault_id, hash))
+    }
+
+    fn read_chunk(&self, vault_id: &str, hash: &[u8; 32]) -> Result<Vec<u8>> {
         let _probe = lanvault_core::ProbeGuard::start(
             "server.vault",
             "vault.get_chunk",
@@ -335,20 +364,29 @@ impl VaultStore {
             .get_vault(vault_id)?
             .ok_or_else(|| LanVaultError::NotFound(format!("vault {vault_id}")))?;
         let volumes = self.online_volumes(vault_id)?;
+        Self::read_chunk_from_pool(&vault, &volumes, hash)
+    }
+
+    fn read_chunk_from_pool(
+        vault: &VaultRecord,
+        volumes: &[VaultVolumeRecord],
+        hash: &[u8; 32],
+    ) -> Result<Vec<u8>> {
+        let vault_id = &vault.vault_id;
         let hash_hex = hex::encode(hash);
 
         match vault.pool_mode {
             PoolMode::Single => {
-                let primary = primary_volume(&volumes)?;
+                let primary = primary_volume(volumes)?;
                 read_verified_chunk(Path::new(&primary.mount_path), &hash_hex, hash)
             }
             PoolMode::Striped => {
-                let target = striped_target_volume(&volumes, hash)?;
+                let target = striped_target_volume(volumes, hash)?;
                 let target_path = chunk_file_path(Path::new(&target.mount_path), &hash_hex);
                 if target_path.exists() {
                     return read_verified_chunk(Path::new(&target.mount_path), &hash_hex, hash);
                 }
-                for vol in &volumes {
+                for vol in volumes {
                     let candidate = chunk_file_path(Path::new(&vol.mount_path), &hash_hex);
                     if candidate.exists() {
                         return read_verified_chunk(Path::new(&vol.mount_path), &hash_hex, hash);
@@ -391,13 +429,51 @@ impl VaultStore {
     }
 
     pub fn has_verified_chunk(&self, vault_id: &str, hash: &[u8; 32]) -> Result<bool> {
-        match self.get_chunk(vault_id, hash) {
+        Self::chunk_readable(self.get_chunk(vault_id, hash))
+    }
+
+    fn chunk_readable(result: Result<Vec<u8>>) -> Result<bool> {
+        match result {
             Ok(_) => Ok(true),
             Err(LanVaultError::NotFound(_)) | Err(LanVaultError::CorruptedChunk { .. }) => {
                 Ok(false)
             }
+            Err(LanVaultError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(err),
         }
+    }
+
+    pub fn resume_chunk(&self, vault_id: &str, hash: &[u8; 32]) -> Result<bool> {
+        self.with_chunk_lock(hash, || {
+            if self.db.get_chunk(vault_id, hash)?.is_none()
+                || !Self::chunk_readable(self.read_chunk(vault_id, hash))?
+            {
+                return Ok(false);
+            }
+            self.db.renew_orphan_chunk(vault_id, hash)?;
+            Ok(true)
+        })
+    }
+
+    /// Verifies every distinct chunk with one lookup of the vault's volume layout.
+    pub fn validate_snapshot_chunks(
+        &self,
+        vault: &VaultRecord,
+        hashes: &[[u8; 32]],
+    ) -> Result<()> {
+        let vault_id = &vault.vault_id;
+        let volumes = self.online_volumes(vault_id)?;
+        for hash in hashes {
+            let hash_hex = hex::encode(hash);
+            let missing = || LanVaultError::NotFound(format!("chunk {hash_hex} in vault {vault_id}"));
+            let readable = self.with_chunk_lock(hash, || {
+                Self::chunk_readable(Self::read_chunk_from_pool(vault, &volumes, hash))
+            })?;
+            if !readable {
+                return Err(missing());
+            }
+        }
+        Ok(())
     }
 
     pub fn manifest_backup_roots(&self, vault_id: &str) -> Result<Vec<PathBuf>> {
@@ -517,7 +593,7 @@ impl VaultStore {
         expected_hash: &[u8; 32],
         healthy_bytes: &[u8],
     ) -> Result<()> {
-        let _guard = self.write_lock.lock().map_err(|_| {
+        let _guard = self.write_lock.write().map_err(|_| {
             LanVaultError::InvalidState("vault write lock poisoned".to_string())
         })?;
         if blake3_hash(healthy_bytes) != *expected_hash {
@@ -559,8 +635,10 @@ impl VaultStore {
         let hash_hex = hex::encode(hash);
         for vol in &volumes {
             let path = chunk_file_path(Path::new(&vol.mount_path), &hash_hex);
-            if path.exists() {
-                fs::remove_file(path)?;
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
             }
         }
         Ok(())
@@ -579,6 +657,32 @@ impl VaultStore {
             )));
         }
         Ok(volumes)
+    }
+
+    /// O(1) `stat` 层面的"块已完整落盘"判断（配额与去重快路径用，不做整块回读）。
+    ///
+    /// 校验的是**文件长度等于存储字节数**，而不只是"文件存在"：去掉逐块 `fsync` 之后，
+    /// 断电可能留下被截断的文件，只判断存在会把唯一的好副本判成"已存在"而跳过重传。
+    fn chunk_present_on_pool(
+        &self,
+        vault: &VaultRecord,
+        volumes: &[VaultVolumeRecord],
+        hash: &[u8; 32],
+        matches: impl Fn(&VaultVolumeRecord) -> bool,
+    ) -> bool {
+        match vault.pool_mode {
+            PoolMode::Single => volumes
+                .iter()
+                .find(|volume| volume.role == VolumeRole::Primary)
+                .is_some_and(matches),
+            PoolMode::Striped => striped_target_volume(volumes, hash).is_ok_and(matches),
+            PoolMode::MirrorRaid1 => {
+                let mut replicas = volumes.iter().filter(|volume| {
+                    matches!(volume.role, VolumeRole::Primary | VolumeRole::Mirror)
+                }).peekable();
+                replicas.peek().is_some() && replicas.all(matches)
+            }
+        }
     }
 }
 
@@ -612,11 +716,17 @@ pub fn chunk_file_path(volume_root: &Path, hash_hex: &str) -> PathBuf {
 
 fn write_chunk_atomic(volume_root: &Path, hash_hex: &str, bytes: &[u8]) -> Result<()> {
     let staging_dir = volume_root.join("staging");
-    fs::create_dir_all(&staging_dir)?;
-
     let final_path = chunk_file_path(volume_root, hash_hex);
-    if let Some(parent) = final_path.parent() {
-        fs::create_dir_all(parent)?;
+    let bucket_dir = final_path
+        .parent()
+        .ok_or_else(|| LanVaultError::InvalidInput("chunk path has no parent".to_string()))?;
+    // Two `create_dir_all` calls per chunk dominated small-chunk ingest; the bucket exists
+    // after the first write in that 256-way prefix, so only create what is missing.
+    if !bucket_dir.exists() {
+        fs::create_dir_all(bucket_dir)?;
+    }
+    if !staging_dir.exists() {
+        fs::create_dir_all(&staging_dir)?;
     }
 
     let tmp_path = staging_dir.join(format!("{}.{}.tmp", hash_hex, Uuid::new_v4()));

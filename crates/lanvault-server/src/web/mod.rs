@@ -263,7 +263,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/vaults", get(handle_list_vaults).post(handle_create_vault))
         .route(
             "/api/vaults/{vault_id}/chunks/{hash_hex}",
-            put(handle_put_chunk).layer(DefaultBodyLimit::max(MAX_CHUNK_UPLOAD_BYTES)),
+            put(handle_put_chunk)
+                .head(handle_probe_chunk)
+                .layer(DefaultBodyLimit::max(MAX_CHUNK_UPLOAD_BYTES)),
         )
         .route(
             "/api/vaults/{vault_id}/snapshots",
@@ -480,7 +482,7 @@ fn decode_hex_32(hex_str: &str, field_name: &str) -> Result<[u8; 32], LanVaultEr
     })
 }
 
-fn validate_relative_snapshot_path(raw: &str) -> Result<PathBuf, LanVaultError> {
+pub fn validate_relative_snapshot_path(raw: &str) -> Result<PathBuf, LanVaultError> {
     if raw.is_empty() || raw.contains('\0') {
         return Err(LanVaultError::InvalidInput(
             "snapshot file path must be non-empty".to_string(),
@@ -640,6 +642,40 @@ pub struct SnapshotManifest {
     pub e2ee_enabled: bool,
     pub created_at: i64,
     pub files: Vec<SnapshotManifestFile>,
+}
+
+pub fn load_snapshot_manifest(
+    store: &VaultStore,
+    snapshot: &SnapshotRecord,
+) -> lanvault_core::Result<Option<SnapshotManifest>> {
+    validate_snapshot_id(&snapshot.snapshot_id)?;
+    let filename = format!("{}.json", snapshot.snapshot_id);
+    let mut invalid = false;
+    for root in store.manifest_backup_roots(&snapshot.vault_id)? {
+        let bytes = match fs::read(root.join("manifests").join(&filename)) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                invalid = true;
+                continue;
+            }
+        };
+        if let Ok(candidate) = serde_json::from_slice::<SnapshotManifest>(&bytes) {
+            if candidate.snapshot_id == snapshot.snapshot_id
+                && candidate.vault_id == snapshot.vault_id
+                && candidate.device_id == snapshot.device_id
+                && candidate.rule_id == snapshot.rule_id
+                && manifest_root_hash(&candidate.files).ok() == Some(snapshot.root_tree_hash)
+            {
+                return Ok(Some(candidate));
+            }
+        }
+        invalid = true;
+    }
+    if invalid {
+        return Err(LanVaultError::InvalidState("no verified manifest replica".to_string()));
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Deserialize)]
@@ -977,6 +1013,35 @@ async fn handle_create_vault(
     }
 }
 
+async fn handle_probe_chunk(
+    State(state): State<Arc<AppState>>,
+    Path((vault_id, hash_hex)): Path<(String, String)>,
+) -> Response {
+    if let Err(response) = require_accepting_tasks(&state) {
+        return response;
+    }
+    let hash = match decode_hex_32(&hash_hex, "hash_hex") {
+        Ok(hash) => hash,
+        Err(err) => return map_domain_error(err),
+    };
+    let store = Arc::clone(&state.vault_store);
+    let result = tokio::task::spawn_blocking(move || store.resume_chunk(&vault_id, &hash)).await;
+    let mut response = match result {
+        Ok(Ok(true)) => StatusCode::OK.into_response(),
+        Ok(Ok(false)) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(err)) => map_domain_error(err),
+        Err(err) => {
+            warn!("chunk availability task failed: {err}");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    };
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
 async fn handle_put_chunk(
     State(state): State<Arc<AppState>>,
     Extension(session): Extension<SessionInfo>,
@@ -1027,7 +1092,7 @@ async fn handle_put_chunk(
         )));
     }
 
-    let _write_guard = ActiveChunkWriteGuard::new(Arc::clone(&state));
+    let write_guard = ActiveChunkWriteGuard::new(Arc::clone(&state));
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
@@ -1037,6 +1102,7 @@ async fn handle_put_chunk(
     let vid = vault_id.clone();
 
     let join_res = tokio::task::spawn_blocking(move || {
+        let _write_guard = write_guard;
         vault_store.put_chunk(&vid, &expected_hash, raw_size, &body)
     })
     .await;
@@ -1203,7 +1269,10 @@ async fn handle_create_snapshot(
     }
     normalized_files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
 
-    let _write_guard = ActiveChunkWriteGuard::new(Arc::clone(&state));
+    let write_guard = ActiveChunkWriteGuard::new(Arc::clone(&state));
+    if let Err(response) = require_accepting_tasks(&state) {
+        return response;
+    }
     let retention_tier = req.retention_tier.unwrap_or(RetentionTier::Daily);
     let rule_id = req.rule_id;
     let device_id = req.device_id;
@@ -1212,31 +1281,14 @@ async fn handle_create_snapshot(
     let vid = vault_id.clone();
 
     let join_res = tokio::task::spawn_blocking(move || -> lanvault_core::Result<SnapshotRecord> {
-        // Verify all referenced chunks on disk BEFORE acquiring the global vault write_lock
-        // so slow disk reads/hashing do not stall concurrent chunk uploads.
-        for hash in &unique_hashes {
-            if !vault_store.has_verified_chunk(&vid, hash)? {
-                return Err(LanVaultError::NotFound(format!(
-                    "chunk {} in vault {vid}",
-                    hex::encode(hash)
-                )));
-            }
-        }
-
-        vault_store.with_write_lock(|| {
-        let vault = db
-            .get_vault(&vid)?
-            .ok_or_else(|| LanVaultError::NotFound(format!("vault {vid}")))?;
-        if db.get_trusted_peer(&device_id)?.is_none() {
-            return Err(LanVaultError::NotFound(format!("trusted peer {device_id}")));
-        }
-        let manifest_roots = vault_store.manifest_backup_roots(&vid)?;
-
+        let _write_guard = write_guard;
         let created_at = unix_timestamp_secs();
         let file_count = normalized_files.len() as u64;
         let total_bytes = normalized_files
             .iter()
-            .fold(0u64, |acc, f| acc.saturating_add(f.size));
+            .try_fold(0u64, |acc, f| acc.checked_add(f.size))
+            .filter(|&bytes| bytes <= i64::MAX as u64)
+            .ok_or_else(|| LanVaultError::InvalidInput("snapshot size exceeds limit".to_string()))?;
 
         let canonical_root = manifest_root_hash(&normalized_files)?;
         let root_tree_hash = match explicit_root_hash {
@@ -1260,7 +1312,13 @@ async fn handle_create_snapshot(
             total_bytes,
             created_at,
         };
-        if let Some(existing) = db.get_snapshot(&snapshot_id)? {
+        let vault = db
+            .get_vault(&vid)?
+            .ok_or_else(|| LanVaultError::NotFound(format!("vault {vid}")))?;
+        if db.get_trusted_peer(&device_id)?.is_none() {
+            return Err(LanVaultError::NotFound(format!("trusted peer {device_id}")));
+        }
+        let check_existing = |record: &SnapshotRecord, existing: SnapshotRecord| {
             if existing.vault_id == record.vault_id
                 && existing.rule_id == record.rule_id
                 && existing.device_id == record.device_id
@@ -1274,54 +1332,66 @@ async fn handle_create_snapshot(
             return Err(LanVaultError::InvalidInput(format!(
                 "snapshot_id {snapshot_id} already exists with different contents"
             )));
-        }
-
-        let manifest = SnapshotManifest {
-            snapshot_id: snapshot_id.clone(),
-            vault_id: vid.clone(),
-            rule_id: rule_id.clone(),
-            device_id: device_id.clone(),
-            root_tree_hash_hex: hex::encode(root_tree_hash),
-            e2ee_enabled: vault.e2ee_enabled,
-            created_at,
-            files: normalized_files,
         };
-
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-        let mut manifest_paths = Vec::with_capacity(manifest_roots.len());
-        let write_manifests = (|| -> lanvault_core::Result<()> {
-            for root_dir in &manifest_roots {
-                let manifests_dir = root_dir.join("manifests");
-                let staging_dir = root_dir.join("staging");
-                fs::create_dir_all(&manifests_dir)?;
-                fs::create_dir_all(&staging_dir)?;
-                let tmp_path = staging_dir.join(format!("manifest.{}.tmp", uuid::Uuid::new_v4()));
-                let final_path = manifests_dir.join(format!("{snapshot_id}.json"));
-                {
-                    let mut file = File::create(&tmp_path)?;
-                    file.write_all(&manifest_bytes)?;
-                    file.sync_all()?;
-                }
-                fs::rename(&tmp_path, &final_path)?;
-                manifest_paths.push(final_path);
-            }
-            Ok(())
-        })();
-        if let Err(err) = write_manifests {
-            for path in &manifest_paths {
-                let _ = fs::remove_file(path);
-            }
-            return Err(err);
+        if let Some(existing) = db.get_snapshot(&snapshot_id)? {
+            return check_existing(&record, existing);
         }
         let hashes: Vec<[u8; 32]> = unique_hashes.into_iter().collect();
-        if let Err(err) = db.insert_snapshot_with_chunks(&record, &hashes) {
-            for path in &manifest_paths {
-                let _ = fs::remove_file(path);
-            }
-            return Err(err);
-        }
+        vault_store.validate_snapshot_chunks(&vault, &hashes)?;
 
-        Ok(record)
+        vault_store.with_write_lock(|| {
+            if db.get_trusted_peer(&device_id)?.is_none() {
+                return Err(LanVaultError::NotFound(format!("trusted peer {device_id}")));
+            }
+            if let Some(existing) = db.get_snapshot(&snapshot_id)? {
+                return check_existing(&record, existing);
+            }
+            let manifest_roots = vault_store.manifest_backup_roots(&vid)?;
+            let manifest = SnapshotManifest {
+                snapshot_id: snapshot_id.clone(),
+                vault_id: vid.clone(),
+                rule_id: rule_id.clone(),
+                device_id: device_id.clone(),
+                root_tree_hash_hex: hex::encode(root_tree_hash),
+                e2ee_enabled: vault.e2ee_enabled,
+                created_at,
+                files: normalized_files,
+            };
+
+            let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+            let mut manifest_paths = Vec::with_capacity(manifest_roots.len());
+            let write_manifests = (|| -> lanvault_core::Result<()> {
+                for root_dir in &manifest_roots {
+                    let manifests_dir = root_dir.join("manifests");
+                    let staging_dir = root_dir.join("staging");
+                    fs::create_dir_all(&manifests_dir)?;
+                    fs::create_dir_all(&staging_dir)?;
+                    let tmp_path = staging_dir.join(format!("manifest.{}.tmp", uuid::Uuid::new_v4()));
+                    let final_path = manifests_dir.join(format!("{snapshot_id}.json"));
+                    {
+                        let mut file = File::create(&tmp_path)?;
+                        file.write_all(&manifest_bytes)?;
+                        file.sync_all()?;
+                    }
+                    fs::rename(&tmp_path, &final_path)?;
+                    manifest_paths.push(final_path);
+                }
+                Ok(())
+            })();
+            if let Err(err) = write_manifests {
+                for path in &manifest_paths {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(err);
+            }
+            if let Err(err) = db.insert_snapshot_with_chunks(&record, &hashes) {
+                for path in &manifest_paths {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(err);
+            }
+
+            Ok(record)
         })
     })
     .await;
@@ -1404,25 +1474,7 @@ async fn handle_snapshot_file_download(
             .get_vault(&vault_id)?
             .ok_or_else(|| LanVaultError::NotFound(format!("vault {vault_id}")))?;
 
-        let mut valid_manifest = None;
-        for root in vault_store.manifest_backup_roots(&vault_id)? {
-            let Ok(bytes) = fs::read(root.join("manifests").join(format!("{snap_id}.json"))) else {
-                continue;
-            };
-            let Ok(candidate) = serde_json::from_slice::<SnapshotManifest>(&bytes) else {
-                continue;
-            };
-            if candidate.snapshot_id == snap.snapshot_id
-                && candidate.vault_id == snap.vault_id
-                && candidate.device_id == snap.device_id
-                && candidate.rule_id == snap.rule_id
-                && manifest_root_hash(&candidate.files).ok() == Some(snap.root_tree_hash)
-            {
-                valid_manifest = Some(candidate);
-                break;
-            }
-        }
-        let manifest = valid_manifest.ok_or_else(|| {
+        let manifest = load_snapshot_manifest(&vault_store, &snap)?.ok_or_else(|| {
             LanVaultError::NotFound(format!("valid snapshot manifest for {snap_id}"))
         })?;
 

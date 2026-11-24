@@ -39,7 +39,9 @@ use lanvault_core::{
 };
 use lanvault_server::scrub::{BitRotAlertEvent, BitRotScrubber};
 use lanvault_server::vault::{ExtraVolumeSpec, VaultStore};
-use lanvault_server::web::PendingPairRequestDto;
+use lanvault_server::web::{
+    load_snapshot_manifest, validate_relative_snapshot_path, PendingPairRequestDto,
+};
 use lanvault_server::{ServerConfig, ServerExitReason};
 
 use crate::frb_generated::StreamSink;
@@ -1772,6 +1774,8 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
     })
     .await
     .context("reconcile_directory worker panicked")??;
+    let up_to_date = diff.is_empty()
+        && !SyncEngine::has_pending_checkpoint(&state.client_db, &rule_id, &resolved_vault_id)?;
     let total_bytes: u64 = diff.changed_files().map(|f| f.size).sum();
 
     emit_progress(
@@ -1784,7 +1788,7 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
             chunks_uploaded: 0,
             chunks_deduplicated: 0,
             throughput_bps: 0,
-            status: if diff.is_empty() {
+            status: if up_to_date {
                 "up_to_date".to_string()
             } else {
                 "scanning".to_string()
@@ -1793,7 +1797,7 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
         },
     );
 
-    if diff.is_empty() {
+    if up_to_date {
         return Ok(());
     }
 
@@ -3811,37 +3815,6 @@ pub struct RestoreSnapshotResultDto {
     pub output_path: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct RestoreManifestFile {
-    rel_path: String,
-    chunk_hashes_hex: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RestoreSnapshotManifest {
-    files: Vec<RestoreManifestFile>,
-}
-
-fn sanitize_restore_rel_path(raw: &str) -> Result<PathBuf> {
-    use std::path::Component;
-    let p = Path::new(raw);
-    if raw.trim().is_empty() || raw.contains('\0') || p.is_absolute() {
-        bail!("invalid snapshot manifest path `{raw}`");
-    }
-    let mut clean = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::Normal(seg) => clean.push(seg),
-            Component::CurDir => {}
-            _ => bail!("unsafe snapshot manifest path `{raw}`"),
-        }
-    }
-    if clean.as_os_str().is_empty() {
-        bail!("empty snapshot manifest path");
-    }
-    Ok(clean)
-}
-
 /// 37. 从本地存储池解密、校验并还原指定快照数据块至目标目录（优先按 manifest 重建原始目录树）。
 pub async fn restore_snapshot(
     snapshot_id: String,
@@ -3875,89 +3848,96 @@ pub async fn restore_snapshot(
             .with_context(|| format!("failed to create restore directory {}", out_dir.display()))?;
 
         // 1. Prefer reading the snapshot manifest so every file is reconstructed at its exact relative path.
-        let mut loaded_manifest: Option<RestoreSnapshotManifest> = None;
-        if let Ok(roots) = vault_store.manifest_backup_roots(&snap.vault_id) {
-            for root in roots {
-                let candidate = root.join("manifests").join(format!("{}.json", snap.snapshot_id));
-                if candidate.is_file() {
-                    let bytes = std::fs::read(&candidate).with_context(|| {
-                        format!("failed to read snapshot manifest {}", candidate.display())
-                    })?;
-                    loaded_manifest = Some(
-                        serde_json::from_slice::<RestoreSnapshotManifest>(&bytes)
-                            .context("invalid snapshot manifest JSON")?,
-                    );
-                    break;
-                }
-            }
+        let loaded_manifest = load_snapshot_manifest(&vault_store, &snap)?;
+        if loaded_manifest.is_none() && !snap.rule_id.is_empty() {
+            bail!("snapshot manifest is missing from all online volumes");
         }
+        let restore_name = format!("restore_{}_{:016x}", snap.snapshot_id, rand::random::<u64>());
+        let restore_root = out_dir.join(&restore_name);
+        let staging_root = out_dir.join(format!(".{restore_name}.partial"));
+        std::fs::create_dir(&staging_root)?;
 
         let mut restored_chunks = 0u64;
         let mut restored_bytes = 0u64;
-        let output_path_str: String;
-
-        if let Some(manifest) = loaded_manifest {
-            let restore_root = out_dir.join(format!("restore_{}", snap.snapshot_id));
-            std::fs::create_dir_all(&restore_root)?;
-            for file in &manifest.files {
-                let rel = sanitize_restore_rel_path(&file.rel_path)?;
-                let dest_path = restore_root.join(rel);
-                if let Some(parent) = dest_path.parent() {
-                    std::fs::create_dir_all(parent)?;
+        let staged = (|| -> Result<PathBuf> {
+            let output_path = if let Some(manifest) = loaded_manifest {
+                for file in &manifest.files {
+                    let rel = validate_relative_snapshot_path(&file.rel_path)?;
+                    #[cfg(windows)]
+                    if file.rel_path.contains(':') {
+                        bail!("snapshot file path contains a Windows stream separator");
+                    }
+                    let dest_path = staging_root.join(rel);
+                    if let Some(parent) = dest_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let mut dest_file = std::fs::File::create_new(&dest_path).with_context(|| {
+                        format!("failed to create restored file {}", dest_path.display())
+                    })?;
+                    let before = restored_bytes;
+                    for hash_hex in &file.chunk_hashes_hex {
+                        let hash_bytes = hex::decode(hash_hex)
+                            .with_context(|| format!("invalid chunk hash hex `{hash_hex}`"))?;
+                        let hash: [u8; 32] = hash_bytes
+                            .try_into()
+                            .map_err(|_| anyhow!("invalid chunk hash length"))?;
+                        let stored_bytes = vault_store.get_chunk(&snap.vault_id, &hash)?;
+                        let plain = unpack_chunk(
+                            &stored_bytes,
+                            &hash,
+                            Some(&chunk_key),
+                            snap.vault_id.as_bytes(),
+                            CHUNK_MAX_SIZE as usize,
+                        )?;
+                        std::io::Write::write_all(&mut dest_file, &plain)?;
+                        restored_chunks += 1;
+                        restored_bytes += plain.len() as u64;
+                    }
+                    if restored_bytes - before != file.size {
+                        bail!("restored file size does not match the snapshot manifest");
+                    }
+                    dest_file.sync_all()?;
                 }
-                let mut dest_file = std::fs::File::create(&dest_path).with_context(|| {
-                    format!("failed to create restored file {}", dest_path.display())
+                restore_root.clone()
+            } else {
+                // Fallback for legacy manifestless snapshots.
+                let hashes = db.list_snapshot_chunks(&snap.snapshot_id)?;
+                let filename = format!("restore_{}.bin", snap.snapshot_id);
+                let out_file_path = staging_root.join(&filename);
+                let mut out_file = std::fs::File::create_new(&out_file_path).with_context(|| {
+                    format!("failed to create restore output {}", out_file_path.display())
                 })?;
-                for hash_hex in &file.chunk_hashes_hex {
-                    let hash_bytes = hex::decode(hash_hex)
-                        .with_context(|| format!("invalid chunk hash hex `{hash_hex}`"))?;
-                    let hash: [u8; 32] = hash_bytes
-                        .try_into()
-                        .map_err(|_| anyhow!("invalid chunk hash length"))?;
-                    let stored_bytes = vault_store.get_chunk(&snap.vault_id, &hash)?;
+                for hash in &hashes {
+                    let stored_bytes = vault_store.get_chunk(&snap.vault_id, hash)?;
                     let plain = unpack_chunk(
                         &stored_bytes,
-                        &hash,
+                        hash,
                         Some(&chunk_key),
                         snap.vault_id.as_bytes(),
                         CHUNK_MAX_SIZE as usize,
                     )?;
-                    std::io::Write::write_all(&mut dest_file, &plain)?;
+                    std::io::Write::write_all(&mut out_file, &plain)?;
                     restored_chunks += 1;
                     restored_bytes += plain.len() as u64;
                 }
-                std::io::Write::flush(&mut dest_file)?;
+                out_file.sync_all()?;
+                restore_root.join(filename)
+            };
+            std::fs::rename(&staging_root, &restore_root)?;
+            Ok(output_path)
+        })();
+        if staged.is_err() {
+            if let Err(err) = std::fs::remove_dir_all(&staging_root) {
+                warn!(%err, "failed to clean up interrupted restore");
             }
-            output_path_str = restore_root.to_string_lossy().into_owned();
-        } else {
-            // Fallback for legacy manifestless snapshots.
-            let hashes = db.list_snapshot_chunks(&snap.snapshot_id)?;
-            let out_file_path = out_dir.join(format!("restore_{}.bin", snap.snapshot_id));
-            let mut out_file = std::fs::File::create(&out_file_path).with_context(|| {
-                format!("failed to create restore output {}", out_file_path.display())
-            })?;
-            for hash in &hashes {
-                let stored_bytes = vault_store.get_chunk(&snap.vault_id, hash)?;
-                let plain = unpack_chunk(
-                    &stored_bytes,
-                    hash,
-                    Some(&chunk_key),
-                    snap.vault_id.as_bytes(),
-                    CHUNK_MAX_SIZE as usize,
-                )?;
-                std::io::Write::write_all(&mut out_file, &plain)?;
-                restored_chunks += 1;
-                restored_bytes += plain.len() as u64;
-            }
-            std::io::Write::flush(&mut out_file)?;
-            output_path_str = out_file_path.to_string_lossy().into_owned();
         }
+        let output_path = staged?;
 
         Ok(RestoreSnapshotResultDto {
             snapshot_id: snap.snapshot_id,
             restored_chunks,
             restored_bytes,
-            output_path: output_path_str,
+            output_path: output_path.to_string_lossy().into_owned(),
         })
     })
     .await

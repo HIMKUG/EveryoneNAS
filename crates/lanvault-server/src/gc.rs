@@ -60,25 +60,26 @@ impl GarbageCollector {
     }
 
     /// Evaluates which snapshots are expired under `policy` at timestamp `now_unix_secs`.
-    /// Input snapshots may be in any order; newest snapshots in each GFS bucket are retained.
+    /// Retains the newest three versions in each vault, rule, and device.
+    /// Equal timestamps keep input order, newest insertion first from the database.
     pub fn select_expired_snapshots(
         snapshots: &[SnapshotRecord],
         now_unix_secs: i64,
         policy: GfsPolicy,
     ) -> Vec<String> {
         let mut expired = Vec::new();
-        let mut scopes: std::collections::BTreeMap<(&str, &str), Vec<&SnapshotRecord>> =
+        let mut scopes: std::collections::BTreeMap<(&str, &str, &str), Vec<&SnapshotRecord>> =
             std::collections::BTreeMap::new();
         for snapshot in snapshots {
             scopes
-                .entry((snapshot.rule_id.as_str(), snapshot.device_id.as_str()))
+                .entry((&snapshot.vault_id, &snapshot.rule_id, &snapshot.device_id))
                 .or_default()
                 .push(snapshot);
         }
         for scope in scopes.values_mut() {
             scope.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.created_at));
             let mut seen = HashSet::new();
-            for snap in scope {
+            for (index, snap) in scope.iter().enumerate() {
                 if snap.retention_tier == RetentionTier::Pinned {
                     continue;
                 }
@@ -93,9 +94,9 @@ impl GarbageCollector {
                 };
                 let cutoff = now_unix_secs.saturating_sub(window_secs);
                 let bucket = snap.created_at.div_euclid(bucket_secs);
-                if snap.created_at < cutoff
-                    || !seen.insert((snap.retention_tier.as_str(), bucket))
-                {
+                let keep_bucket = snap.created_at >= cutoff
+                    && seen.insert((snap.retention_tier.as_str(), bucket));
+                if index >= 3 && !keep_bucket {
                     expired.push(snap.snapshot_id.clone());
                 }
             }
@@ -111,73 +112,50 @@ impl GarbageCollector {
         now_unix_secs: i64,
         policy: GfsPolicy,
     ) -> Result<GcReport> {
-        let snapshots = self.db.list_snapshots(Some(vault_id))?;
-        let evaluated_snapshots = snapshots.len() as u64;
-        let expired_ids = Self::select_expired_snapshots(&snapshots, now_unix_secs, policy);
-
-        let _probe = ProbeGuard::start(
-            "server.gc",
-            "server.gc_run",
-            Some(format!("vault_id={vault_id}, snapshots={evaluated_snapshots}")),
-        );
-        let expired_count = self.db.delete_snapshots_batch(&expired_ids)? as u64;
-        if !expired_ids.is_empty() {
-            if let Ok(roots) = self.vault_store.manifest_backup_roots(vault_id) {
-                for root in roots {
-                    for snapshot_id in &expired_ids {
-                        let path = root
-                            .join("manifests")
-                            .join(format!("{snapshot_id}.json"));
-                        if let Err(err) = std::fs::remove_file(&path) {
-                            if err.kind() != std::io::ErrorKind::NotFound {
-                                tracing::warn!(
-                                    path = %path.display(),
-                                    "failed to remove expired snapshot manifest: {err}"
-                                );
+        let report = self.vault_store.with_write_lock(|| {
+            let snapshots = self.db.list_snapshots(Some(vault_id))?;
+            let evaluated_snapshots = snapshots.len() as u64;
+            let expired_ids = Self::select_expired_snapshots(&snapshots, now_unix_secs, policy);
+            let _probe = ProbeGuard::start(
+                "server.gc",
+                "server.gc_run",
+                Some(format!("vault_id={vault_id}, snapshots={evaluated_snapshots}")),
+            );
+            let expired_count = self.db.delete_snapshots_batch(&expired_ids)? as u64;
+            if !expired_ids.is_empty() {
+                if let Ok(roots) = self.vault_store.manifest_backup_roots(vault_id) {
+                    for root in roots {
+                        for snapshot_id in &expired_ids {
+                            let path = root.join("manifests").join(format!("{snapshot_id}.json"));
+                            if let Err(err) = std::fs::remove_file(&path) {
+                                if err.kind() != std::io::ErrorKind::NotFound {
+                                    tracing::warn!(path = %path.display(), %err, "expired manifest deletion failed");
+                                }
                             }
                         }
                     }
                 }
             }
-        }
 
-        let (deleted_chunks, reclaimed_bytes) = self.vault_store.with_write_lock(|| {
-            // 5-minute grace period prevents GC from deleting in-flight chunks before `create_snapshot` commits.
-            const ORPHAN_GRACE_SECS: i64 = 300;
+            const ORPHAN_GRACE_SECS: i64 = 86_400;
             let cutoff = now_unix_secs.saturating_sub(ORPHAN_GRACE_SECS);
             let orphans = self.db.list_orphan_chunks_before(vault_id, cutoff)?;
-            let orphan_hashes: Vec<[u8; 32]> = orphans.iter().map(|o| o.hash_blake3).collect();
-            let batch_deleted = self.db.delete_chunks_batch(vault_id, &orphan_hashes)? as u64;
-
-            let mut reclaimed = 0u64;
-            let mut deleted = 0u64;
-            if batch_deleted > 0 {
-                let all_deleted = batch_deleted == orphans.len() as u64;
-                for orphan in &orphans {
-                    if all_deleted || self.db.get_chunk(vault_id, &orphan.hash_blake3)?.is_none() {
-                        self.vault_store
-                            .delete_chunk_files(vault_id, &orphan.hash_blake3)?;
-                        deleted += 1;
-                        reclaimed = reclaimed.saturating_add(orphan.stored_size);
-                    }
+            let mut removed = Vec::with_capacity(orphans.len());
+            for orphan in orphans {
+                match self.vault_store.delete_chunk_files(vault_id, &orphan.hash_blake3) {
+                    Ok(()) => removed.push(orphan.hash_blake3),
+                    Err(err) => tracing::warn!(%vault_id, %err, "orphan chunk deletion failed"),
                 }
             }
-
-            if reclaimed > 0 {
-                self.db
-                    .update_vault_used_bytes(vault_id, -(reclaimed as i64))?;
-            }
-
-            Ok((deleted, reclaimed))
+            let (deleted_chunks, reclaimed_bytes) = self.db.delete_chunks_batch(vault_id, &removed)?;
+            Ok(GcReport {
+                evaluated_snapshots,
+                expired_snapshots: expired_count,
+                deleted_chunks,
+                reclaimed_bytes,
+            })
         })?;
-
         self.db.prune_revoked_sessions(now_unix_secs)?;
-
-        Ok(GcReport {
-            evaluated_snapshots,
-            expired_snapshots: expired_count,
-            deleted_chunks,
-            reclaimed_bytes,
-        })
+        Ok(report)
     }
 }

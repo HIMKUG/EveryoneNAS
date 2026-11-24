@@ -700,8 +700,9 @@ PRAGMA mmap_size = 268435456;";
         raw_size: u64,
         stored_size: u64,
     ) -> Result<bool> {
-        let conn = self.lock_conn();
-        let existing: Option<i64> = conn
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let existing: Option<i64> = tx
             .query_row(
                 "SELECT ref_count FROM chunks WHERE vault_id = ?1 AND hash_blake3 = ?2",
                 params![vault_id, hash_blake3.as_slice()],
@@ -710,21 +711,37 @@ PRAGMA mmap_size = 268435456;";
             .optional()?;
 
         let now = unix_timestamp_secs();
-        if existing.is_some() {
-            conn.execute(
+        let is_new = existing.is_none();
+        if !is_new {
+            tx.execute(
                 "UPDATE chunks
-                 SET raw_size = ?1, stored_size = ?2, scrub_status = 'ok', last_scrub_at = NULL
-                 WHERE vault_id = ?3 AND hash_blake3 = ?4",
+                 SET raw_size = ?1, stored_size = ?2, scrub_status = 'ok', last_scrub_at = NULL,
+                     created_at = CASE WHEN ref_count <= 0 THEN ?3 ELSE created_at END
+                 WHERE vault_id = ?4 AND hash_blake3 = ?5",
                 params![
                     raw_size as i64,
                     stored_size as i64,
+                    now,
                     vault_id,
                     hash_blake3.as_slice()
                 ],
             )?;
-            Ok(false)
         } else {
-            conn.execute(
+            let available: i64 = tx
+                .query_row(
+                    "SELECT MAX(0, quota_bytes - used_bytes) FROM vaults WHERE vault_id = ?1",
+                    params![vault_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| LanVaultError::NotFound(format!("vault {vault_id}")))?;
+            if stored_size > available as u64 {
+                return Err(LanVaultError::QuotaExceeded {
+                    required: stored_size,
+                    available: available as u64,
+                });
+            }
+            tx.execute(
                 r#"
                 INSERT INTO chunks (vault_id, hash_blake3, raw_size, stored_size, ref_count, scrub_status, created_at)
                 VALUES (?1, ?2, ?3, ?4, 0, 'ok', ?5)
@@ -737,8 +754,24 @@ PRAGMA mmap_size = 268435456;";
                     now
                 ],
             )?;
-            Ok(true)
+            tx.execute(
+                "UPDATE vaults SET used_bytes = used_bytes + ?1 WHERE vault_id = ?2",
+                params![stored_size as i64, vault_id],
+            )?;
         }
+        tx.commit()?;
+        Ok(is_new)
+    }
+
+    /// Extends the time an uncommitted upload can be reused before orphan GC.
+    pub fn renew_orphan_chunk(&self, vault_id: &str, hash: &[u8; 32]) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE chunks SET created_at = ?1
+             WHERE vault_id = ?2 AND hash_blake3 = ?3 AND ref_count <= 0",
+            params![unix_timestamp_secs(), vault_id, hash.as_slice()],
+        )?;
+        Ok(())
     }
 
     pub fn insert_chunk_if_missing(
@@ -873,6 +906,10 @@ PRAGMA mmap_size = 268435456;";
             SELECT vault_id, hash_blake3, raw_size, stored_size, ref_count, last_scrub_at, scrub_status
             FROM chunks
             WHERE vault_id = ?1 AND ref_count <= 0 AND created_at <= ?2
+              AND NOT EXISTS (
+                  SELECT 1 FROM snapshot_chunks sc
+                  WHERE sc.vault_id = chunks.vault_id AND sc.chunk_hash = chunks.hash_blake3
+              )
             "#,
         )?;
         let rows = stmt
@@ -1031,7 +1068,7 @@ PRAGMA mmap_size = 268435456;";
                            retention_tier, file_count, total_bytes, created_at
                     FROM snapshots
                     WHERE vault_id = ?1
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, rowid DESC
                     "#,
                 )?;
                 let rows = stmt
@@ -1045,7 +1082,7 @@ PRAGMA mmap_size = 268435456;";
                     SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
                            retention_tier, file_count, total_bytes, created_at
                     FROM snapshots
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, rowid DESC
                     "#,
                 )?;
                 let rows = stmt
@@ -1073,7 +1110,7 @@ PRAGMA mmap_size = 268435456;";
                            retention_tier, file_count, total_bytes, created_at
                     FROM snapshots
                     WHERE vault_id = ?1
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, rowid DESC
                     LIMIT ?2 OFFSET ?3
                     "#,
                 )?;
@@ -1088,7 +1125,7 @@ PRAGMA mmap_size = 268435456;";
                     SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
                            retention_tier, file_count, total_bytes, created_at
                     FROM snapshots
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, rowid DESC
                     LIMIT ?1 OFFSET ?2
                     "#,
                 )?;
@@ -1101,37 +1138,7 @@ PRAGMA mmap_size = 268435456;";
     }
 
     pub fn delete_snapshot(&self, snapshot_id: &str) -> Result<bool> {
-        let mut conn = self.lock_conn();
-        let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE chunks
-             SET ref_count = MAX(
-                 0,
-                 ref_count - (
-                     SELECT COUNT(*) FROM snapshot_chunks sc
-                     WHERE sc.snapshot_id = ?1
-                       AND sc.vault_id = chunks.vault_id
-                       AND sc.chunk_hash = chunks.hash_blake3
-                 )
-             )
-             WHERE EXISTS (
-                 SELECT 1 FROM snapshot_chunks sc
-                 WHERE sc.snapshot_id = ?1
-                   AND sc.vault_id = chunks.vault_id
-                   AND sc.chunk_hash = chunks.hash_blake3
-             )",
-            params![snapshot_id],
-        )?;
-        tx.execute(
-            "DELETE FROM snapshot_chunks WHERE snapshot_id = ?1",
-            params![snapshot_id],
-        )?;
-        let affected = tx.execute(
-            "DELETE FROM snapshots WHERE snapshot_id = ?1",
-            params![snapshot_id],
-        )?;
-        tx.commit()?;
-        Ok(affected > 0)
+        Ok(self.delete_snapshots_batch(&[snapshot_id.to_owned()])? == 1)
     }
 
     // -------------------------------------------------------------------------
@@ -1278,16 +1285,23 @@ PRAGMA mmap_size = 268435456;";
         }
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
-        let mut total_deleted = 0usize;
-        {
-            let mut stmt = tx.prepare(
-                "DELETE FROM local_file_state WHERE rule_id = ?1 AND rel_path = ?2",
-            )?;
-            for rel_path in rel_paths {
-                total_deleted += stmt.execute(params![rule_id, rel_path])?;
-            }
-        }
+        let total_deleted = Self::delete_file_states(&tx, rule_id, rel_paths)?;
         tx.commit()?;
+        Ok(total_deleted)
+    }
+
+    fn delete_file_states(
+        conn: &Connection,
+        rule_id: &str,
+        rel_paths: &[String],
+    ) -> Result<usize> {
+        let mut total_deleted = 0usize;
+        let mut stmt = conn.prepare_cached(
+            "DELETE FROM local_file_state WHERE rule_id = ?1 AND rel_path = ?2",
+        )?;
+        for rel_path in rel_paths {
+            total_deleted += stmt.execute(params![rule_id, rel_path])?;
+        }
         Ok(total_deleted)
     }
 
@@ -1344,25 +1358,19 @@ PRAGMA mmap_size = 268435456;";
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         let mut total = 0usize;
+        let now = unix_timestamp_secs();
         for id in snapshot_ids {
             tx.execute(
                 "UPDATE chunks
-                 SET ref_count = MAX(
-                     0,
-                     ref_count - (
-                         SELECT COUNT(*) FROM snapshot_chunks sc
-                         WHERE sc.snapshot_id = ?1
-                           AND sc.vault_id = chunks.vault_id
-                           AND sc.chunk_hash = chunks.hash_blake3
-                     )
-                 )
+                 SET ref_count = MAX(0, ref_count - 1),
+                     created_at = CASE WHEN ref_count <= 1 THEN ?2 ELSE created_at END
                  WHERE EXISTS (
                      SELECT 1 FROM snapshot_chunks sc
                      WHERE sc.snapshot_id = ?1
                        AND sc.vault_id = chunks.vault_id
                        AND sc.chunk_hash = chunks.hash_blake3
                  )",
-                params![id],
+                params![id, now],
             )?;
             tx.execute(
                 "DELETE FROM snapshot_chunks WHERE snapshot_id = ?1",
@@ -1378,9 +1386,9 @@ PRAGMA mmap_size = 268435456;";
     }
 
     /// Batch-deletes orphan chunks in a single transaction (eliminates N+1 commits in GC).
-    pub fn delete_chunks_batch(&self, vault_id: &str, hashes: &[[u8; 32]]) -> Result<usize> {
+    pub fn delete_chunks_batch(&self, vault_id: &str, hashes: &[[u8; 32]]) -> Result<(u64, u64)> {
         if hashes.is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
         let _probe = crate::debug_telemetry::ProbeGuard::start(
             "core.db",
@@ -1389,7 +1397,8 @@ PRAGMA mmap_size = 268435456;";
         );
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
-        let mut total = 0usize;
+        let mut count = 0;
+        let mut reclaimed = 0i64;
         {
             let mut stmt = tx.prepare_cached(
                 "DELETE FROM chunks
@@ -1397,14 +1406,25 @@ PRAGMA mmap_size = 268435456;";
                    AND NOT EXISTS (
                        SELECT 1 FROM snapshot_chunks sc
                        WHERE sc.vault_id = ?1 AND sc.chunk_hash = ?2
-                   )",
+                   )
+                 RETURNING stored_size",
             )?;
             for h in hashes {
-                total += stmt.execute(params![vault_id, h.as_slice()])?;
+                if let Some(size) = stmt
+                    .query_row(params![vault_id, h.as_slice()], |row| row.get::<_, i64>(0))
+                    .optional()?
+                {
+                    count += 1;
+                    reclaimed += size;
+                }
             }
         }
+        tx.execute(
+            "UPDATE vaults SET used_bytes = MAX(0, used_bytes - ?1) WHERE vault_id = ?2",
+            params![reclaimed, vault_id],
+        )?;
         tx.commit()?;
-        Ok(total)
+        Ok((count, reclaimed as u64))
     }
 
     /// Batch-upserts local file states in a single transaction after sync_diff.
@@ -1419,9 +1439,32 @@ PRAGMA mmap_size = 268435456;";
         );
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
+        let total = Self::write_file_states(&tx, states)?;
+        tx.commit()?;
+        Ok(total)
+    }
+
+    pub fn commit_local_snapshot(
+        &self,
+        rule_id: &str,
+        states: &[LocalFileStateRecord],
+        deleted_paths: &[String],
+        checkpoint_key: &str,
+        snapshot_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        Self::write_file_states(&tx, states)?;
+        Self::delete_file_states(&tx, rule_id, deleted_paths)?;
+        Self::write_setting(&tx, checkpoint_key, snapshot_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn write_file_states(conn: &Connection, states: &[LocalFileStateRecord]) -> Result<usize> {
         let mut total = 0usize;
         {
-            let mut stmt = tx.prepare_cached(
+            let mut stmt = conn.prepare_cached(
                 r#"
                 INSERT INTO local_file_state
                     (rule_id, target_vault_id, rel_path, size, mtime_ns, file_id, chunk_hashes)
@@ -1446,7 +1489,6 @@ PRAGMA mmap_size = 268435456;";
                 ])?;
             }
         }
-        tx.commit()?;
         Ok(total)
     }
 
@@ -1464,6 +1506,10 @@ PRAGMA mmap_size = 268435456;";
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         let conn = self.lock_conn();
+        Self::write_setting(&conn, key, value)
+    }
+
+    fn write_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
         conn.execute(
             r#"
             INSERT INTO app_settings (key, value)
