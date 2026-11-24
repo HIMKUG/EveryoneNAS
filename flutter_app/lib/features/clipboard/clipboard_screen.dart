@@ -1,4 +1,4 @@
-import 'dart:io';
+import 'dart:async';
 
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
@@ -8,560 +8,667 @@ import '../../bridge/system_env_helper.dart';
 import '../../theme/neu_theme.dart';
 import '../../theme/neu_toast.dart';
 
-enum _TransferMode { file, clipboard }
-
-/// 6. 传输页：
-/// - 顶部两张大动作卡：“发送文件（调用 push_clipboard_file）”与“剪贴板同步（调用 push_clipboard_text）”
-/// - 下方目标设备选择、文件/文本输入与最近传输列表（带文件/文本图标、目标设备、时间戳与绿色完成勾）
+/// 传输页（对话流重构版，对标 Message 体验）：
+/// - 彻底合并“发送文件”与“剪贴板同步”为统一的聊天式传输流。
+/// - 桌面端（>= 840px）：左栏已配对设备列表 + 右栏消息与文件气泡流 + 底部输入栏。
+/// - 移动端（< 840px）：跟随顶栏全局设备胶囊，全屏呈现对话流 + 底部输入栏。
 class ClipboardScreen extends StatefulWidget {
-  const ClipboardScreen({super.key, required this.bridge});
+  const ClipboardScreen({
+    super.key,
+    required this.bridge,
+    this.onOpenDeviceManager,
+  });
 
   final LanVaultBridge bridge;
+  final VoidCallback? onOpenDeviceManager;
 
   @override
   State<ClipboardScreen> createState() => _ClipboardScreenState();
 }
 
 class _ClipboardScreenState extends State<ClipboardScreen> {
-  static const String _broadcastTargetSentinel = '__all_paired__';
-
-  final TextEditingController _filePathController = TextEditingController();
-  final TextEditingController _contentController = TextEditingController();
+  final TextEditingController _inputController = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
   List<TransferHistoryModel> _history = const <TransferHistoryModel>[];
-
-  _TransferMode _mode = _TransferMode.file;
-  String? _selectedTarget;
+  Timer? _pollTimer;
   bool _sending = false;
+  bool _loading = true;
+  bool _refreshing = false;
 
   @override
   void initState() {
     super.initState();
-    _refreshPeers();
-    _loadHistory();
-  }
-
-  Future<void> _loadHistory() async {
-    try {
-      final records = await widget.bridge.listTransferHistory(limit: 50);
-      if (!mounted) return;
-      setState(() => _history = records);
-    } catch (err) {
-      if (!mounted) return;
-      NeuToast.error(context, '加载传输记录失败：${LanVaultBridge.formatUserError(err)}');
-    }
+    unawaited(_refreshHistory(silent: false));
+    _pollTimer = Timer.periodic(
+      const Duration(seconds: 4),
+      (_) => unawaited(_refreshHistory(silent: true)),
+    );
   }
 
   @override
   void dispose() {
-    _filePathController.dispose();
-    _contentController.dispose();
+    _pollTimer?.cancel();
+    _inputController.dispose();
+    _scrollController.dispose();
     super.dispose();
   }
 
-  String? _resolveValidTarget(List<PairedPeerModel> peers) {
-    if (peers.isEmpty) return null;
-    if (_selectedTarget == _broadcastTargetSentinel && peers.length > 1) {
-      return _broadcastTargetSentinel;
-    }
-    if (_selectedTarget != null &&
-        peers.any((p) => p.deviceId == _selectedTarget)) {
-      return _selectedTarget;
-    }
-    return peers.length > 1 ? _broadcastTargetSentinel : peers.first.deviceId;
-  }
-
-  Future<void> _refreshPeers() async {
+  Future<void> _refreshHistory({required bool silent}) async {
+    if (_refreshing) return;
+    _refreshing = true;
+    if (!silent && mounted) setState(() => _loading = true);
     try {
-      final peers = await widget.bridge.refreshPairedPeers();
+      final list = await widget.bridge.listTransferHistory(limit: 100);
       if (!mounted) return;
-      final resolved = _resolveValidTarget(peers);
-      if (resolved != _selectedTarget) {
-        setState(() => _selectedTarget = resolved);
-      }
+      setState(() {
+        _history = list.reversed.toList(growable: false);
+        _loading = false;
+      });
     } catch (err) {
       if (!mounted) return;
-      NeuToast.error(context, '获取已配对设备失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _pickFileToSend() async {
-    setState(() => _mode = _TransferMode.file);
-    try {
-      final picked = await widget.bridge.pickFile(title: '选择要加密传输的文件');
-      if (picked != null && mounted) {
-        setState(() => _filePathController.text = picked);
-      } else if (!Platform.isWindows && mounted) {
-        NeuToast.info(context, '请在下方输入或粘贴本地文件路径');
+      setState(() => _loading = false);
+      if (!silent) {
+        NeuToast.error(context, LanVaultBridge.formatUserError(err));
       }
-    } catch (err) {
-      if (!mounted) return;
-      NeuToast.error(context, '打开文件选择器失败：${LanVaultBridge.formatUserError(err)}');
+    } finally {
+      _refreshing = false;
     }
   }
 
-  Future<void> _pasteFromSystemClipboard() async {
-    final data = await Clipboard.getData(Clipboard.kTextPlain);
-    final text = data?.text;
-    if (!mounted) return;
-    if (text == null || text.isEmpty) {
-      NeuToast.info(context, '系统剪贴板当前为空');
-      return;
-    }
-    setState(() {
-      _mode = _TransferMode.clipboard;
-      _contentController.text = text;
-    });
-  }
-
-  Future<void> _sendFile(
-    List<PairedPeerModel> peers,
-    String? effectiveSelection,
-  ) async {
-    if (peers.isEmpty) {
-      NeuToast.warning(context, '请先在“设备”页配对至少一台设备');
-      return;
-    }
-    final filePath = _filePathController.text.trim();
-    if (filePath.isEmpty) {
-      NeuToast.warning(context, '请先选择或输入要发送的文件路径');
+  Future<void> _sendText() async {
+    final text = _inputController.text.trim();
+    if (text.isEmpty || _sending) return;
+    final peer = widget.bridge.selectedPeer;
+    if (peer == null) {
+      NeuToast.warning(context, '请先配对并选择一台目标设备');
       return;
     }
 
-    final targetId = (effectiveSelection == null ||
-            effectiveSelection == _broadcastTargetSentinel)
-        ? null
-        : effectiveSelection;
-
-    setState(() {
-      _selectedTarget = effectiveSelection;
-      _sending = true;
-    });
-    try {
-      final sent = await widget.bridge.pushClipboardFile(
-        targetDeviceId: targetId,
-        filePath: filePath,
-      );
-      if (!mounted) return;
-      setState(() => _sending = false);
-      if (!sent) {
-        NeuToast.warning(context, '文件未发送成功，请确认对端设备在线');
-        return;
-      }
-
-      final fileName = SystemEnvHelper.folderDisplayName(filePath);
-      _filePathController.clear();
-      await _loadHistory();
-      if (!mounted) return;
-      NeuToast.success(context, '已加密发送文件：$fileName');
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _sending = false);
-      NeuToast.error(context, '发送文件失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _sendClipboardText(
-    List<PairedPeerModel> peers,
-    String? effectiveSelection,
-  ) async {
-    if (peers.isEmpty) {
-      NeuToast.warning(context, '请先在“设备”页配对至少一台设备');
-      return;
-    }
-
-    final text = _contentController.text.trim();
-    if (text.isEmpty) {
-      NeuToast.warning(context, '请输入要同步的剪贴板内容');
-      return;
-    }
-
-    final targetId = (effectiveSelection == null ||
-            effectiveSelection == _broadcastTargetSentinel)
-        ? null
-        : effectiveSelection;
-
-    setState(() {
-      _selectedTarget = effectiveSelection;
-      _sending = true;
-    });
+    setState(() => _sending = true);
     try {
       await widget.bridge.pushClipboardText(
-        targetDeviceId: targetId,
+        targetDeviceId: peer.deviceId,
         text: text,
       );
       if (!mounted) return;
-      _contentController.clear();
-      setState(() => _sending = false);
-      await _loadHistory();
-      if (!mounted) return;
-      NeuToast.success(context, '已同步剪贴板内容');
+      _inputController.clear();
+      await _refreshHistory(silent: true);
+      _scrollToBottom();
     } catch (err) {
       if (!mounted) return;
-      setState(() => _sending = false);
-      NeuToast.error(context, '同步剪贴板失败：${LanVaultBridge.formatUserError(err)}');
+      NeuToast.error(context, LanVaultBridge.formatUserError(err));
+    } finally {
+      if (mounted) setState(() => _sending = false);
     }
   }
 
-  Future<void> _copyMessage(String text) async {
-    await Clipboard.setData(ClipboardData(text: text));
+  Future<void> _pickAndSendFile() async {
+    if (_sending) return;
+    final peer = widget.bridge.selectedPeer;
+    if (peer == null) {
+      NeuToast.warning(context, '请先配对并选择一台目标设备');
+      return;
+    }
+    final path = await widget.bridge.pickFile(title: '选择要发送的文件');
+    if (path == null || path.isEmpty || !mounted) return;
+
+    setState(() => _sending = true);
+    try {
+      await widget.bridge.pushClipboardFile(
+        targetDeviceId: peer.deviceId,
+        filePath: path,
+      );
+      if (!mounted) return;
+      NeuToast.success(
+        context,
+        '已发送 ${SystemEnvHelper.folderDisplayName(path)}',
+      );
+      await _refreshHistory(silent: true);
+      _scrollToBottom();
+    } catch (err) {
+      if (!mounted) return;
+      NeuToast.error(context, LanVaultBridge.formatUserError(err));
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  Future<void> _pasteFromClipboard() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text?.trim() ?? '';
     if (!mounted) return;
-    NeuToast.success(context, '已复制到剪贴板');
+    if (text.isEmpty) {
+      NeuToast.info(context, '本机剪贴板为空');
+      return;
+    }
+    _inputController.text = text;
+    _inputController.selection = TextSelection.fromPosition(
+      TextPosition(offset: text.length),
+    );
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _scrollController.hasClients) {
+        _scrollController.animateTo(
+          _scrollController.position.maxScrollExtent,
+          duration: const Duration(milliseconds: 200),
+          curve: Curves.easeOut,
+        );
+      }
+    });
   }
 
   @override
   Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
     final isWide =
         MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
 
     return ValueListenableBuilder<List<PairedPeerModel>>(
       valueListenable: widget.bridge.pairedPeersNotifier,
       builder: (context, peers, _) {
-        final options = peers.isEmpty
-            ? const <NeuDropdownOption<String>>[]
-            : <NeuDropdownOption<String>>[
-                if (peers.length > 1)
-                  const NeuDropdownOption<String>(
-                    value: _broadcastTargetSentinel,
-                    label: '全部在线已配对设备',
-                  ),
-                for (final peer in peers)
-                  NeuDropdownOption<String>(
-                    value: peer.deviceId,
-                    label: peer.displayLabel,
-                  ),
-              ];
+        return ValueListenableBuilder<String?>(
+          valueListenable: widget.bridge.selectedPeerIdNotifier,
+          builder: (context, _, __) {
+            final activePeer = widget.bridge.selectedPeer;
+            final filtered = (activePeer == null || peers.length <= 1)
+                ? _history
+                : _history.where((item) {
+                    final raw = item.peerName.trim().toLowerCase();
+                    if (raw.isEmpty || raw == '对端设备') return true;
+                    final dName = activePeer.deviceName.trim().toLowerCase();
+                    final dId = activePeer.deviceId.trim().toLowerCase();
+                    final dIp = (activePeer.ip ?? '').trim().toLowerCase();
+                    return raw == dName ||
+                        raw == dId ||
+                        (dIp.isNotEmpty && raw.contains(dIp));
+                  }).toList(growable: false);
 
-        final validSelection = _resolveValidTarget(peers);
+            final chatPane = _buildChatPane(
+              context,
+              activePeer: activePeer,
+              items: filtered,
+              isWide: isWide,
+            );
 
-        return SingleChildScrollView(
-          padding: EdgeInsets.all(isWide ? NeuSpace.lg : NeuSpace.md),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: <Widget>[
-              if (isWide) ...<Widget>[
-                Text('传输', style: textTheme.headlineSmall),
-                const SizedBox(height: 4),
-                Text(
-                  '局域网内的加密文件传输与协作',
-                  style: textTheme.bodySmall,
-                ),
-                const SizedBox(height: 18),
+            if (!isWide) return chatPane;
+
+            return Row(
+              children: <Widget>[
+                _buildDesktopPeerSidebar(context, peers, activePeer),
+                Expanded(child: chatPane),
               ],
-              Row(
-                children: <Widget>[
-                  Expanded(
-                    child: _TransferActionCard(
-                      icon: Icons.send_rounded,
-                      title: '发送文件',
-                      subtitle: '加密传输至设备',
-                      selected: _mode == _TransferMode.file,
-                      onTap: _pickFileToSend,
-                    ),
-                  ),
-                  const SizedBox(width: NeuSpace.md),
-                  Expanded(
-                    child: _TransferActionCard(
-                      icon: Icons.content_paste_go_rounded,
-                      title: '剪贴板同步',
-                      subtitle: '跨设备内容同步',
-                      selected: _mode == _TransferMode.clipboard,
-                      onTap: () =>
-                          setState(() => _mode = _TransferMode.clipboard),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: NeuSpace.md),
-              NeuCard(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    NeuDropdown<String>(
-                      label: '目标设备',
-                      emptyHint: '暂无已配对设备（请先在“设备”页配对）',
-                      prefixIcon: Icons.devices_outlined,
-                      options: options,
-                      value: validSelection,
-                      enabled: peers.isNotEmpty,
-                      onChanged: (value) =>
-                          setState(() => _selectedTarget = value),
-                    ),
-                    const SizedBox(height: 14),
-                    NeuMotionSwitcher(
-                      child: _mode == _TransferMode.file
-                          ? Column(
-                              key: const ValueKey<_TransferMode>(_TransferMode.file),
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: <Widget>[
-                                if (isWide)
-                                  Row(
-                                    crossAxisAlignment: CrossAxisAlignment.end,
-                                    children: <Widget>[
-                                      Expanded(
-                                        child: NeuInsetField(
-                                          controller: _filePathController,
-                                          label: '本地文件路径',
-                                          hint: Platform.isAndroid
-                                              ? '/storage/emulated/0/Download/report.pdf'
-                                              : r'C:\Users\YourName\Desktop\report.pdf',
-                                          prefixIcon:
-                                              Icons.insert_drive_file_outlined,
-                                        ),
-                                      ),
-                                      const SizedBox(width: NeuSpace.sm),
-                                      NeuButton(
-                                        label: '选择文件',
-                                        icon: Icons.attach_file_rounded,
-                                        onPressed: _pickFileToSend,
-                                      ),
-                                    ],
-                                  )
-                                else ...<Widget>[
-                                  NeuInsetField(
-                                    controller: _filePathController,
-                                    label: '本地文件路径',
-                                    hint: Platform.isAndroid
-                                        ? '/storage/emulated/0/Download/report.pdf'
-                                        : r'C:\Users\YourName\Desktop\report.pdf',
-                                    prefixIcon:
-                                        Icons.insert_drive_file_outlined,
-                                  ),
-                                  const SizedBox(height: NeuSpace.sm),
-                                  NeuButton(
-                                    label: '选择文件',
-                                    icon: Icons.attach_file_rounded,
-                                    expanded: true,
-                                    onPressed: _pickFileToSend,
-                                  ),
-                                ],
-                                const SizedBox(height: 14),
-                                Align(
-                                  alignment: isWide
-                                      ? Alignment.centerLeft
-                                      : Alignment.center,
-                                  child: NeuButton(
-                                    label: '加密发送文件',
-                                    icon: Icons.send_rounded,
-                                    tone: NeuButtonTone.primary,
-                                    loading: _sending,
-                                    expanded: !isWide,
-                                    onPressed: peers.isEmpty
-                                        ? null
-                                        : () => _sendFile(peers, validSelection),
-                                  ),
-                                ),
-                              ],
-                            )
-                          : Column(
-                              key: const ValueKey<_TransferMode>(
-                                _TransferMode.clipboard,
-                              ),
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: <Widget>[
-                                NeuInsetField(
-                                  controller: _contentController,
-                                  label: '剪贴板内容',
-                                  hint: '输入或粘贴要跨设备同步的文本…',
-                                  maxLines: 4,
-                                ),
-                                const SizedBox(height: 14),
-                                Wrap(
-                                  spacing: NeuSpace.sm,
-                                  runSpacing: NeuSpace.sm,
-                                  children: <Widget>[
-                                    NeuButton(
-                                      label: '加密同步剪贴板',
-                                      icon: Icons.sync_alt_rounded,
-                                      tone: NeuButtonTone.primary,
-                                      loading: _sending,
-                                      onPressed: peers.isEmpty
-                                          ? null
-                                          : () => _sendClipboardText(
-                                                peers,
-                                                validSelection,
-                                              ),
-                                    ),
-                                    NeuButton(
-                                      label: '读取本机剪贴板',
-                                      icon: Icons.content_paste_rounded,
-                                      onPressed: _pasteFromSystemClipboard,
-                                    ),
-                                  ],
-                                ),
-                              ],
-                            ),
-                    ),
-                  ],
-                ),
-              ),
-              const SizedBox(height: NeuSpace.md),
-              NeuCard(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: <Widget>[
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: <Widget>[
-                        Text('最近传输', style: textTheme.titleMedium),
-                        Text(
-                          '${_history.length} 条记录',
-                          style: textTheme.labelMedium,
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 14),
-                    if (_history.isEmpty)
-                      const NeuEmptyState(
-                        icon: Icons.swap_horiz_rounded,
-                        title: '暂无传输记录',
-                        subtitle: '选择上方“发送文件”或“剪贴板同步”即可向局域网设备高速加密发送。',
-                      )
-                    else
-                      for (var i = 0; i < _history.length; i++) ...<Widget>[
-                        Builder(
-                          key: ValueKey<String>(
-                            '${_history[i].formattedTime}_${_history[i].title}_$i',
-                          ),
-                          builder: (context) {
-                            final item = _history[i];
-                            return Padding(
-                              padding: const EdgeInsets.symmetric(vertical: 10),
-                              child: Row(
-                                children: <Widget>[
-                                  NeuIconBadge(
-                                    icon: item.isFile
-                                        ? Icons.description_rounded
-                                        : Icons.notes_rounded,
-                                    color: item.isFile
-                                        ? NeuTokens.folderGold
-                                        : NeuTokens.accent,
-                                    backgroundColor: item.isFile
-                                        ? NeuTokens.folderGoldSoft
-                                        : NeuTokens.accentSoft,
-                                    radius: 10,
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: Column(
-                                      crossAxisAlignment:
-                                          CrossAxisAlignment.start,
-                                      children: <Widget>[
-                                        Text(
-                                          item.title,
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: textTheme.titleSmall,
-                                        ),
-                                        const SizedBox(height: 2),
-                                        Text(
-                                          isWide
-                                              ? item.subtitle
-                                              : '${item.subtitle} · ${item.formattedTime}',
-                                          maxLines: 1,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: textTheme.bodySmall,
-                                        ),
-                                      ],
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  if (item.content != null &&
-                                      item.content!.isNotEmpty)
-                                    IconButton(
-                                      tooltip: '复制文本',
-                                      icon: const Icon(
-                                        Icons.copy_rounded,
-                                        size: 18,
-                                        color: NeuTokens.textSecondary,
-                                      ),
-                                      onPressed: () =>
-                                          _copyMessage(item.content!),
-                                    ),
-                                  if (isWide) ...<Widget>[
-                                    Text(
-                                      item.formattedTime,
-                                      style: textTheme.labelMedium,
-                                    ),
-                                    const SizedBox(width: 8),
-                                  ],
-                                  const Icon(
-                                    Icons.check_circle_outline_rounded,
-                                    size: 18,
-                                    color: NeuTokens.healthy,
-                                  ),
-                                ],
-                              ),
-                            );
-                          },
-                        ),
-                        if (i < _history.length - 1) const Divider(height: 1),
-                      ],
-                  ],
-                ),
-              ),
-            ],
-          ),
+            );
+          },
         );
       },
     );
   }
+
+  Widget _buildDesktopPeerSidebar(
+    BuildContext context,
+    List<PairedPeerModel> peers,
+    PairedPeerModel? activePeer,
+  ) {
+    return Container(
+      width: 244,
+      decoration: const BoxDecoration(
+        color: Color(0xFFFAFBFD),
+        border: Border(
+          right: BorderSide(color: NeuTokens.hairlineBorder, width: 1),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 18, 12, 12),
+            child: Row(
+              children: <Widget>[
+                Text(
+                  '设备对话',
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                ),
+                const Spacer(),
+                IconButton(
+                  tooltip: '配对新设备',
+                  icon: const Icon(Icons.add_rounded, size: 20),
+                  onPressed: widget.onOpenDeviceManager,
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: peers.isEmpty
+                ? Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: NeuEmptyState(
+                      icon: Icons.devices_other_rounded,
+                      title: '暂无设备',
+                      subtitle: '配对后即可像聊天一样互传文件和文字。',
+                      action: NeuButton(
+                        label: '去配对',
+                        tone: NeuButtonTone.primary,
+                        onPressed: widget.onOpenDeviceManager,
+                      ),
+                    ),
+                  )
+                : ListView.separated(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
+                    ),
+                    itemCount: peers.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 6),
+                    itemBuilder: (context, index) {
+                      final peer = peers[index];
+                      final selected = peer.deviceId == activePeer?.deviceId;
+                      return InkWell(
+                        onTap: () => widget.bridge.selectPeer(peer.deviceId),
+                        borderRadius:
+                            const BorderRadius.all(Radius.circular(12)),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                          decoration: BoxDecoration(
+                            color: selected
+                                ? NeuTokens.accentSoft
+                                : Colors.transparent,
+                            borderRadius:
+                                const BorderRadius.all(Radius.circular(12)),
+                          ),
+                          child: Row(
+                            children: <Widget>[
+                              NeuIconBadge(
+                                icon: peer.osType
+                                        .toLowerCase()
+                                        .contains('android')
+                                    ? Icons.phone_android_rounded
+                                    : Icons.desktop_windows_rounded,
+                                color: selected
+                                    ? NeuTokens.accent
+                                    : NeuTokens.slateMuted,
+                                backgroundColor: NeuTokens.surface,
+                                size: 34,
+                                iconSize: 17,
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: <Widget>[
+                                    Text(
+                                      peer.deviceName,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .titleSmall
+                                          ?.copyWith(
+                                            fontWeight: selected
+                                                ? FontWeight.w700
+                                                : FontWeight.w500,
+                                          ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      peer.online ? '在线' : '离线',
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .labelSmall
+                                          ?.copyWith(
+                                            color: peer.online
+                                                ? NeuTokens.healthy
+                                                : NeuTokens.textSecondary,
+                                          ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildChatPane(
+    BuildContext context, {
+    required PairedPeerModel? activePeer,
+    required List<TransferHistoryModel> items,
+    required bool isWide,
+  }) {
+    return Column(
+      children: <Widget>[
+        if (isWide && activePeer != null)
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
+            decoration: const BoxDecoration(
+              color: NeuTokens.surface,
+              border: Border(
+                bottom: BorderSide(color: NeuTokens.hairlineBorder),
+              ),
+            ),
+            child: Row(
+              children: <Widget>[
+                Text(
+                  activePeer.deviceName,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                        fontWeight: FontWeight.w700,
+                      ),
+                ),
+                const SizedBox(width: 10),
+                NeuStatusBadge(
+                  label: activePeer.online ? '在线' : '离线',
+                  tone: activePeer.online
+                      ? NeuStatusTone.healthy
+                      : NeuStatusTone.neutral,
+                  showDot: true,
+                ),
+                const Spacer(),
+                IconButton(
+                  tooltip: '刷新记录',
+                  icon: const Icon(Icons.refresh_rounded, size: 19),
+                  onPressed: () => _refreshHistory(silent: false),
+                ),
+              ],
+            ),
+          ),
+        Expanded(
+          child: _loading && items.isEmpty
+              ? const Center(child: CircularProgressIndicator())
+              : items.isEmpty
+                  ? Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: NeuEmptyState(
+                          icon: Icons.chat_bubble_outline_rounded,
+                          title: activePeer == null
+                              ? '先配对一台设备'
+                              : '与 ${activePeer.deviceName} 暂无传输记录',
+                          subtitle: activePeer == null
+                              ? '配对后即可在这里直接互发文件或文字。'
+                              : '点击左下角 + 发送文件，或在输入框输入文字直接发送。',
+                          action: activePeer == null
+                              ? NeuButton(
+                                  label: '去配对设备',
+                                  tone: NeuButtonTone.primary,
+                                  onPressed: widget.onOpenDeviceManager,
+                                )
+                              : null,
+                        ),
+                      ),
+                    )
+                  : ListView.builder(
+                      controller: _scrollController,
+                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+                      itemCount: items.length,
+                      itemBuilder: (context, index) {
+                        final item = items[index];
+                        final showTime = index == 0 ||
+                            (item.createdAtSecs -
+                                        items[index - 1].createdAtSecs)
+                                    .abs() >
+                                180;
+                        return _MessageBubbleRow(
+                          item: item,
+                          showTimeHeader: showTime,
+                        );
+                      },
+                    ),
+        ),
+        _buildInputBar(context, enabled: activePeer != null && !_sending),
+      ],
+    );
+  }
+
+  Widget _buildInputBar(BuildContext context, {required bool enabled}) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
+      decoration: const BoxDecoration(
+        color: NeuTokens.canvas,
+        border: Border(
+          top: BorderSide(color: NeuTokens.hairlineBorder),
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: <Widget>[
+          _RoundActionButton(
+            icon: Icons.add_rounded,
+            tooltip: '发送文件',
+            onPressed: enabled ? _pickAndSendFile : null,
+          ),
+          const SizedBox(width: 8),
+          _RoundActionButton(
+            icon: Icons.content_paste_rounded,
+            tooltip: '粘贴本机剪贴板',
+            onPressed: enabled ? _pasteFromClipboard : null,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Container(
+              constraints: const BoxConstraints(minHeight: 42, maxHeight: 110),
+              padding: const EdgeInsets.symmetric(horizontal: 14),
+              decoration: BoxDecoration(
+                color: NeuTokens.surface,
+                borderRadius: const BorderRadius.all(Radius.circular(22)),
+                border: Border.all(color: NeuTokens.hairlineBorder),
+              ),
+              child: TextField(
+                controller: _inputController,
+                enabled: enabled,
+                minLines: 1,
+                maxLines: 4,
+                textInputAction: TextInputAction.send,
+                onSubmitted: (_) => unawaited(_sendText()),
+                decoration: const InputDecoration(
+                  hintText: '输入文字或链接发送…',
+                  border: InputBorder.none,
+                  isDense: true,
+                  contentPadding: EdgeInsets.symmetric(vertical: 11),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          _RoundActionButton(
+            icon: _sending
+                ? Icons.hourglass_top_rounded
+                : Icons.arrow_upward_rounded,
+            tooltip: '发送',
+            primary: true,
+            onPressed: enabled ? _sendText : null,
+          ),
+        ],
+      ),
+    );
+  }
 }
 
-class _TransferActionCard extends StatelessWidget {
-  const _TransferActionCard({
-    required this.icon,
-    required this.title,
-    required this.subtitle,
-    required this.selected,
-    required this.onTap,
+class _MessageBubbleRow extends StatelessWidget {
+  const _MessageBubbleRow({
+    required this.item,
+    required this.showTimeHeader,
   });
 
-  final IconData icon;
-  final String title;
-  final String subtitle;
-  final bool selected;
-  final VoidCallback onTap;
+  final TransferHistoryModel item;
+  final bool showTimeHeader;
 
   @override
   Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    return NeuCard(
-      onTap: onTap,
-      backgroundColor: selected ? NeuTokens.accentSoft : NeuTokens.surface,
-      borderColor: selected
-          ? NeuTokens.accent.withValues(alpha: 0.45)
-          : NeuTokens.hairlineBorder,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
+    final incoming = item.isIncoming;
+    final timeStr = item.createdAtSecs > 0
+        ? LanVaultBridge.formatRelativeTime('${item.createdAtSecs}')
+        : item.formattedTime;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
       child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: <Widget>[
-              Container(
-                width: 48,
-                height: 48,
-                decoration: BoxDecoration(
-                  color: selected ? NeuTokens.surface : NeuTokens.accentSoft,
-                  borderRadius: const BorderRadius.all(Radius.circular(14)),
-                ),
-                child: Icon(icon, size: 24, color: NeuTokens.accent),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                title,
-                style: textTheme.titleMedium?.copyWith(
-                  color: selected ? NeuTokens.accent : NeuTokens.textPrimary,
+        crossAxisAlignment:
+            incoming ? CrossAxisAlignment.start : CrossAxisAlignment.end,
+        children: <Widget>[
+          if (showTimeHeader && timeStr.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 10),
+              child: Center(
+                child: Text(
+                  timeStr,
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                        color: NeuTokens.textSecondary,
+                      ),
                 ),
               ),
-              const SizedBox(height: 4),
-              Text(
-                subtitle,
-                textAlign: TextAlign.center,
-                style: textTheme.bodySmall,
-              ),
-            ],
+            ),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 320),
+            child: item.isFile
+                ? _buildFileBubble(context, incoming)
+                : _buildTextBubble(context, incoming),
           ),
-        );
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFileBubble(BuildContext context, bool incoming) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: NeuTokens.surface,
+        borderRadius: const BorderRadius.all(Radius.circular(18)),
+        border: Border.all(color: NeuTokens.hairlineBorder),
+        boxShadow: NeuTokens.controlShadows,
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: <Widget>[
+          NeuIconBadge(
+            icon: Icons.insert_drive_file_rounded,
+            color: NeuTokens.accent,
+            backgroundColor: NeuTokens.accentSoft,
+            size: 40,
+            iconSize: 20,
+          ),
+          const SizedBox(width: 12),
+          Flexible(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  item.title,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  item.sizeBytes > 0
+                      ? SystemEnvHelper.formatBytes(item.sizeBytes)
+                      : (incoming ? '已接收文件' : '已发送文件'),
+                  style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: NeuTokens.textSecondary,
+                      ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTextBubble(BuildContext context, bool incoming) {
+    final text = (item.content != null && item.content!.isNotEmpty)
+        ? item.content!
+        : item.title;
+
+    return InkWell(
+      onTap: () {
+        Clipboard.setData(ClipboardData(text: text));
+        NeuToast.success(context, '已复制到剪贴板');
+      },
+      borderRadius: const BorderRadius.all(Radius.circular(18)),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
+        decoration: BoxDecoration(
+          color: incoming ? NeuTokens.surface : NeuTokens.accent,
+          borderRadius: const BorderRadius.all(Radius.circular(18)),
+          border: incoming
+              ? Border.all(color: NeuTokens.hairlineBorder)
+              : null,
+          boxShadow: NeuTokens.controlShadows,
+        ),
+        child: Text(
+          text,
+          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: incoming ? NeuTokens.textPrimary : Colors.white,
+                height: 1.4,
+              ),
+        ),
+      ),
+    );
+  }
+}
+
+class _RoundActionButton extends StatelessWidget {
+  const _RoundActionButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+    this.primary = false,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback? onPressed;
+  final bool primary;
+
+  @override
+  Widget build(BuildContext context) {
+    final enabled = onPressed != null;
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onPressed,
+        borderRadius: const BorderRadius.all(Radius.circular(NeuRadius.pill)),
+        child: Container(
+          width: 42,
+          height: 42,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: primary
+                ? (enabled
+                    ? NeuTokens.accent
+                    : NeuTokens.accent.withValues(alpha: 0.35))
+                : NeuTokens.surface,
+            border: primary
+                ? null
+                : Border.all(color: NeuTokens.hairlineBorder),
+            boxShadow: NeuTokens.controlShadows,
+          ),
+          child: Icon(
+            icon,
+            size: 20,
+            color: primary
+                ? Colors.white
+                : (enabled
+                    ? NeuTokens.textPrimary
+                    : NeuTokens.textSecondary.withValues(alpha: 0.4)),
+          ),
+        ),
+      ),
+    );
   }
 }

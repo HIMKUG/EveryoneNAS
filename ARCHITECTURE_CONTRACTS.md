@@ -52,6 +52,7 @@
 6. `POST /api/vaults`（Cookie）
    - Request: `{ "name": string, "mount_path": string, "volume_guid": string|null, "pool_mode": "single|striped|mirror_raid1", "quota_bytes": number, "e2ee_enabled": boolean, "extra_volumes": [ { "mount_path": string, "volume_guid": string|null, "role": "mirror|pool_ext" } ] }`
    - 201 Created: 返回新建 Vault 对象
+   - `PUT /api/vaults/{vault_id}/devices/{device_id}` 允许管理员向已配对设备授予库访问权限。重复授权返回 `204`，普通设备无法授予权限。
 7. `GET /api/snapshots?vault_id=<id>`（Cookie）
    - 200 OK: `{ "snapshots": [ { "snapshot_id": string, "vault_id": string, "device_id": string, "retention_tier": "hourly|daily|weekly|monthly|pinned", "file_count": number, "total_bytes": number, "created_at": number } ] }`
 8. `POST /api/scrub/trigger`（Cookie）

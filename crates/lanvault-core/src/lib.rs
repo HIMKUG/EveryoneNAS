@@ -14,8 +14,10 @@ pub mod woff2;
 
 pub use chunker::{
     blake3_hash, blake3_hash_reader, chunk_bytes, chunk_stream, compress_zstd, decompress_zstd,
-    pack_chunk, pack_chunk_with_context, unpack_chunk, ChunkDescriptor, ChunkParams, PackedChunk, CHUNK_AVG_SIZE,
-    CHUNK_MAX_SIZE, CHUNK_MIN_SIZE, DEFAULT_ZSTD_LEVEL,
+    is_incompressible_extension, pack_chunk, pack_chunk_adaptive_with_context,
+    pack_chunk_with_context, unpack_chunk, unpack_chunk_with_compression, ChunkCompression,
+    ChunkDescriptor, ChunkParams, PackedChunk, CHUNK_AVG_SIZE, CHUNK_MAX_SIZE, CHUNK_MIN_SIZE,
+    DEFAULT_ZSTD_LEVEL,
 };
 pub use crypto::{
     compute_pin_mac, constant_time_eq, decrypt_aead, encrypt_aead, encrypt_aead_deterministic, ChunkSealContext,
@@ -24,15 +26,15 @@ pub use crypto::{
 };
 pub use db::{
     ChunkRecord, Database, LocalFileStateRecord, PoolMode, RetentionTier, ScrubStatus,
-    SnapshotRecord, SyncRuleRecord, TransferHistoryRecord, TrustedPeer, VaultRecord, VaultVolumeRecord, VolumeRole,
-    WalCheckpointReport,
+    SnapshotRecord, SyncRuleRecord, TransferHistoryRecord, TransferSessionRecord, TrustedPeer,
+    VaultRecord, VaultVolumeRecord, VolumeRole, WalCheckpointReport,
 };
 pub use discovery::{
     DiscoveredPeerInfo, DiscoveryAnnouncement, DiscoveryBrowser, MdnsRegistrar, MDNS_SERVICE_TYPE,
     UDP_FALLBACK_PORT,
 };
 pub use protocol::{
-    pairing_identity_message, pairing_response_message, CLIPBOARD_AAD,
+    pairing_identity_message, pairing_response_message, session_renew_message, CLIPBOARD_AAD,
 };
 pub use debug_telemetry::{
     clear_debug_logs, configure_debug_log_file, get_debug_log_path, get_debug_logs, install_rust_panic_hook,

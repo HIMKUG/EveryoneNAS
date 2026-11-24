@@ -22,11 +22,21 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 已在线设备的健康心跳间隔。
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 
-/// 重连目标设备信息。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 重连目标设备信息，支持通过共享动态地址在 IP 漂移（DHCP / Wi-Fi 切换）后自动收敛。
+#[derive(Debug, Clone)]
 pub struct ReconnectTarget {
     pub device_id: String,
     pub addr: SocketAddr,
+    pub dynamic_addr: Option<Arc<std::sync::RwLock<SocketAddr>>>,
+}
+
+impl ReconnectTarget {
+    pub fn current_addr(&self) -> SocketAddr {
+        self.dynamic_addr
+            .as_ref()
+            .and_then(|lock| lock.read().ok().map(|g| *g))
+            .unwrap_or(self.addr)
+    }
 }
 
 /// 自愈重连状态机当前状态。
@@ -131,16 +141,17 @@ impl ReconnectController {
                 continue;
             }
 
-            if probe_tcp(target.addr).await {
+            let active_addr = target.current_addr();
+            if probe_tcp(active_addr).await {
                 if !was_connected {
                     info!(
                         device_id = %target.device_id,
-                        addr = %target.addr,
+                        addr = %active_addr,
                         "paired peer reconnected"
                     );
                     let _ = self.events_tx.send(ReconnectEvent::PeerConnected {
                         device_id: target.device_id.clone(),
-                        addr: target.addr,
+                        addr: active_addr,
                     });
                 }
                 was_connected = true;
@@ -155,14 +166,14 @@ impl ReconnectController {
                 if was_connected {
                     warn!(
                         device_id = %target.device_id,
-                        addr = %target.addr,
+                        addr = %active_addr,
                         next_delay_secs = delay.as_secs(),
                         "paired peer lost connection; entering exponential backoff"
                     );
                 } else {
                     debug!(
                         device_id = %target.device_id,
-                        addr = %target.addr,
+                        addr = %active_addr,
                         attempt,
                         next_delay_secs = delay.as_secs(),
                         "peer probe failed; backing off"
@@ -171,7 +182,7 @@ impl ReconnectController {
 
                 let _ = self.events_tx.send(ReconnectEvent::PeerDisconnected {
                     device_id: target.device_id.clone(),
-                    addr: target.addr,
+                    addr: active_addr,
                     next_delay: delay,
                 });
                 was_connected = false;

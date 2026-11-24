@@ -5,8 +5,10 @@
 //! and `local_file_state`, along with indices, `PRAGMA wal_checkpoint(TRUNCATE)`,
 //! and strongly typed CRUD methods.
 
-use std::path::Path;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -242,19 +244,122 @@ pub struct WalCheckpointReport {
 }
 
 /// Thread-safe SQLite WAL database handle.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferSessionRecord {
+    pub transfer_id: String,
+    pub owner_device_id: String,
+    pub filename: String,
+    pub total_size: u64,
+    pub chunk_size: u64,
+    pub total_parts: u64,
+    pub received_parts: Vec<u64>,
+    pub file_blake3: String,
+    pub encoding: String,
+    pub status: String,
+    pub saved_path: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub expires_at: i64,
+}
+
 pub struct Database {
     conn: Mutex<Connection>,
+    read_pool: Vec<Mutex<Connection>>,
+    read_rr: AtomicUsize,
+}
+
+/// Process-wide cache of migrated handles keyed by normalized database path.
+static SHARED_DB_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<Database>>>> = OnceLock::new();
+
+/// 缓存上限。正常使用只需 2 个（`client_state.db` + 当前服务端 `index.db`）；
+/// 用户反复切换存储池时会累积旧路径，超过这个数量就回收无人持有的旧句柄，
+/// 避免长期占着已卸载卷上的文件句柄（Windows 会因此阻止用户删除目录）。
+const MAX_SHARED_DB_HANDLES: usize = 16;
+
+/// Cache key: absolute + lowercased on Windows, so `D:\a\index.db` and `d:\a\index.db`
+/// (or a verbatim-prefixed variant) resolve to the same handle instead of two connections
+/// fighting over one WAL file.
+fn canonical_cache_key(path: &Path) -> PathBuf {
+    let absolute = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        let stripped = crate::strip_windows_verbatim(&absolute.to_string_lossy());
+        return PathBuf::from(stripped.to_lowercase());
+    }
+    #[cfg(not(windows))]
+    {
+        absolute
+    }
 }
 
 impl Database {
+    /// Returns a shared, already-migrated handle for `path`, opening it only once per process.
+    ///
+    /// The FFI/UI layer re-reads telemetry, vaults and snapshots on every poll. Each
+    /// `Database::open` otherwise re-ran the full `CREATE TABLE/INDEX IF NOT EXISTS` batch
+    /// (a write transaction per call) plus PRAGMAs, which showed up as steady background
+    /// I/O and lock contention on the same file the uploader is writing to. Caching the
+    /// handle removes that entire class of repeat work; SQLite serializes access internally
+    /// so sharing one connection across threads is safe and cheaper than N connections.
+    pub fn shared<P: AsRef<Path>>(path: P) -> Result<Arc<Self>> {
+        let path_ref = path.as_ref();
+        let key = canonical_cache_key(path_ref);
+        let mut guard = SHARED_DB_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = guard.get(&key) {
+            return Ok(Arc::clone(existing));
+        }
+        // 超出上限时先回收"只有缓存自己还持有"的旧句柄：`Arc::strong_count == 1`
+        // 说明没有任何调用方还在用它，关闭连接不会影响正在进行的读写。
+        if guard.len() >= MAX_SHARED_DB_HANDLES {
+            let evictable: Vec<PathBuf> = guard
+                .iter()
+                .filter(|(_, db)| Arc::strong_count(db) == 1)
+                .map(|(path, _)| path.clone())
+                .collect();
+            for path in evictable {
+                guard.remove(&path);
+            }
+        }
+        let db = Arc::new(Self::open(path_ref)?);
+        guard.insert(key, Arc::clone(&db));
+        Ok(db)
+    }
+
+    /// 丢弃 `path` 的缓存句柄（测试清理、整库重建时使用）。
+    pub fn evict_shared<P: AsRef<Path>>(path: P) {
+        let mut guard = SHARED_DB_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.remove(&canonical_cache_key(path.as_ref()));
+    }
+
     /// Opens (or creates) a SQLite database at `path`, enables WAL mode and foreign keys,
     /// and initializes all 7 schema tables and indices.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        let db = Self {
+        let path_ref = path.as_ref();
+        let conn = Connection::open(path_ref)?;
+        let mut db = Self {
             conn: Mutex::new(conn),
+            read_pool: Vec::new(),
+            read_rr: AtomicUsize::new(0),
         };
         db.configure_and_migrate()?;
+        // WAL 模式下构建 4 个只读连接，让高并发查询与块存在性探测不阻塞写入锁。
+        let mut readers = Vec::with_capacity(4);
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        for _ in 0..4 {
+            if let Ok(rconn) = Connection::open_with_flags(path_ref, flags) {
+                let _ = rconn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA temp_store = MEMORY;");
+                readers.push(Mutex::new(rconn));
+            }
+        }
+        db.read_pool = readers;
         Ok(db)
     }
 
@@ -263,6 +368,8 @@ impl Database {
         let conn = Connection::open_in_memory()?;
         let db = Self {
             conn: Mutex::new(conn),
+            read_pool: Vec::new(),
+            read_rr: AtomicUsize::new(0),
         };
         db.configure_and_migrate()?;
         Ok(db)
@@ -270,6 +377,16 @@ impl Database {
 
     fn lock_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("database mutex poisoned")
+    }
+
+    fn lock_read_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        if self.read_pool.is_empty() {
+            return self.lock_conn();
+        }
+        let idx = self.read_rr.fetch_add(1, Ordering::Relaxed) % self.read_pool.len();
+        self.read_pool[idx]
+            .lock()
+            .expect("read database mutex poisoned")
     }
 
     fn configure_and_migrate(&self) -> Result<()> {
@@ -284,11 +401,39 @@ PRAGMA mmap_size = 268435456;";
         conn.execute_batch(
             r#"
             PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = FULL;
+            -- `NORMAL` in WAL mode is durable across application crashes (only a power
+            -- loss can roll back the newest transaction). `FULL` forced an fsync on every
+            -- single chunk index row, which capped LAN ingest at a few hundred KiB/s.
+            PRAGMA synchronous = NORMAL;
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
             PRAGMA temp_store = MEMORY;
-            PRAGMA wal_autocheckpoint = 4000;
+            PRAGMA wal_autocheckpoint = 8000;
+
+            CREATE TABLE IF NOT EXISTS transfer_sessions (
+                transfer_id     TEXT PRIMARY KEY,
+                owner_device_id TEXT NOT NULL DEFAULT '',
+                filename        TEXT NOT NULL,
+                total_size      INTEGER NOT NULL,
+                chunk_size      INTEGER NOT NULL,
+                total_parts     INTEGER NOT NULL,
+                received_parts  TEXT NOT NULL DEFAULT '[]',
+                file_blake3     TEXT NOT NULL,
+                encoding        TEXT NOT NULL DEFAULT 'xchacha20poly1305+raw',
+                status          TEXT NOT NULL DEFAULT 'active',
+                saved_path      TEXT,
+                created_at      INTEGER NOT NULL,
+                updated_at      INTEGER NOT NULL,
+                expires_at      INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS transfer_session_parts (
+                transfer_id     TEXT NOT NULL REFERENCES transfer_sessions(transfer_id) ON DELETE CASCADE,
+                part_index      INTEGER NOT NULL,
+                part_size       INTEGER NOT NULL DEFAULT 0,
+                received_at     INTEGER NOT NULL,
+                PRIMARY KEY (transfer_id, part_index)
+            );
 
             CREATE TABLE IF NOT EXISTS trusted_peers (
                 device_id       TEXT PRIMARY KEY,
@@ -399,7 +544,16 @@ PRAGMA mmap_size = 268435456;";
             CREATE INDEX IF NOT EXISTS idx_chunks_scrub_status ON chunks(scrub_status);
             CREATE INDEX IF NOT EXISTS idx_chunks_vault_scrub_status ON chunks(vault_id, scrub_status);
             CREATE INDEX IF NOT EXISTS idx_chunks_vault_ref_count ON chunks(vault_id, ref_count);
-            CREATE INDEX IF NOT EXISTS idx_snapshots_vault_created ON snapshots(vault_id, created_at DESC);
+            CREATE TABLE IF NOT EXISTS vault_device_grants (
+                vault_id        TEXT NOT NULL REFERENCES vaults(vault_id) ON DELETE CASCADE,
+                device_id       TEXT NOT NULL,
+                granted_at      INTEGER NOT NULL,
+                PRIMARY KEY (vault_id, device_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_snapshots_vault_created ON snapshots(vault_id, created_at DESC, snapshot_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_device_created ON snapshots(device_id, created_at DESC, snapshot_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_snapshots_vault_device_created ON snapshots(vault_id, device_id, created_at DESC, snapshot_id DESC);
             CREATE INDEX IF NOT EXISTS idx_snapshots_retention ON snapshots(vault_id, retention_tier);
             CREATE INDEX IF NOT EXISTS idx_local_file_state_rule ON local_file_state(rule_id);
             CREATE INDEX IF NOT EXISTS idx_snapshot_chunks_vault_hash
@@ -408,6 +562,7 @@ PRAGMA mmap_size = 268435456;";
                 ON revoked_sessions(expires_at);
             "#,
         )?;
+        ensure_column(&conn, "chunks", "compression", "compression TEXT NOT NULL DEFAULT 'zstd'")?;
         ensure_column(
             &conn,
             "trusted_peers",
@@ -432,6 +587,48 @@ PRAGMA mmap_size = 268435456;";
             "target_vault_id",
             "target_vault_id TEXT NOT NULL DEFAULT ''",
         )?;
+        ensure_column(
+            &conn,
+            "transfer_sessions",
+            "owner_device_id",
+            "owner_device_id TEXT NOT NULL DEFAULT ''",
+        )?;
+        ensure_column(
+            &conn,
+            "transfer_sessions",
+            "saved_path",
+            "saved_path TEXT",
+        )?;
+        // One-time idempotent migration: backfill legacy JSON received_parts into
+        // transfer_session_parts, and expire legacy unbound active sessions so they
+        // cannot be hijacked across devices and GC reaps their .part files.
+        {
+            let mut stmt = conn.prepare(
+                "SELECT transfer_id, received_parts, updated_at FROM transfer_sessions WHERE received_parts != '[]' AND received_parts != ''",
+            )?;
+            let legacy_rows: Vec<(String, String, i64)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            for (tid, parts_json, updated_at) in legacy_rows {
+                if let Ok(parts) = serde_json::from_str::<Vec<u64>>(&parts_json) {
+                    for part_idx in parts {
+                        conn.execute(
+                            "INSERT OR IGNORE INTO transfer_session_parts (transfer_id, part_index, part_size, received_at) VALUES (?1, ?2, 0, ?3)",
+                            params![tid, part_idx as i64, updated_at],
+                        )?;
+                    }
+                }
+                conn.execute(
+                    "UPDATE transfer_sessions SET received_parts = '[]' WHERE transfer_id = ?1",
+                    params![tid],
+                )?;
+            }
+            conn.execute(
+                "UPDATE transfer_sessions SET status = 'expired', expires_at = 0 WHERE owner_device_id = '' AND status = 'active'",
+                [],
+            )?;
+        }
         Ok(())
     }
 
@@ -607,7 +804,7 @@ PRAGMA mmap_size = 268435456;";
             r#"
             SELECT vault_id, name, pool_mode, quota_bytes, used_bytes, e2ee_enabled, created_at
             FROM vaults
-            ORDER BY created_at ASC
+            ORDER BY created_at ASC, rowid ASC
             "#,
         )?;
         let rows = stmt
@@ -693,6 +890,107 @@ PRAGMA mmap_size = 268435456;";
     // chunks CRUD & Bit-Rot / GC helpers (scoped by vault_id)
     // -------------------------------------------------------------------------
 
+
+    /// 原子化配额校验 + 写入块索引 + 扣减已用空间，防止高并发上传击穿存储池配额。
+    pub fn upsert_chunk_with_quota(
+        &self,
+        vault_id: &str,
+        hash_blake3: &[u8; 32],
+        raw_size: u64,
+        stored_size: u64,
+    ) -> Result<bool> {
+        self.upsert_chunk_with_quota_and_compression(
+            vault_id,
+            hash_blake3,
+            raw_size,
+            stored_size,
+            "zstd",
+        )
+    }
+
+    pub fn upsert_chunk_with_quota_and_compression(
+        &self,
+        vault_id: &str,
+        hash_blake3: &[u8; 32],
+        raw_size: u64,
+        stored_size: u64,
+        compression: &str,
+    ) -> Result<bool> {
+        if !matches!(compression, "zstd" | "raw") {
+            return Err(LanVaultError::InvalidInput(format!(
+                "unsupported chunk compression: `{compression}`"
+            )));
+        }
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let existing: Option<(i64, String)> = tx
+            .query_row(
+                "SELECT ref_count, compression FROM chunks WHERE vault_id = ?1 AND hash_blake3 = ?2",
+                params![vault_id, hash_blake3.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+
+        let now = unix_timestamp_secs();
+        if let Some((_ref_count, existing_comp)) = existing {
+            if !existing_comp.eq_ignore_ascii_case(compression) {
+                return Err(LanVaultError::InvalidState(format!(
+                    "chunk compression conflict for {}: stored as `{existing_comp}`, cannot overwrite with `{compression}`",
+                    hex::encode(hash_blake3)
+                )));
+            }
+            tx.execute(
+                "UPDATE chunks
+                 SET raw_size = ?1, stored_size = ?2, scrub_status = 'ok', last_scrub_at = NULL
+                 WHERE vault_id = ?3 AND hash_blake3 = ?4",
+                params![
+                    raw_size as i64,
+                    stored_size as i64,
+                    vault_id,
+                    hash_blake3.as_slice()
+                ],
+            )?;
+            tx.commit()?;
+            Ok(false)
+        } else {
+            let (quota_bytes, used_bytes): (i64, i64) = tx
+                .query_row(
+                    "SELECT quota_bytes, used_bytes FROM vaults WHERE vault_id = ?1",
+                    params![vault_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+                .ok_or_else(|| LanVaultError::NotFound(format!("vault {vault_id}")))?;
+            let available = (quota_bytes.max(0) as u64).saturating_sub(used_bytes.max(0) as u64);
+            if stored_size > available {
+                return Err(LanVaultError::QuotaExceeded {
+                    required: stored_size,
+                    available,
+                });
+            }
+            tx.execute(
+                r#"
+                INSERT INTO chunks (vault_id, hash_blake3, raw_size, stored_size, ref_count, scrub_status, created_at, compression)
+                VALUES (?1, ?2, ?3, ?4, 0, 'ok', ?5, ?6)
+                "#,
+                params![
+                    vault_id,
+                    hash_blake3.as_slice(),
+                    raw_size as i64,
+                    stored_size as i64,
+                    now,
+                    compression
+                ],
+            )?;
+            tx.execute(
+                "UPDATE vaults SET used_bytes = MAX(0, used_bytes + ?1) WHERE vault_id = ?2",
+                params![stored_size as i64, vault_id],
+            )?;
+            tx.commit()?;
+            Ok(true)
+        }
+    }
+
     pub fn upsert_chunk(
         &self,
         vault_id: &str,
@@ -700,17 +998,39 @@ PRAGMA mmap_size = 268435456;";
         raw_size: u64,
         stored_size: u64,
     ) -> Result<bool> {
+        self.upsert_chunk_with_compression(vault_id, hash_blake3, raw_size, stored_size, "zstd")
+    }
+
+    pub fn upsert_chunk_with_compression(
+        &self,
+        vault_id: &str,
+        hash_blake3: &[u8; 32],
+        raw_size: u64,
+        stored_size: u64,
+        compression: &str,
+    ) -> Result<bool> {
+        if !matches!(compression, "zstd" | "raw") {
+            return Err(LanVaultError::InvalidInput(format!(
+                "unsupported chunk compression: `{compression}`"
+            )));
+        }
         let conn = self.lock_conn();
-        let existing: Option<i64> = conn
+        let existing: Option<(i64, String)> = conn
             .query_row(
-                "SELECT ref_count FROM chunks WHERE vault_id = ?1 AND hash_blake3 = ?2",
+                "SELECT ref_count, compression FROM chunks WHERE vault_id = ?1 AND hash_blake3 = ?2",
                 params![vault_id, hash_blake3.as_slice()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
 
         let now = unix_timestamp_secs();
-        if existing.is_some() {
+        if let Some((_ref_count, existing_comp)) = existing {
+            if !existing_comp.eq_ignore_ascii_case(compression) {
+                return Err(LanVaultError::InvalidState(format!(
+                    "chunk compression conflict for {}: stored as `{existing_comp}`, cannot overwrite with `{compression}`",
+                    hex::encode(hash_blake3)
+                )));
+            }
             conn.execute(
                 "UPDATE chunks
                  SET raw_size = ?1, stored_size = ?2, scrub_status = 'ok', last_scrub_at = NULL
@@ -726,15 +1046,16 @@ PRAGMA mmap_size = 268435456;";
         } else {
             conn.execute(
                 r#"
-                INSERT INTO chunks (vault_id, hash_blake3, raw_size, stored_size, ref_count, scrub_status, created_at)
-                VALUES (?1, ?2, ?3, ?4, 0, 'ok', ?5)
+                INSERT INTO chunks (vault_id, hash_blake3, raw_size, stored_size, ref_count, scrub_status, created_at, compression)
+                VALUES (?1, ?2, ?3, ?4, 0, 'ok', ?5, ?6)
                 "#,
                 params![
                     vault_id,
                     hash_blake3.as_slice(),
                     raw_size as i64,
                     stored_size as i64,
-                    now
+                    now,
+                    compression
                 ],
             )?;
             Ok(true)
@@ -766,7 +1087,7 @@ PRAGMA mmap_size = 268435456;";
     }
 
     pub fn get_chunk(&self, vault_id: &str, hash_blake3: &[u8; 32]) -> Result<Option<ChunkRecord>> {
-        let conn = self.lock_conn();
+        let conn = self.lock_read_conn();
         let row = conn
             .query_row(
                 r#"
@@ -1062,18 +1383,44 @@ PRAGMA mmap_size = 268435456;";
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SnapshotRecord>> {
-        let conn = self.lock_conn();
+        self.list_snapshots_filtered_paginated(vault_id, None, limit, offset)
+    }
+
+    pub fn list_snapshots_filtered_paginated(
+        &self,
+        vault_id: Option<&str>,
+        device_id: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SnapshotRecord>> {
+        let conn = self.lock_read_conn();
         let limit_i64 = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
         let offset_i64 = i64::try_from(offset).unwrap_or(i64::MAX);
-        match vault_id {
-            Some(vid) => {
+        match (vault_id, device_id) {
+            (Some(vid), Some(did)) => {
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
+                           retention_tier, file_count, total_bytes, created_at
+                    FROM snapshots
+                    WHERE vault_id = ?1 AND device_id = ?2
+                    ORDER BY created_at DESC, snapshot_id DESC
+                    LIMIT ?3 OFFSET ?4
+                    "#,
+                )?;
+                let rows = stmt
+                    .query_map(params![vid, did, limit_i64, offset_i64], row_to_snapshot)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }
+            (Some(vid), None) => {
                 let mut stmt = conn.prepare(
                     r#"
                     SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
                            retention_tier, file_count, total_bytes, created_at
                     FROM snapshots
                     WHERE vault_id = ?1
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, snapshot_id DESC
                     LIMIT ?2 OFFSET ?3
                     "#,
                 )?;
@@ -1082,13 +1429,29 @@ PRAGMA mmap_size = 268435456;";
                     .collect::<std::result::Result<Vec<_>, _>>()?;
                 Ok(rows)
             }
-            None => {
+            (None, Some(did)) => {
                 let mut stmt = conn.prepare(
                     r#"
                     SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
                            retention_tier, file_count, total_bytes, created_at
                     FROM snapshots
-                    ORDER BY created_at DESC
+                    WHERE device_id = ?1
+                    ORDER BY created_at DESC, snapshot_id DESC
+                    LIMIT ?2 OFFSET ?3
+                    "#,
+                )?;
+                let rows = stmt
+                    .query_map(params![did, limit_i64, offset_i64], row_to_snapshot)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(rows)
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
+                           retention_tier, file_count, total_bytes, created_at
+                    FROM snapshots
+                    ORDER BY created_at DESC, snapshot_id DESC
                     LIMIT ?1 OFFSET ?2
                     "#,
                 )?;
@@ -1098,6 +1461,83 @@ PRAGMA mmap_size = 268435456;";
                 Ok(rows)
             }
         }
+    }
+
+    pub fn grant_vault_access(
+        &self,
+        vault_id: &str,
+        device_id: &str,
+        granted_at: i64,
+    ) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO vault_device_grants (vault_id, device_id, granted_at) VALUES (?1, ?2, ?3)",
+            params![vault_id, device_id, granted_at],
+        )?;
+        Ok(())
+    }
+
+    /// Checks whether a non-admin paired device is authorized to access `vault_id`.
+    /// - Explicitly granted devices are always authorized.
+    /// - Devices that already own a snapshot in `vault_id` retain access to their existing backups.
+    /// - Paired devices can use the primary/default vault (oldest vault) out of the box.
+    ///   Secondary vaults require an explicit grant or an existing snapshot.
+    pub fn is_device_authorized_for_vault(&self, vault_id: &str, device_id: &str) -> Result<bool> {
+        let conn = self.lock_read_conn();
+        let vault_exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM vaults WHERE vault_id = ?1",
+            params![vault_id],
+            |r| r.get(0),
+        )?;
+        if vault_exists == 0 {
+            return Ok(false);
+        }
+        let granted: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM vault_device_grants WHERE vault_id = ?1 AND device_id = ?2",
+            params![vault_id, device_id],
+            |r| r.get(0),
+        )?;
+        if granted > 0 {
+            return Ok(true);
+        }
+        let owns_snapshot: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM snapshots WHERE vault_id = ?1 AND device_id = ?2",
+            params![vault_id, device_id],
+            |r| r.get(0),
+        )?;
+        if owns_snapshot > 0 {
+            return Ok(true);
+        }
+        let default_vault_id: Option<String> = conn
+            .query_row(
+                "SELECT vault_id FROM vaults ORDER BY created_at ASC, rowid ASC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(default_vault_id.as_deref() == Some(vault_id))
+    }
+
+    /// Checks whether a non-admin device is allowed to read a specific chunk from `vault_id`
+    /// (requires the chunk to be referenced by at least one snapshot owned by `device_id` in `vault_id`).
+    pub fn is_chunk_accessible_to_device(
+        &self,
+        vault_id: &str,
+        hash_blake3: &[u8; 32],
+        device_id: &str,
+    ) -> Result<bool> {
+        let conn = self.lock_read_conn();
+        let count: i64 = conn.query_row(
+            r#"
+            SELECT COUNT(*)
+            FROM snapshot_chunks sc
+            INNER JOIN snapshots s ON s.snapshot_id = sc.snapshot_id
+            WHERE sc.vault_id = ?1 AND sc.chunk_hash = ?2 AND s.device_id = ?3
+            "#,
+            params![vault_id, hash_blake3.as_slice(), device_id],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn delete_snapshot(&self, snapshot_id: &str) -> Result<bool> {
@@ -1786,6 +2226,347 @@ fn ensure_column(
     Ok(())
 }
 
+impl Database {
+    pub fn ensure_chunk_compression_column(&self) -> Result<()> {
+        let conn = self.lock_conn();
+        let _ = conn.execute(
+            "ALTER TABLE chunks ADD COLUMN compression TEXT NOT NULL DEFAULT 'zstd'",
+            [],
+        );
+        Ok(())
+    }
+
+    pub fn set_chunk_compression(
+        &self,
+        vault_id: &str,
+        hash_blake3: &[u8; 32],
+        compression: &str,
+    ) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE chunks SET compression = ?3 WHERE vault_id = ?1 AND hash_blake3 = ?2",
+            params![vault_id, hash_blake3.as_slice(), compression],
+        )?;
+        Ok(())
+    }
+
+
+    fn load_transfer_parts_with_conn(conn: &Connection, transfer_id: &str) -> Result<Vec<u64>> {
+        let mut stmt = conn.prepare(
+            "SELECT part_index FROM transfer_session_parts WHERE transfer_id = ?1 ORDER BY part_index ASC",
+        )?;
+        let parts = stmt
+            .query_map(params![transfer_id], |r| Ok(r.get::<_, i64>(0)? as u64))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(parts)
+    }
+
+    pub fn upsert_transfer_session(&self, rec: &TransferSessionRecord) -> Result<TransferSessionRecord> {
+        let mut conn = self.lock_conn();
+        let existing_opt = conn
+            .query_row(
+                "SELECT transfer_id, owner_device_id, filename, total_size, chunk_size, total_parts, file_blake3, encoding, status, saved_path, created_at, updated_at, expires_at FROM transfer_sessions WHERE transfer_id = ?1",
+                params![rec.transfer_id],
+                |row| {
+                    Ok(TransferSessionRecord {
+                        transfer_id: row.get(0)?,
+                        owner_device_id: row.get(1)?,
+                        filename: row.get(2)?,
+                        total_size: row.get::<_, i64>(3)? as u64,
+                        chunk_size: row.get::<_, i64>(4)? as u64,
+                        total_parts: row.get::<_, i64>(5)? as u64,
+                        received_parts: Vec::new(),
+                        file_blake3: row.get(6)?,
+                        encoding: row.get(7)?,
+                        status: row.get(8)?,
+                        saved_path: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
+                        expires_at: row.get(12)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        if let Some(mut existing) = existing_opt {
+            if !existing.owner_device_id.is_empty() && existing.owner_device_id != rec.owner_device_id {
+                return Err(LanVaultError::Auth(
+                    "transfer session belongs to another device".to_string(),
+                ));
+            }
+            if existing.owner_device_id == rec.owner_device_id
+                && existing.total_size == rec.total_size
+                && existing.chunk_size == rec.chunk_size
+                && existing.file_blake3 == rec.file_blake3
+                && existing.status == "active"
+            {
+                existing.received_parts = Self::load_transfer_parts_with_conn(&conn, &existing.transfer_id)?;
+                return Ok(existing);
+            }
+        }
+
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            INSERT INTO transfer_sessions (
+                transfer_id, owner_device_id, filename, total_size, chunk_size, total_parts,
+                received_parts, file_blake3, encoding, status, saved_path, created_at, updated_at, expires_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, '[]', ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+            ON CONFLICT(transfer_id) DO UPDATE SET
+                owner_device_id = excluded.owner_device_id,
+                filename = excluded.filename,
+                total_size = excluded.total_size,
+                chunk_size = excluded.chunk_size,
+                total_parts = excluded.total_parts,
+                received_parts = '[]',
+                file_blake3 = excluded.file_blake3,
+                encoding = excluded.encoding,
+                status = excluded.status,
+                saved_path = excluded.saved_path,
+                updated_at = excluded.updated_at,
+                expires_at = excluded.expires_at
+            "#,
+            params![
+                rec.transfer_id,
+                rec.owner_device_id,
+                rec.filename,
+                rec.total_size as i64,
+                rec.chunk_size as i64,
+                rec.total_parts as i64,
+                rec.file_blake3,
+                rec.encoding,
+                rec.status,
+                rec.saved_path,
+                rec.created_at,
+                rec.updated_at,
+                rec.expires_at,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM transfer_session_parts WHERE transfer_id = ?1",
+            params![rec.transfer_id],
+        )?;
+        for &part_idx in &rec.received_parts {
+            tx.execute(
+                "INSERT OR IGNORE INTO transfer_session_parts (transfer_id, part_index, part_size, received_at) VALUES (?1, ?2, 0, ?3)",
+                params![rec.transfer_id, part_idx as i64, rec.updated_at],
+            )?;
+        }
+        tx.commit()?;
+        Ok(rec.clone())
+    }
+
+    pub fn get_transfer_session(&self, transfer_id: &str) -> Result<Option<TransferSessionRecord>> {
+        let conn = self.lock_read_conn();
+        let mut record = Self::query_transfer_session(&conn, transfer_id)?;
+        if let Some(rec) = record.as_mut() {
+            rec.received_parts = Self::load_transfer_parts_with_conn(&conn, &rec.transfer_id)?;
+        }
+        Ok(record)
+    }
+
+    pub fn get_transfer_session_metadata(&self, transfer_id: &str) -> Result<Option<TransferSessionRecord>> {
+        Self::query_transfer_session(&self.lock_read_conn(), transfer_id)
+    }
+
+    fn query_transfer_session(conn: &Connection, transfer_id: &str) -> Result<Option<TransferSessionRecord>> {
+        Ok(conn
+            .query_row(
+                "SELECT transfer_id, owner_device_id, filename, total_size, chunk_size, total_parts, file_blake3, encoding, status, saved_path, created_at, updated_at, expires_at FROM transfer_sessions WHERE transfer_id = ?1",
+                params![transfer_id],
+                |row| {
+                    Ok(TransferSessionRecord {
+                        transfer_id: row.get(0)?,
+                        owner_device_id: row.get(1)?,
+                        filename: row.get(2)?,
+                        total_size: row.get::<_, i64>(3)? as u64,
+                        chunk_size: row.get::<_, i64>(4)? as u64,
+                        total_parts: row.get::<_, i64>(5)? as u64,
+                        received_parts: Vec::new(),
+                        file_blake3: row.get(6)?,
+                        encoding: row.get(7)?,
+                        status: row.get(8)?,
+                        saved_path: row.get(9)?,
+                        created_at: row.get(10)?,
+                        updated_at: row.get(11)?,
+                        expires_at: row.get(12)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn active_transfer_usage(
+        &self,
+        owner_device_id: &str,
+    ) -> Result<(usize, u64, usize, u64)> {
+        let conn = self.lock_read_conn();
+        let (owner_count, owner_bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(total_size), 0) FROM transfer_sessions WHERE owner_device_id = ?1 AND status = 'active'",
+            params![owner_device_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let (global_count, global_bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(total_size), 0) FROM transfer_sessions WHERE status = 'active'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((
+            owner_count.max(0) as usize,
+            owner_bytes.max(0) as u64,
+            global_count.max(0) as usize,
+            global_bytes.max(0) as u64,
+        ))
+    }
+
+    pub fn is_active_transfer_session(&self, transfer_id: &str) -> Result<bool> {
+        let conn = self.lock_read_conn();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM transfer_sessions WHERE transfer_id = ?1 AND status = 'active'",
+            params![transfer_id],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn mark_transfer_part_received(
+        &self,
+        transfer_id: &str,
+        part_index: u64,
+        part_size: u64,
+        now_secs: i64,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            r#"
+            INSERT INTO transfer_session_parts (transfer_id, part_index, part_size, received_at)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT(transfer_id, part_index) DO UPDATE SET
+                part_size = excluded.part_size,
+                received_at = excluded.received_at
+            "#,
+            params![transfer_id, part_index as i64, part_size as i64, now_secs],
+        )?;
+        let updated = tx.execute(
+            "UPDATE transfer_sessions SET updated_at = ?2 WHERE transfer_id = ?1 AND status = 'active'",
+            params![transfer_id, now_secs],
+        )?;
+        if updated == 0 {
+            return Err(LanVaultError::InvalidState(
+                "transfer session is not active".to_string(),
+            ));
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn complete_transfer_session(&self, transfer_id: &str, now_secs: i64) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE transfer_sessions SET status = 'completed', updated_at = ?2 WHERE transfer_id = ?1",
+            params![transfer_id, now_secs],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_transfer_session_with_history(
+        &self,
+        transfer_id: &str,
+        saved_path: &str,
+        filename: &str,
+        peer_name: &str,
+        total_size: u64,
+        now_secs: i64,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        let updated = tx.execute(
+            "UPDATE transfer_sessions SET status = 'completed', updated_at = ?3 WHERE transfer_id = ?1 AND status = 'active' AND saved_path = ?2",
+            params![transfer_id, saved_path, now_secs],
+        )?;
+        if updated == 0 {
+            return Err(LanVaultError::InvalidState(
+                "transfer session already completed or missing".to_string(),
+            ));
+        }
+        let subtitle = format!("已保存至 {saved_path}");
+        tx.execute(
+            "INSERT INTO transfer_history (
+                direction, kind, title, subtitle, peer_name, content, size_bytes, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                "received",
+                "file",
+                filename,
+                subtitle,
+                peer_name,
+                Option::<&str>::None,
+                total_size as i64,
+                now_secs
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn reserve_transfer_destination(&self, transfer_id: &str, path: &str) -> Result<()> {
+        let updated = self.lock_conn().execute(
+            "UPDATE transfer_sessions SET saved_path = ?2 WHERE transfer_id = ?1 AND status = 'active' AND saved_path IS NULL AND NOT EXISTS (SELECT 1 FROM transfer_sessions WHERE saved_path = ?2 AND status = 'active')",
+            params![transfer_id, path],
+        )?;
+        if updated != 1 {
+            return Err(LanVaultError::InvalidState("transfer destination could not be reserved".to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn reserved_transfer_destinations(&self) -> Result<Vec<String>> {
+        let conn = self.lock_read_conn();
+        let mut stmt = conn.prepare(
+            "SELECT saved_path FROM transfer_sessions WHERE status = 'active' AND saved_path IS NOT NULL",
+        )?;
+        let paths = stmt.query_map([], |row| row.get(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(paths)
+    }
+
+    pub fn release_transfer_destination(&self, transfer_id: &str, path: &str) -> Result<()> {
+        self.lock_conn().execute(
+            "UPDATE transfer_sessions SET saved_path = NULL WHERE transfer_id = ?1 AND status = 'active' AND saved_path = ?2",
+            params![transfer_id, path],
+        )?;
+        Ok(())
+    }
+
+    pub fn prune_expired_transfer_sessions(&self, now_secs: i64) -> Result<Vec<String>> {
+        let conn = self.lock_conn();
+        let mut stmt = conn.prepare(
+            "SELECT transfer_id FROM transfer_sessions WHERE (status = 'active' AND saved_path IS NULL AND expires_at < ?1) OR status = 'expired' OR (status = 'completed' AND updated_at < ?2)",
+        )?;
+        let stale_cutoff = now_secs.saturating_sub(3600);
+        let ids: Vec<String> = stmt
+            .query_map(params![now_secs, stale_cutoff], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        conn.execute(
+            "DELETE FROM transfer_sessions WHERE (status = 'active' AND saved_path IS NULL AND expires_at < ?1) OR status = 'expired' OR (status = 'completed' AND updated_at < ?2)",
+            params![now_secs, stale_cutoff],
+        )?;
+        Ok(ids)
+    }
+
+    pub fn get_chunk_compression(&self, vault_id: &str, hash_blake3: &[u8; 32]) -> String {
+        let conn = self.lock_read_conn();
+        conn.query_row(
+            "SELECT compression FROM chunks WHERE vault_id = ?1 AND hash_blake3 = ?2",
+            params![vault_id, hash_blake3.as_slice()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "zstd".to_string())
+    }
+
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -1907,5 +2688,25 @@ mod tests {
                 .ref_count,
             0
         );
+    }
+
+    #[test]
+    fn shared_handle_is_reused_and_evictable() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "lanvault-shared-db-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let first = Database::shared(&temp_dir).unwrap();
+        let second = Database::shared(&temp_dir).unwrap();
+        // 同一路径必须复用同一个句柄，否则每次 UI 轮询都会重跑建表 DDL。
+        assert!(Arc::ptr_eq(&first, &second));
+
+        first.set_setting("k", "v").unwrap();
+        assert_eq!(second.get_setting("k").unwrap().as_deref(), Some("v"));
+
+        Database::evict_shared(&temp_dir);
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_file(&temp_dir);
     }
 }

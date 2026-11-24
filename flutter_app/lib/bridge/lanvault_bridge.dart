@@ -900,16 +900,28 @@ class PowerNetworkPolicyModel {
 class BackupStorageConfigModel {
   const BackupStorageConfigModel({
     required this.primaryDir,
+    this.primaryRoot = '',
     this.fallbackDir,
+    this.fallbackRoot,
   });
 
+  /// 用户选择的目录（UI 中展示/编辑的路径）。
   final String primaryDir;
+
+  /// 后端在所选目录下自动创建的隔离根 `<primaryDir>/everyonenasbackup`。
+  final String primaryRoot;
+
   final String? fallbackDir;
+
+  /// 备用盘的隔离根 `<fallbackDir>/everyonenasbackup`。
+  final String? fallbackRoot;
 
   factory BackupStorageConfigModel.fromJson(Map<String, dynamic> json) {
     return BackupStorageConfigModel(
-      primaryDir: json['primary_dir'] as String,
+      primaryDir: json['primary_dir'] as String? ?? '',
+      primaryRoot: json['primary_root'] as String? ?? '',
       fallbackDir: json['fallback_dir'] as String?,
+      fallbackRoot: json['fallback_root'] as String?,
     );
   }
 }
@@ -1024,6 +1036,8 @@ abstract class LanVaultRustFfi {
 
   Future<bool> setSyncPaused(bool paused);
 
+  Future<bool> setFastBackupMode(bool enabled);
+
   Future<bool> getSyncPaused();
 
   Future<bool> setBitRotAutoScrub(bool enabled);
@@ -1034,6 +1048,14 @@ abstract class LanVaultRustFfi {
     required String ruleId,
     required String scheduleMode,
   });
+
+  /// 启动时自动拉起上次配置好的本地存储服务；返回监听端口，或 null（尚未配置/已关闭）。
+  Future<int?> autostartLocalServer();
+
+  /// 是否在每次启动时自动开启存储服务。
+  Future<bool> getAutostartServer();
+
+  Future<bool> setAutostartServer(bool enabled);
 }
 
 // --- Native C-ABI 符号签名，与 lanvault_ffi 共享库对齐 ---
@@ -1145,15 +1167,247 @@ Map<String, dynamic> _invokeJsonInWorker((String, String) args) {
   }
 }
 
+/// 常驻的 Rust 调用工作 Isolate。
+///
+/// 原来的实现是每次 FFI 调用都 `Isolate.run(...)`：一次调用就要新建 isolate、重新
+/// `dlopen` 动态库、查符号表，然后销毁。UI 里同步进度每秒轮询、配对请求每 2 秒轮询、
+/// 环境每 15 秒刷新，加起来每秒都在重复这套开销，还会和真正的传输抢 CPU。
+///
+/// 这里改为进程内一个长驻 worker：通过 `SendPort` 串行派发请求，`dlopen` 与符号查找
+/// 只做一次。Rust 侧本来就是多线程异步运行时，真正并行的是 Rust 内部任务，
+/// 而不是 Dart isolate 的数量；串行派发反而消除了多个 isolate 同时抢全局状态锁的问题。
+class _FfiWorker {
+  _FfiWorker._(this._sendPort);
+
+  final SendPort _sendPort;
+  final Map<int, Completer<Map<String, dynamic>>> _pending =
+      <int, Completer<Map<String, dynamic>>>{};
+  int _nextRequestId = 1;
+  ReceivePort? _replyPort;
+  bool _dead = false;
+
+  static _FfiWorker? _instance;
+  static Future<_FfiWorker>? _starting;
+  static _FfiWorker? _transferInstance;
+  static Future<_FfiWorker>? _transferStarting;
+
+  static const Set<String> _heavyFfiOps = <String>{
+    'trigger_incremental_scan',
+    'push_clipboard_file',
+    'restore_snapshot',
+    'trigger_bit_rot_scrub',
+  };
+
+  /// 获取（必要时启动）常驻 worker：控制通道与长耗时传输通道隔离，避免传输阻塞进度轮询与 UI 响应。
+  static Future<_FfiWorker> acquire({bool heavy = false}) {
+    if (heavy) {
+      final existing = _transferInstance;
+      if (existing != null && !existing._dead) {
+        return Future<_FfiWorker>.value(existing);
+      }
+      final inFlight = _transferStarting;
+      if (inFlight != null) return inFlight;
+      final future = _FfiWorker._spawn(isTransfer: true).whenComplete(() {
+        if (_transferStarting != null && _transferInstance == null) {
+          _transferStarting = null;
+        }
+      });
+      _transferStarting = future;
+      return future;
+    }
+    final existing = _instance;
+    if (existing != null && !existing._dead) {
+      return Future<_FfiWorker>.value(existing);
+    }
+    final inFlight = _starting;
+    if (inFlight != null) return inFlight;
+    // 失败必须清掉 `_starting`，否则后续调用会永远 await 一个已失败的 Future。
+    final future = _FfiWorker._spawn(isTransfer: false).whenComplete(() {
+      if (_starting != null && _instance == null) _starting = null;
+    });
+    _starting = future;
+    return future;
+  }
+
+  static Future<_FfiWorker> _spawn({bool isTransfer = false}) async {
+    final replyPort = ReceivePort();
+    final hostPort = replyPort.sendPort;
+    final handshake = Completer<SendPort>();
+
+    await Isolate.spawn<_WorkerBootstrap>(
+      _ffiWorkerMain,
+      _WorkerBootstrap(hostPort),
+      debugName: 'everyonenas-ffi-worker',
+    );
+
+    late _FfiWorker worker;
+    replyPort.listen((Object? message) {
+      if (message is SendPort) {
+        if (!handshake.isCompleted) handshake.complete(message);
+        return;
+      }
+      if (message is _WorkerReply) {
+        final completer = worker._pending.remove(message.requestId);
+        if (completer != null && !completer.isCompleted) {
+          if (message.error != null) {
+            completer.completeError(StateError(message.error!));
+          } else {
+            completer.complete(message.payload ?? <String, dynamic>{});
+          }
+        }
+        return;
+      }
+      // isolate 退出或异常：标记死亡，后续调用会重建 worker。
+      worker._markDead();
+    });
+
+    final sendPort = await handshake.future.timeout(
+      const Duration(seconds: 10),
+      onTimeout: () {
+        replyPort.close();
+        throw StateError('FFI worker isolate failed to start');
+      },
+    );
+    worker = _FfiWorker._(sendPort).._replyPort = replyPort;
+    if (isTransfer) {
+      _transferInstance = worker;
+      _transferStarting = null;
+    } else {
+      _instance = worker;
+      _starting = null;
+    }
+    return worker;
+  }
+
+  void _markDead() {
+    _dead = true;
+    if (identical(_instance, this)) _instance = null;
+    _starting = null;
+    _replyPort?.close();
+    _replyPort = null;
+    for (final completer in _pending.values) {
+      if (!completer.isCompleted) {
+        completer.completeError(StateError('FFI worker isolate exited'));
+      }
+    }
+    _pending.clear();
+  }
+
+  /// 派发一次调用；由 [_FfiWorker] 内部串行化。
+  Future<Map<String, dynamic>> call(String fnName, String payloadJson) {
+    if (_dead) {
+      return Future<Map<String, dynamic>>.error(
+        StateError('FFI worker isolate is not running'),
+      );
+    }
+    final id = _nextRequestId++;
+    final completer = Completer<Map<String, dynamic>>();
+    _pending[id] = completer;
+    _sendPort.send(_WorkerRequest(id, fnName, payloadJson));
+    return completer.future;
+  }
+}
+
+class _WorkerBootstrap {
+  const _WorkerBootstrap(this.replyPort);
+  final SendPort replyPort;
+}
+
+class _WorkerRequest {
+  const _WorkerRequest(this.requestId, this.fnName, this.payloadJson);
+  final int requestId;
+  final String fnName;
+  final String payloadJson;
+}
+
+class _WorkerReply {
+  const _WorkerReply(this.requestId, this.payload, this.error);
+  final int requestId;
+  final Map<String, dynamic>? payload;
+  final String? error;
+}
+
+/// 常驻 worker 的主循环：只在这里做一次库打开与符号查找。
+void _ffiWorkerMain(_WorkerBootstrap bootstrap) {
+  final requests = ReceivePort();
+  ffi.DynamicLibrary? library;
+  _CInvokeJsonDart? invokeJson;
+  _CFreeStringDart? freeString;
+
+  void ensureLibrary() {
+    if (library != null) return;
+    final opened = _openLanVaultLibrary();
+    library = opened;
+    invokeJson = opened.lookupFunction<_CInvokeJsonNative, _CInvokeJsonDart>(
+      'lanvault_ffi_invoke_json',
+    );
+    freeString = opened.lookupFunction<_CFreeStringNative, _CFreeStringDart>(
+      'lanvault_ffi_free_string',
+    );
+  }
+
+  bootstrap.replyPort.send(requests.sendPort);
+  requests.listen((Object? message) {
+    if (message is! _WorkerRequest) return;
+    ffi.Pointer<Utf8>? fnPtr;
+    ffi.Pointer<Utf8>? payloadPtr;
+    ffi.Pointer<Utf8>? resultPtr;
+    try {
+      ensureLibrary();
+      fnPtr = message.fnName.toNativeUtf8();
+      payloadPtr = message.payloadJson.toNativeUtf8();
+      resultPtr = invokeJson!(fnPtr, payloadPtr);
+      if (resultPtr == ffi.nullptr) {
+        throw StateError('FFI ${message.fnName} returned null pointer.');
+      }
+      final raw = resultPtr.toDartString();
+      final decoded = jsonDecode(raw) as Map<String, dynamic>;
+      if (decoded['ok'] != true) {
+        throw StateError('FFI ${message.fnName} failed: ${decoded['error']}');
+      }
+      bootstrap.replyPort.send(_WorkerReply(message.requestId, decoded, null));
+    } catch (error) {
+      bootstrap.replyPort
+          .send(_WorkerReply(message.requestId, null, error.toString()));
+    } finally {
+      if (fnPtr != null) calloc.free(fnPtr);
+      if (payloadPtr != null) calloc.free(payloadPtr);
+      if (resultPtr != null && resultPtr != ffi.nullptr) {
+        freeString!(resultPtr);
+      }
+    }
+  });
+}
+
 class NativeLanVaultRustFfi implements LanVaultRustFfi {
   NativeLanVaultRustFfi();
+
+  /// 常驻 worker 不可用（例如被系统回收）时的一次性兜底。
+  Future<Map<String, dynamic>> _callViaOneShotIsolate(
+    String fnName,
+    String encoded,
+  ) {
+    return Isolate.run(() => _invokeJsonInWorker((fnName, encoded)));
+  }
 
   Future<Map<String, dynamic>> _callAsync(
     String fnName,
     Map<String, Object?> payload,
-  ) {
+  ) async {
     final encoded = jsonEncode(payload);
-    return Isolate.run(() => _invokeJsonInWorker((fnName, encoded)));
+    try {
+      final worker = await _FfiWorker.acquire(heavy: _FfiWorker._heavyFfiOps.contains(fnName));
+      return await worker.call(fnName, encoded);
+    } catch (error) {
+      // 只有"worker 起不来"才回退；Rust 侧返回的业务错误必须原样抛给调用方，
+      // 否则会用一次额外 isolate 重跑同一个失败调用（例如密码错的登录）。
+      final message = error.toString();
+      final workerInfraFailure = message.contains('worker isolate') ||
+          message.contains('DynamicLibrary') ||
+          message.contains('Failed to load dynamic library');
+      if (!workerInfraFailure) rethrow;
+      return _callViaOneShotIsolate(fnName, encoded);
+    }
   }
 
   @override
@@ -1735,6 +1989,14 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
   }
 
   @override
+  Future<bool> setFastBackupMode(bool enabled) async {
+    final resp = await _callAsync('set_fast_backup_mode', <String, Object?>{
+      'enabled': enabled,
+    });
+    return resp['enabled'] as bool? ?? enabled;
+  }
+
+  @override
   Future<bool> getSyncPaused() async {
     final resp = await _callAsync('get_sync_paused', const <String, Object?>{});
     return resp['paused'] as bool? ?? false;
@@ -1764,6 +2026,31 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
       'schedule_mode': scheduleMode,
     });
     return resp['schedule_mode'] as String? ?? scheduleMode;
+  }
+
+  @override
+  Future<int?> autostartLocalServer() async {
+    final resp = await _callAsync(
+      'autostart_local_server',
+      const <String, Object?>{},
+    );
+    return (resp['port'] as num?)?.toInt();
+  }
+
+  @override
+  Future<bool> getAutostartServer() async {
+    final resp =
+        await _callAsync('get_autostart_server', const <String, Object?>{});
+    return resp['enabled'] as bool? ?? true;
+  }
+
+  @override
+  Future<bool> setAutostartServer(bool enabled) async {
+    final resp = await _callAsync(
+      'set_autostart_server',
+      <String, Object?>{'enabled': enabled},
+    );
+    return resp['enabled'] as bool? ?? enabled;
   }
 }
 
@@ -1823,6 +2110,70 @@ class LanVaultBridge {
   /// 断线自动重连开关状态源。
   final ValueNotifier<bool> autoReconnectNotifier = ValueNotifier<bool>(true);
   final ValueNotifier<int> serverStateVersion = ValueNotifier<int>(0);
+  final ValueNotifier<String?> selectedPeerIdNotifier = ValueNotifier<String?>(null);
+  final ValueNotifier<bool> fastBackupModeNotifier = ValueNotifier<bool>(false);
+
+  PairedPeerModel? get selectedPeer {
+    final peers = pairedPeersNotifier.value;
+    if (peers.isEmpty) return null;
+    final currentId = selectedPeerIdNotifier.value;
+    if (currentId != null) {
+      for (final p in peers) {
+        if (p.deviceId == currentId) return p;
+      }
+    }
+    for (final p in peers) {
+      if (p.online) return p;
+    }
+    return peers.first;
+  }
+
+  void selectPeer(String? deviceId) {
+    if (_disposed) return;
+    if (selectedPeerIdNotifier.value != deviceId) {
+      selectedPeerIdNotifier.value = deviceId;
+    }
+  }
+
+  /// 将后端原始时间戳（秒/毫秒/ISO 字符串）格式化为简洁可读时间。
+  static String formatRelativeTime(String raw) {
+    final trimmed = raw.trim();
+    if (trimmed.isEmpty) return '';
+    DateTime? dt;
+    final parsedInt = int.tryParse(trimmed);
+    if (parsedInt != null) {
+      final ms = parsedInt > 100000000000 ? parsedInt : parsedInt * 1000;
+      dt = DateTime.fromMillisecondsSinceEpoch(ms).toLocal();
+    } else {
+      dt = DateTime.tryParse(trimmed)?.toLocal();
+    }
+    if (dt == null) return trimmed;
+    final now = DateTime.now();
+    final hh = dt.hour.toString().padLeft(2, '0');
+    final mm = dt.minute.toString().padLeft(2, '0');
+    if (dt.year == now.year && dt.month == now.month && dt.day == now.day) {
+      return '$hh:$mm';
+    }
+    final mo = dt.month.toString().padLeft(2, '0');
+    final dd = dt.day.toString().padLeft(2, '0');
+    return '$mo-$dd $hh:$mm';
+  }
+
+  /// 将后端同步阻塞/状态英文短语翻译为自然中文。
+  static String formatSyncBlockedReason(String rawStatus) {
+    final lower = rawStatus.toLowerCase();
+    if (lower.contains('notonwifi')) return '已暂停 · 等待连接 Wi-Fi';
+    if (lower.contains('notcharging')) return '已暂停 · 等待连接电源';
+    if (lower.contains('ssid')) return '已暂停 · 未连接到允许的家庭网络';
+    if (lower.contains('paused')) return '已暂停自动备份';
+    if (lower.contains('blocked')) return '已暂停 · 等待网络或电源条件满足';
+    if (lower.contains('error') || lower.contains('fail')) return '同步遇到异常，正在等待重试';
+    if (lower.contains('running') || lower.contains('uploading') || lower.contains('syncing')) {
+      return '正在备份中';
+    }
+    if (lower.contains('completed') || lower.contains('done')) return '备份已完成';
+    return '空闲待命';
+  }
 
   Stream<SyncProgressEvent>? _sharedSyncStream;
   StreamSubscription<SyncProgressEvent>? _sharedSyncSub;
@@ -1841,10 +2192,38 @@ class LanVaultBridge {
 
   Future<void> _syncInitialServerStatus() async {
     try {
+      // 已配置过的机器在这里自动拉起存储服务：用户不必每次手动开启。
+      final restoredPort = await _ffi.autostartLocalServer();
+      if (_disposed) return;
+      if (restoredPort != null) {
+        serverRunningNotifier.value = true;
+        _notifyStateChanged();
+      }
       final overview = await _ffi.getSystemOverview();
       if (_disposed) return;
       serverRunningNotifier.value = overview.serverRunning;
-    } catch (_) {}
+    } catch (_) {
+      // 自动启动失败不阻塞 UI；用户仍可在"存储"页手动启动。
+    }
+  }
+
+  /// 打开/关闭"随软件启动自动开启存储服务"。
+  Future<bool> getAutostartServer() => _ffi.getAutostartServer();
+
+  Future<bool> setAutostartServer(bool enabled) async {
+    final applied = await _ffi.setAutostartServer(enabled);
+    if (!_disposed) _notifyStateChanged();
+    return applied;
+  }
+
+  /// 供"存储"页在用户手动启动失败后重试自动恢复。
+  Future<int?> autostartLocalServer() async {
+    final port = await _ffi.autostartLocalServer();
+    if (port != null && !_disposed) {
+      serverRunningNotifier.value = true;
+      _notifyStateChanged();
+    }
+    return port;
   }
 
   Future<void> _pollIncomingPairRequests() async {
@@ -1941,7 +2320,10 @@ class LanVaultBridge {
     pendingPairRequestsNotifier.dispose();
     pairedPeersNotifier.dispose();
     autoReconnectNotifier.dispose();
+    SystemEnvHelper.windowsNetworkScanner = null;
     serverStateVersion.dispose();
+    selectedPeerIdNotifier.dispose();
+    fastBackupModeNotifier.dispose();
   }
 
   Future<({bool onWifi, String? currentSsid, bool isCharging})>
@@ -2116,6 +2498,19 @@ class LanVaultBridge {
     final peers = await _ffi.listPairedPeers();
     if (!_disposed) {
       pairedPeersNotifier.value = peers;
+      final currentId = selectedPeerIdNotifier.value;
+      final exists = currentId != null && peers.any((p) => p.deviceId == currentId);
+      if (!exists) {
+        PairedPeerModel? fallback;
+        for (final p in peers) {
+          if (p.online) {
+            fallback = p;
+            break;
+          }
+        }
+        fallback ??= peers.isNotEmpty ? peers.first : null;
+        selectedPeerIdNotifier.value = fallback?.deviceId;
+      }
     }
     return peers;
   }
@@ -2452,6 +2847,20 @@ class LanVaultBridge {
       _ffi.listTransferHistory(limit: limit);
 
   Future<bool> setSyncPaused(bool paused) => _ffi.setSyncPaused(paused);
+
+  Future<bool> setFastBackupMode(bool enabled) async {
+    if (_disposed) return fastBackupModeNotifier.value;
+    final prev = fastBackupModeNotifier.value;
+    fastBackupModeNotifier.value = enabled;
+    try {
+      final applied = await _ffi.setFastBackupMode(enabled);
+      if (!_disposed) fastBackupModeNotifier.value = applied;
+      return applied;
+    } catch (err) {
+      if (!_disposed) fastBackupModeNotifier.value = prev;
+      rethrow;
+    }
+  }
 
   Future<bool> getSyncPaused() => _ffi.getSyncPaused();
 

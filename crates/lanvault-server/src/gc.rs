@@ -172,6 +172,29 @@ impl GarbageCollector {
         })?;
 
         self.db.prune_revoked_sessions(now_unix_secs)?;
+        // 清理崩溃残留的 staging/*.tmp（超过 1 小时未修改）。
+        if let Ok(vols) = self.vault_store.online_volumes(vault_id) {
+            for vol in vols {
+                let staging_dir = std::path::Path::new(&vol.mount_path).join("staging");
+                if let Ok(entries) = std::fs::read_dir(&staging_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                            let stale = entry
+                                .metadata()
+                                .ok()
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                                .map(|d| d.as_secs() > 3600)
+                                .unwrap_or(false);
+                            if stale {
+                                let _ = std::fs::remove_file(&path);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(GcReport {
             evaluated_snapshots,

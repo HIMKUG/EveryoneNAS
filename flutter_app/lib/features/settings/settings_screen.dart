@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -9,23 +10,18 @@ import '../../theme/neu_theme.dart';
 import '../../theme/neu_toast.dart';
 
 enum _SettingsSection {
-  general('通用', Icons.tune_rounded),
-  security('安全与加密', Icons.verified_user_outlined),
-  backupPolicy('备份策略', Icons.event_repeat_rounded),
-  networkService('网络与服务', Icons.lan_outlined),
-  diagnostics('诊断与日志', Icons.terminal_rounded),
-  about('关于', Icons.info_outline_rounded);
-
-  const _SettingsSection(this.label, this.icon);
-
-  final String label;
-  final IconData icon;
+  general,
+  backup,
+  webSecurity,
+  serviceDiag,
+  about,
 }
 
-/// 7. 设置页：
-/// 桌面端左侧二级菜单 + 右侧详情面板；移动端顶部横向分类胶囊切换。
-/// 完整整合三态运行模式、安全加密与密钥备份、网络限速与多 SSID 白名单、
-/// 服务端运行管理、Debug 探针日志控制台与品牌“关于”页。
+/// 设置页（重构版，全面对标 Settings 参考图）：
+/// - 移动端（< 840px）：单一纵向分组白卡列表（蓝字小节标题 + 圆角白卡），彻底取消顶部两排 6 药丸按钮。
+/// - 桌面端（>= 840px）：左侧 5 项清爽分类 + 右侧最大宽度 720px 分组白卡。
+/// - 所有开关即改即生效，彻底移除“保存备份与网络策略”按钮与重复的“立即校验”蓝按钮。
+/// - 统一收口权限、主/备异盘目录、Web 访问密码保护（默认关闭可选开关）与应急重启服务。
 class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key, required this.bridge});
 
@@ -36,1252 +32,1256 @@ class SettingsScreen extends StatefulWidget {
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  static const String _anyNetworkSentinel = '__any_network__';
+  _SettingsSection _desktopSection = _SettingsSection.general;
 
-  final TextEditingController _maxKbpsController =
-      TextEditingController(text: '0');
-  final TextEditingController _keyPassphraseController =
-      TextEditingController();
-
-  _SettingsSection _activeSection = _SettingsSection.general;
-
-  bool _loading = true;
-  bool _switchingMode = false;
-  bool _savingPolicy = false;
-  bool _scanningWifi = false;
-  bool _scrubbing = false;
-  bool _restarting = false;
-  bool _exportingKey = false;
-
-  bool _wifiOnly = true;
-  bool _requireCharging = false;
-  bool _debugMode = false;
+  RoleMode _roleMode = RoleMode.dual;
+  bool _autoReconnect = true;
+  bool _autostartServer = true;
   bool _bitRotAutoScrub = true;
-  bool _loadingLogs = false;
-  bool _runningDiagnostics = false;
-  String _logFilter = 'ALL';
-  String? _debugLogPath;
-  List<DebugLogEntryModel> _debugLogs = const <DebugLogEntryModel>[];
+  bool _debugMode = false;
+  bool _webPasswordEnabled = false;
 
-  List<String> _allowedSsids = <String>[];
-  String _selectedWifiDropdown = _anyNetworkSentinel;
-  NetworkScanSnapshot? _networkSnapshot;
+  PowerNetworkPolicyModel _policy = const PowerNetworkPolicyModel(
+    wifiOnly: true,
+    allowedSsids: <String>[],
+    requireCharging: false,
+    maxKbps: 0,
+  );
+  BackupStorageConfigModel? _storageConfig;
+  LastServerConfig? _lastServerConfig;
   SystemOverviewModel? _overview;
-  KeepAliveLevel? _keepAliveLevel;
-  BitRotScrubResultModel? _lastScrub;
+  bool _restarting = false;
+  bool _runningDiag = false;
 
   @override
   void initState() {
     super.initState();
-    widget.bridge.serverStateVersion.addListener(_loadSettings);
-    _loadSettings();
+    unawaited(_loadAll());
   }
 
-  @override
-  void didUpdateWidget(covariant SettingsScreen oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.bridge != widget.bridge) {
-      oldWidget.bridge.serverStateVersion.removeListener(_loadSettings);
-      widget.bridge.serverStateVersion.addListener(_loadSettings);
-      _loadSettings();
-    }
-  }
-
-  @override
-  void dispose() {
-    widget.bridge.serverStateVersion.removeListener(_loadSettings);
-    _maxKbpsController.dispose();
-    _keyPassphraseController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _loadSettings() async {
-    setState(() => _loading = true);
+  Future<void> _loadAll() async {
     try {
-      final results = await Future.wait<Object>(<Future<Object>>[
-        widget.bridge.getRoleMode(),
-        widget.bridge.getAutoReconnect(),
-        widget.bridge.getPowerNetworkPolicy(),
-        widget.bridge.getDebugMode(),
-        widget.bridge.getSystemOverview(),
-      ]);
-      final policy = results[2] as PowerNetworkPolicyModel;
-      final debugEnabled = results[3] as bool;
-      final overview = results[4] as SystemOverviewModel;
-      final env = await widget.bridge.getDeviceEnvironment();
-      final scan = await SystemEnvHelper.scanNetworks(
-        fallbackCurrentSsid: env.currentSsid,
-      );
-      final level = await widget.bridge.detectKeepAliveLevel();
-
-      String? logPath;
-      List<DebugLogEntryModel> logs = const <DebugLogEntryModel>[];
-      if (debugEnabled) {
-        logPath = await widget.bridge.getDebugLogPath();
-        logs = await widget.bridge.getDebugLogs(limit: 120);
-      }
-
-      if (!mounted) return;
-      final preservedSsids = policy.allowedSsids
-          .map((s) => s.trim())
-          .where((s) => s.isNotEmpty)
-          .toSet()
-          .toList(growable: true);
-      setState(() {
-        _wifiOnly = Platform.isAndroid ? policy.wifiOnly : false;
-        _requireCharging = Platform.isAndroid ? policy.requireCharging : false;
-        _maxKbpsController.text = policy.maxKbps.toString();
-        _allowedSsids = preservedSsids;
-        _selectedWifiDropdown = preservedSsids.isEmpty
-            ? _anyNetworkSentinel
-            : preservedSsids.first;
-        _debugMode = debugEnabled;
-        _debugLogPath = logPath;
-        _debugLogs = logs.reversed.toList(growable: false);
-        _networkSnapshot = scan;
-        _overview = overview;
-        _bitRotAutoScrub = overview.bitRotAutoScrub;
-        _keepAliveLevel = level;
-        _loading = false;
-      });
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _loading = false);
-      NeuToast.error(context, '读取设置失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _rescanNetworks() async {
-    setState(() => _scanningWifi = true);
-    try {
-      final env = await widget.bridge.getDeviceEnvironment();
-      final scan = await SystemEnvHelper.scanNetworks(
-        fallbackCurrentSsid: env.currentSsid,
-      );
-      if (!mounted) return;
-      setState(() {
-        _networkSnapshot = scan;
-        _scanningWifi = false;
-      });
-      if (!scan.hasWifiAdapter || scan.availableSsids.isEmpty) {
-        NeuToast.info(context, '当前未扫描到可用 Wi-Fi（有线网线连接可直接同步）');
-      } else {
-        NeuToast.success(context, '已扫描到 ${scan.availableSsids.length} 个 Wi-Fi 网络');
-      }
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _scanningWifi = false);
-      NeuToast.error(context, '扫描网络失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _requestLocationPermission() async {
-    try {
-      final granted = await widget.bridge.requestLocationPermission();
-      if (!mounted) return;
-      if (granted) {
-        NeuToast.success(context, '已获得定位权限，正在刷新当前 Wi-Fi SSID');
-        await _rescanNetworks();
-      } else {
-        NeuToast.info(context, '未授予定位权限，系统将无法读取当前 Wi-Fi 名称');
-      }
-    } catch (err) {
-      if (!mounted) return;
-      NeuToast.error(context, '请求定位权限失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _requestNotificationPermission() async {
-    try {
-      final granted = await widget.bridge.requestNotificationPermission();
-      if (!mounted) return;
-      if (granted) {
-        NeuToast.success(context, '已获得通知权限');
-      } else {
-        NeuToast.info(context, '请在系统设置中允许通知权限以保持后台服务稳定');
-      }
-    } catch (err) {
-      if (!mounted) return;
-      NeuToast.error(context, '请求通知权限失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  void _handleWifiSelected(String? val) {
-    if (val == null) return;
-    setState(() {
-      _selectedWifiDropdown = val;
-      if (val == _anyNetworkSentinel) {
-        _allowedSsids = <String>[];
-      } else if (!_allowedSsids.contains(val)) {
-        _allowedSsids = <String>[..._allowedSsids, val];
-      }
-    });
-  }
-
-  void _removeAllowedSsid(String ssid) {
-    setState(() {
-      _allowedSsids = _allowedSsids.where((s) => s != ssid).toList();
-      if (_allowedSsids.isEmpty) {
-        _selectedWifiDropdown = _anyNetworkSentinel;
-      } else if (_selectedWifiDropdown == ssid) {
-        _selectedWifiDropdown = _allowedSsids.first;
-      }
-    });
-  }
-
-  Future<void> _handleModeSelected(RoleMode target) async {
-    if (_switchingMode || target == widget.bridge.currentRoleMode) return;
-    setState(() => _switchingMode = true);
-    try {
-      final applied = await widget.bridge.setRoleMode(target);
-      if (!mounted) return;
-      setState(() => _switchingMode = false);
-      NeuToast.success(context, '已切换至${applied.label}');
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _switchingMode = false);
-      NeuToast.error(context, '切换运行模式失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _toggleAutoReconnect(bool enabled) async {
-    try {
-      await widget.bridge.enableAutoReconnect(enabled);
-      if (!mounted) return;
-      NeuToast.success(context, enabled ? '已开启断线自动重连' : '已关闭断线自动重连');
-    } catch (err) {
-      if (!mounted) return;
-      NeuToast.error(context, '更新自动重连失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _saveSyncPolicy() async {
-    final maxKbps = int.tryParse(_maxKbpsController.text.trim());
-    if (maxKbps == null || maxKbps < 0) {
-      NeuToast.warning(context, '上传限速必须为大于或等于 0 的整数（0 表示不限速）');
-      return;
-    }
-
-    setState(() => _savingPolicy = true);
-    try {
-      await widget.bridge.updatePowerNetworkPolicy(
-        wifiOnly: Platform.isAndroid ? _wifiOnly : false,
-        allowedSsids: List<String>.unmodifiable(_allowedSsids),
-        requireCharging: Platform.isAndroid ? _requireCharging : false,
-        maxKbps: maxKbps,
-      );
-      if (!mounted) return;
-      setState(() => _savingPolicy = false);
-      NeuToast.success(context, '同步与网络策略已保存');
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _savingPolicy = false);
-      NeuToast.error(context, '保存策略失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _toggleBitRotAutoScrub(bool enabled) async {
-    try {
-      final applied = await widget.bridge.setBitRotAutoScrub(enabled);
-      if (!mounted) return;
-      setState(() => _bitRotAutoScrub = applied);
-      NeuToast.success(
-        context,
-        applied ? '已开启 Bit-Rot 定时自动巡检' : '已关闭定时自动巡检',
-      );
-    } catch (err) {
-      if (!mounted) return;
-      NeuToast.error(context, '切换自动巡检失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _triggerQuickScrub() async {
-    setState(() => _scrubbing = true);
-    try {
-      final res = await widget.bridge.triggerBitRotScrub();
-      if (!mounted) return;
-      setState(() {
-        _lastScrub = res;
-        _scrubbing = false;
-      });
-      NeuToast.success(
-        context,
-        '校验完成：已检 ${res.checkedChunks} 块，损坏 ${res.corruptedChunks} 块，自愈 ${res.healedChunks} 块',
-      );
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _scrubbing = false);
-      NeuToast.error(context, '完整性校验失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _exportKeyBackup() async {
-    final pass = _keyPassphraseController.text;
-    if (pass.length < 12) {
-      NeuToast.warning(context, '密钥备份口令至少需要 12 位字符');
-      return;
-    }
-    setState(() => _exportingKey = true);
-    try {
-      final backupJson = await widget.bridge.exportVaultKeyBackup(pass);
-      await Clipboard.setData(ClipboardData(text: backupJson));
-      if (!mounted) return;
-      _keyPassphraseController.clear();
-      setState(() => _exportingKey = false);
-      NeuToast.success(context, '加密密钥备份已导出并复制到剪贴板，请妥善保存');
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _exportingKey = false);
-      NeuToast.error(context, '导出密钥备份失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _restartServer() async {
-    setState(() => _restarting = true);
-    try {
-      final ok = await widget.bridge.executeGracefulRestart();
+      final role = await widget.bridge.getRoleMode();
+      final autoRec = await widget.bridge.getAutoReconnect();
+      final autostart = await widget.bridge.getAutostartServer();
+      final policy = await widget.bridge.getPowerNetworkPolicy();
+      final scrub = await widget.bridge.getBitRotAutoScrub();
+      final debug = await widget.bridge.getDebugMode();
+      final backupCfg = await widget.bridge.getBackupStorageConfig();
+      final lastCfg = await widget.bridge.getLastServerConfig();
       final overview = await widget.bridge.getSystemOverview();
       if (!mounted) return;
       setState(() {
+        _roleMode = role;
+        _autoReconnect = autoRec;
+        _autostartServer = autostart;
+        _policy = policy;
+        _bitRotAutoScrub = scrub;
+        _debugMode = debug;
+        _storageConfig = backupCfg;
+        _lastServerConfig = lastCfg;
+        _webPasswordEnabled =
+            lastCfg?.webPassword != null && lastCfg!.webPassword!.isNotEmpty;
         _overview = overview;
-        _restarting = false;
       });
-      NeuToast.success(context, ok ? '服务端已完成优雅重启' : '已下发重启指令');
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _restarting = false);
-      NeuToast.error(context, '重启服务失败：${LanVaultBridge.formatUserError(err)}');
-    }
+    } catch (_) {}
   }
 
-  Future<void> _toggleDebugMode(bool enabled) async {
+  Future<bool> _savePolicyImmediate(PowerNetworkPolicyModel next) async {
+    final prev = _policy;
+    setState(() => _policy = next);
     try {
-      final applied = await widget.bridge.setDebugMode(enabled);
-      String? logPath;
-      List<DebugLogEntryModel> logs = const <DebugLogEntryModel>[];
-      if (applied) {
-        logPath = await widget.bridge.getDebugLogPath();
-        logs = await widget.bridge.getDebugLogs(limit: 120);
-      }
-      if (!mounted) return;
-      setState(() {
-        _debugMode = applied;
-        _debugLogPath = logPath;
-        _debugLogs = logs.reversed.toList(growable: false);
-      });
-      NeuToast.info(
-        context,
-        applied ? '已开启 Debug 模式，探针日志将实时写入磁盘' : '已关闭 Debug 模式',
+      await widget.bridge.updatePowerNetworkPolicy(
+        wifiOnly: next.wifiOnly,
+        allowedSsids: next.allowedSsids,
+        requireCharging: next.requireCharging,
+        maxKbps: next.maxKbps,
       );
+      return true;
     } catch (err) {
-      if (!mounted) return;
-      NeuToast.error(context, '切换 Debug 模式失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _refreshDebugLogs() async {
-    setState(() => _loadingLogs = true);
-    try {
-      final logPath = await widget.bridge.getDebugLogPath();
-      final logs = await widget.bridge.getDebugLogs(limit: 150);
-      if (!mounted) return;
-      setState(() {
-        _debugLogPath = logPath;
-        _debugLogs = logs.reversed.toList(growable: false);
-        _loadingLogs = false;
-      });
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _loadingLogs = false);
-      NeuToast.error(context, '刷新日志失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _clearDebugLogs() async {
-    try {
-      await widget.bridge.clearDebugLogs();
-      if (!mounted) return;
-      setState(() => _debugLogs = const <DebugLogEntryModel>[]);
-      NeuToast.info(context, '已清空内存与磁盘 Debug 日志');
-    } catch (err) {
-      if (!mounted) return;
-      NeuToast.error(context, '清空日志失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _runSelfDiagnostics() async {
-    setState(() => _runningDiagnostics = true);
-    try {
-      final report = await widget.bridge.runSelfDiagnostics();
-      final logs = await widget.bridge.getDebugLogs(limit: 150);
-      if (!mounted) return;
-      setState(() {
-        _runningDiagnostics = false;
-        _debugLogs = logs.reversed.toList(growable: false);
-        _debugLogPath = report['log_file_path'] as String? ?? _debugLogPath;
-      });
-      final checksPassed = report['checks_passed'];
-      final issues = report['issues'];
-      final version = report['version'] ?? LanVaultBridge.appVersion;
-      final summary = checksPassed != null
-          ? '自检完成（v$version，通过：$checksPassed，异常：${issues is List ? issues.length : 0}）'
-          : '探针自检通过（模式：${report['role_mode']}，任务数：${report['sync_rule_count']}）';
-      NeuToast.success(context, summary);
-    } catch (err) {
-      if (!mounted) return;
-      setState(() => _runningDiagnostics = false);
-      NeuToast.error(context, '自检失败：${LanVaultBridge.formatUserError(err)}');
-    }
-  }
-
-  Future<void> _copyLogPath() async {
-    final path = _debugLogPath;
-    if (path == null || path.isEmpty) {
-      NeuToast.warning(context, '当前尚未生成日志路径');
-      return;
-    }
-    await Clipboard.setData(ClipboardData(text: path));
-    if (!mounted) return;
-    NeuToast.success(context, '已复制日志文件路径');
-  }
-
-  Future<void> _openLogFolder() async {
-    final path = _debugLogPath;
-    if (path == null || path.isEmpty) return;
-    if (Platform.isWindows) {
-      try {
-        await Process.run('explorer.exe', <String>['/select,$path']);
-      } catch (err) {
-        if (!mounted) return;
-        NeuToast.error(context, '打开日志目录失败：${LanVaultBridge.formatUserError(err)}');
+      if (mounted) {
+        setState(() => _policy = prev);
+        NeuToast.error(context, LanVaultBridge.formatUserError(err));
       }
+      return false;
     }
   }
 
-  String _formatLogTime(int timestampMs) {
-    final dt = DateTime.fromMillisecondsSinceEpoch(timestampMs);
-    return '${dt.hour.toString().padLeft(2, '0')}:'
-        '${dt.minute.toString().padLeft(2, '0')}:'
-        '${dt.second.toString().padLeft(2, '0')}.'
-        '${dt.millisecond.toString().padLeft(3, '0')}';
-  }
-
-  Color _levelColor(String level) {
-    return switch (level.toUpperCase()) {
-      'FATAL' || 'ERROR' => NeuTokens.danger,
-      'WARN' => NeuTokens.warning,
-      'PROBE' => NeuTokens.accent,
-      _ => NeuTokens.healthy,
-    };
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    final isWide =
-        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
-
-    return ValueListenableBuilder<RoleMode>(
-      valueListenable: widget.bridge.roleModeNotifier,
-      builder: (context, roleMode, _) {
-        final detailPanel = NeuMotionSwitcher(
-          child: KeyedSubtree(
-            key: ValueKey<_SettingsSection>(_activeSection),
-            child: _buildActiveSection(context, roleMode, isWide),
-          ),
-        );
-
-        if (isWide) {
-          return Padding(
-            padding: const EdgeInsets.all(NeuSpace.lg),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: <Widget>[
-                Text('设置', style: textTheme.headlineSmall),
-                const SizedBox(height: 4),
-                Text('系统配置、服务与安全', style: textTheme.bodySmall),
-                const SizedBox(height: 20),
-                Expanded(
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      SizedBox(
-                        width: 196,
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: <Widget>[
-                            for (final sec in _SettingsSection.values) ...<Widget>[
-                              _SettingsMenuTile(
-                                section: sec,
-                                selected: sec == _activeSection,
-                                onTap: () =>
-                                    setState(() => _activeSection = sec),
-                              ),
-                              const SizedBox(height: 4),
-                            ],
-                          ],
-                        ),
-                      ),
-                      const SizedBox(width: NeuSpace.lg),
-                      Expanded(
-                        child: SingleChildScrollView(child: detailPanel),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          );
-        }
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+  Future<void> _pickRoleMode() async {
+    final chosen = await showNeuDialog<RoleMode>(
+      context: context,
+      builder: (ctx) => NeuDialog(
+        title: '节点运行模式',
+        subtitle: '决定本机作为备份端、存储端还是双端同时运行',
+        maxWidth: 380,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: <Widget>[
-            Padding(
-              padding: const EdgeInsets.symmetric(
-                horizontal: NeuSpace.md,
-                vertical: 6,
+            for (final mode in RoleMode.values)
+              ListTile(
+                title: Text(mode.label),
+                trailing: mode == _roleMode
+                    ? const Icon(Icons.check_rounded, color: NeuTokens.accent)
+                    : null,
+                onTap: () => Navigator.of(ctx).pop(mode),
               ),
-              child: Wrap(
-                spacing: 8,
-                runSpacing: 8,
-                children: <Widget>[
-                  for (final sec in _SettingsSection.values)
-                    Semantics(
-                      button: true,
-                      selected: sec == _activeSection,
-                      label: sec.label,
-                      child: InkWell(
-                        onTap: () => setState(() => _activeSection = sec),
-                        borderRadius: const BorderRadius.all(
-                          Radius.circular(NeuRadius.pill),
-                        ),
-                        child: AnimatedContainer(
-                          duration: NeuMotion.resolveState(context),
-                          constraints: const BoxConstraints(minHeight: 38),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 13,
-                            vertical: 8,
-                          ),
-                          decoration: BoxDecoration(
-                            color: sec == _activeSection
-                                ? null
-                                : NeuTokens.surface,
-                            gradient: sec == _activeSection
-                                ? NeuTokens.primaryGradient
-                                : null,
-                            borderRadius: const BorderRadius.all(
-                              Radius.circular(NeuRadius.pill),
-                            ),
-                            border: sec == _activeSection
-                                ? null
-                                : Border.all(color: NeuTokens.hairlineBorder),
-                          ),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: <Widget>[
-                              Icon(
-                                sec.icon,
-                                size: 15,
-                                color: sec == _activeSection
-                                    ? Colors.white
-                                    : NeuTokens.textSecondary,
-                              ),
-                              const SizedBox(width: 6),
-                              Text(
-                                sec.label,
-                                style: TextStyle(
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w600,
-                                  color: sec == _activeSection
-                                      ? Colors.white
-                                      : NeuTokens.textPrimary,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                ],
-              ),
-            ),
-            Expanded(
-              child: SingleChildScrollView(
-                padding: const EdgeInsets.all(NeuSpace.md),
-                child: detailPanel,
-              ),
-            ),
           ],
-        );
-      },
-    );
-  }
-
-  Widget _buildActiveSection(
-    BuildContext context,
-    RoleMode roleMode,
-    bool isWide,
-  ) {
-    return switch (_activeSection) {
-      _SettingsSection.general => _buildGeneralSection(context, roleMode),
-      _SettingsSection.security => _buildSecuritySection(context, isWide),
-      _SettingsSection.backupPolicy => _buildBackupPolicySection(context, isWide),
-      _SettingsSection.networkService => _buildNetworkServiceSection(context),
-      _SettingsSection.diagnostics => _buildDiagnosticsSection(context),
-      _SettingsSection.about => _buildAboutSection(context),
-    };
-  }
-
-  Widget _buildGeneralSection(BuildContext context, RoleMode roleMode) {
-    final textTheme = Theme.of(context).textTheme;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: <Widget>[
-        NeuCard(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Text('节点运行模式', style: textTheme.titleMedium),
-              const SizedBox(height: 4),
-              Text(
-                '按需切换为仅备份客户端、仅存储服务端或双端同时运行',
-                style: textTheme.bodySmall,
-              ),
-              const SizedBox(height: 14),
-              NeuSegmentedControl<RoleMode>(
-                semanticLabel: '运行模式切换',
-                value: roleMode,
-                enabled: !_switchingMode && !_loading,
-                onChanged: _handleModeSelected,
-                segments: <NeuSegment<RoleMode>>[
-                  for (final mode in RoleMode.values)
-                    NeuSegment<RoleMode>(value: mode, label: mode.label),
-                ],
-              ),
-            ],
-          ),
         ),
-        const SizedBox(height: NeuSpace.md),
-        NeuCard(
-          padding: const EdgeInsets.all(20),
-          child: ValueListenableBuilder<bool>(
-            valueListenable: widget.bridge.autoReconnectNotifier,
-            builder: (context, autoReconnect, _) {
-              return NeuSwitch(
-                title: '断线自动重连',
-                subtitle: '局域网恢复后自动按 2s / 5s / 15s / 30s 退避重连已配对设备',
-                value: autoReconnect,
-                onChanged: _loading ? null : _toggleAutoReconnect,
-              );
+      ),
+    );
+    if (chosen == null || chosen == _roleMode || !mounted) return;
+    try {
+      final applied = await widget.bridge.setRoleMode(chosen);
+      if (!mounted) return;
+      setState(() => _roleMode = applied);
+      NeuToast.success(context, '已切换为 ${applied.label}');
+    } catch (err) {
+      if (!mounted) return;
+      NeuToast.error(context, LanVaultBridge.formatUserError(err));
+    }
+  }
+
+  Future<void> _editSpeedLimit() async {
+    final ctrl = TextEditingController(
+      text: _policy.maxKbps > 0 ? '${_policy.maxKbps}' : '',
+    );
+    final saved = await showNeuDialog<int>(
+      context: context,
+      builder: (ctx) => NeuDialog(
+        title: '上传限速 (KB/s)',
+        subtitle: '留空或填 0 表示不限速',
+        maxWidth: 360,
+        actions: <Widget>[
+          NeuButton(label: '取消', onPressed: () => Navigator.of(ctx).pop()),
+          NeuButton(
+            label: '确定',
+            tone: NeuButtonTone.primary,
+            onPressed: () {
+              final v = int.tryParse(ctrl.text.trim()) ?? 0;
+              Navigator.of(ctx).pop(v < 0 ? 0 : v);
             },
           ),
+        ],
+        child: NeuInsetField(
+          controller: ctrl,
+          hint: '例如 10240（约 10 MB/s）',
+          keyboardType: TextInputType.number,
+          prefixIcon: Icons.speed_rounded,
         ),
-        if (Platform.isAndroid) ...<Widget>[
-          const SizedBox(height: NeuSpace.md),
-          NeuCard(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text('Android 系统权限', style: textTheme.titleMedium),
-                const SizedBox(height: 4),
-                Text(
-                  '授予 Wi-Fi 定位与通知权限，保障后台保活服务稳定运行与家庭网络 SSID 识别。',
-                  style: textTheme.bodySmall,
-                ),
-                const SizedBox(height: 14),
-                Wrap(
-                  spacing: NeuSpace.sm,
-                  runSpacing: NeuSpace.sm,
-                  children: <Widget>[
-                    NeuButton(
-                      label: '授权 Wi-Fi 定位',
-                      icon: Icons.location_on_outlined,
-                      onPressed: _requestLocationPermission,
-                    ),
-                    NeuButton(
-                      label: '授权通知权限',
-                      icon: Icons.notifications_active_outlined,
-                      onPressed: _requestNotificationPermission,
-                    ),
-                  ],
-                ),
-              ],
-            ),
+      ),
+    );
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 350), ctrl.dispose));
+    if (saved == null || !mounted) return;
+    await _savePolicyImmediate(
+      PowerNetworkPolicyModel(
+        wifiOnly: _policy.wifiOnly,
+        allowedSsids: _policy.allowedSsids,
+        requireCharging: _policy.requireCharging,
+        maxKbps: saved,
+      ),
+    );
+    if (mounted) {
+      NeuToast.success(
+        context,
+        saved == 0 ? '已取消上传限速' : '已设置上传限速为 $saved KB/s',
+      );
+    }
+  }
+
+  Future<void> _openFailoverDirsDialog() async {
+    final primaryCtrl =
+        TextEditingController(text: _storageConfig?.primaryDir ?? '');
+    final fallbackCtrl =
+        TextEditingController(text: _storageConfig?.fallbackDir ?? '');
+
+    final saved = await showNeuDialog<bool>(
+      context: context,
+      builder: (ctx) => NeuDialog(
+        title: '主 / 备异盘存储目录',
+        subtitle: '主盘空间不足时自动切入备用目录写入',
+        maxWidth: 460,
+        actions: <Widget>[
+          NeuButton(label: '取消', onPressed: () => Navigator.of(ctx).pop(false)),
+          NeuButton(
+            label: '保存目录',
+            tone: NeuButtonTone.primary,
+            onPressed: () async {
+              final primary = primaryCtrl.text.trim();
+              final fallback = fallbackCtrl.text.trim();
+              if (primary.isEmpty) {
+                NeuToast.warning(ctx, '主存储目录不能为空');
+                return;
+              }
+              try {
+                final cfg = await widget.bridge.setBackupStorageConfig(
+                  primaryDir: primary,
+                  fallbackDir: fallback.isEmpty ? null : fallback,
+                );
+                if (mounted) setState(() => _storageConfig = cfg);
+                if (ctx.mounted) Navigator.of(ctx).pop(true);
+              } catch (err) {
+                if (ctx.mounted) {
+                  NeuToast.error(ctx, LanVaultBridge.formatUserError(err));
+                }
+              }
+            },
           ),
         ],
-      ],
-    );
-  }
-
-  Widget _buildSecuritySection(BuildContext context, bool isWide) {
-    final textTheme = Theme.of(context).textTheme;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: <Widget>[
-        NeuCard(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Text('安全与加密', style: textTheme.titleMedium),
-              const SizedBox(height: 14),
-              const _SecurityRow(
-                title: '零知识加密',
-                subtitle: '文件在客户端加密后分块上传，服务端仅存密文',
-                status: '已启用',
-                tone: NeuStatusTone.healthy,
-              ),
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 12),
-                child: Divider(height: 1),
-              ),
-              NeuSwitch(
-                title: '数据完整性自动校验 (Bit-Rot)',
-                subtitle: _lastScrub == null
-                    ? '定期巡检数据块哈希并利用冗余副本自愈损坏块'
-                    : '上次校验 ${_lastScrub!.checkedChunks} 块 · 损坏 ${_lastScrub!.corruptedChunks} 块',
-                value: _bitRotAutoScrub,
-                onChanged: _loading ? null : _toggleBitRotAutoScrub,
-              ),
-              const SizedBox(height: 10),
-              Align(
-                alignment: Alignment.centerRight,
-                child: NeuButton(
-                  label: '立即校验',
-                  icon: Icons.fact_check_outlined,
-                  tone: NeuButtonTone.primary,
-                  loading: _scrubbing,
-                  onPressed: _triggerQuickScrub,
-                ),
-              ),
-              const Padding(
-                padding: EdgeInsets.symmetric(vertical: 12),
-                child: Divider(height: 1),
-              ),
-              const _SecurityRow(
-                title: '传输加密 (TLS)',
-                subtitle: '局域网内双向证书校验与端到端加密传输',
-                status: '强制启用',
-                tone: NeuStatusTone.healthy,
-              ),
-            ],
-          ),
-        ),
-        const SizedBox(height: NeuSpace.md),
-        NeuCard(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Text('主密钥加密备份', style: textTheme.titleMedium),
-              const SizedBox(height: 4),
-              Text(
-                '使用至少 12 位高强度口令导出 Vault 主密钥加密备份，换机时可用于离线恢复数据。',
-                style: textTheme.bodySmall,
-              ),
-              const SizedBox(height: 12),
-              if (isWide)
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.end,
-                  children: <Widget>[
-                    Expanded(
-                      child: NeuInsetField(
-                        controller: _keyPassphraseController,
-                        label: '备份加密口令（至少 12 位）',
-                        hint: '输入高强度口令',
-                        obscureText: true,
-                        prefixIcon: Icons.key_rounded,
-                      ),
-                    ),
-                    const SizedBox(width: NeuSpace.sm),
-                    NeuButton(
-                      label: '导出备份',
-                      icon: Icons.download_rounded,
-                      tone: NeuButtonTone.primary,
-                      loading: _exportingKey,
-                      onPressed: _exportKeyBackup,
-                    ),
-                  ],
-                )
-              else
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: <Widget>[
-                    NeuInsetField(
-                      controller: _keyPassphraseController,
-                      label: '备份加密口令（至少 12 位）',
-                      hint: '输入高强度口令',
-                      obscureText: true,
-                      prefixIcon: Icons.key_rounded,
-                    ),
-                    const SizedBox(height: NeuSpace.sm),
-                    NeuButton(
-                      label: '导出备份',
-                      icon: Icons.download_rounded,
-                      tone: NeuButtonTone.primary,
-                      loading: _exportingKey,
-                      expanded: true,
-                      onPressed: _exportKeyBackup,
-                    ),
-                  ],
-                ),
-            ],
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildBackupPolicySection(BuildContext context, bool isWide) {
-    final textTheme = Theme.of(context).textTheme;
-    final scan = _networkSnapshot;
-    final scannedSsids = <String>{
-      ...?scan?.availableSsids,
-      ..._allowedSsids,
-    }.toList(growable: false)
-      ..sort();
-
-    final wifiOptions = <NeuDropdownOption<String>>[
-      const NeuDropdownOption<String>(
-        value: _anyNetworkSentinel,
-        label: '不限制网络（包含网线与任意 Wi-Fi）',
-      ),
-      for (final ssid in scannedSsids)
-        NeuDropdownOption<String>(
-          value: ssid,
-          label: ssid,
-          subtitle: scan?.currentSsid == ssid ? '当前已连' : null,
-        ),
-    ];
-
-    final dropdownValue =
-        wifiOptions.any((o) => o.value == _selectedWifiDropdown)
-            ? _selectedWifiDropdown
-            : _anyNetworkSentinel;
-
-    return NeuCard(
-      padding: const EdgeInsets.all(20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Text('备份与网络限速策略', style: textTheme.titleMedium),
-          const SizedBox(height: 14),
-          if (Platform.isAndroid) ...<Widget>[
-            NeuSwitch(
-              title: '仅 Wi-Fi 网络下执行同步',
-              subtitle: '避免消耗手机蜂窝流量',
-              value: _wifiOnly,
-              onChanged: (v) => setState(() => _wifiOnly = v),
-            ),
-            const SizedBox(height: 8),
-            NeuSwitch(
-              title: '仅充电时全速上传',
-              subtitle: '移动端未充电时降低后台耗电',
-              value: _requireCharging,
-              onChanged: (v) => setState(() => _requireCharging = v),
-            ),
-            const SizedBox(height: 14),
-          ],
-          if (!Platform.isAndroid &&
-              scan != null &&
-              scan.isWiredEthernet) ...<Widget>[
-            Text(
-              scan.hasWifiAdapter
-                  ? '当前未连接 Wi-Fi（可能正通过网线连接），默认不限制网络即可直接同步。'
-                  : '当前电脑未检测到无线网卡（有线网线连接），无需限制 Wi-Fi。',
-              style: textTheme.bodySmall,
-            ),
-            const SizedBox(height: 10),
-          ],
-          if (isWide)
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: <Widget>[
             Row(
               crossAxisAlignment: CrossAxisAlignment.end,
               children: <Widget>[
                 Expanded(
-                  child: NeuDropdown<String>(
-                    label: '允许同步的家庭网络（支持多选添加）',
-                    emptyHint: '不限制网络',
-                    prefixIcon: Icons.wifi_rounded,
-                    options: wifiOptions,
-                    value: dropdownValue,
-                    onChanged: _handleWifiSelected,
+                  child: NeuInsetField(
+                    controller: primaryCtrl,
+                    label: '主存储目录',
+                    hint: '选择主磁盘目录',
+                    prefixIcon: Icons.folder_outlined,
                   ),
                 ),
-                const SizedBox(width: NeuSpace.sm),
+                const SizedBox(width: 8),
                 NeuButton(
-                  label: '扫描',
-                  icon: Icons.refresh_rounded,
-                  loading: _scanningWifi,
-                  onPressed: _rescanNetworks,
+                  label: '浏览',
+                  onPressed: () async {
+                    final p = await widget.bridge.pickDirectory(
+                      description: '选择主存储目录',
+                    );
+                    if (ctx.mounted && p != null && p.isNotEmpty) primaryCtrl.text = p;
+                  },
                 ),
               ],
-            )
-          else ...<Widget>[
-            NeuDropdown<String>(
-              label: '允许同步的家庭网络（支持多选添加）',
-              emptyHint: '不限制网络',
-              prefixIcon: Icons.wifi_rounded,
-              options: wifiOptions,
-              value: dropdownValue,
-              onChanged: _handleWifiSelected,
-            ),
-            const SizedBox(height: NeuSpace.sm),
-            NeuButton(
-              label: '扫描周边 Wi-Fi',
-              icon: Icons.refresh_rounded,
-              loading: _scanningWifi,
-              expanded: true,
-              onPressed: _rescanNetworks,
-            ),
-          ],
-          if (_allowedSsids.isNotEmpty) ...<Widget>[
-            const SizedBox(height: 10),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: <Widget>[
-                for (final ssid in _allowedSsids)
-                  Container(
-                    key: ValueKey<String>('ssid_$ssid'),
-                    padding: const EdgeInsets.only(left: 12, right: 2),
-                    decoration: BoxDecoration(
-                      color: NeuTokens.accentSoft,
-                      borderRadius: const BorderRadius.all(
-                        Radius.circular(NeuRadius.pill),
-                      ),
-                    ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: <Widget>[
-                        Text(
-                          ssid,
-                          style: textTheme.labelMedium?.copyWith(
-                            color: NeuTokens.accent,
-                          ),
-                        ),
-                        const SizedBox(width: 2),
-                        Semantics(
-                          button: true,
-                          label: '移除允许的 Wi-Fi $ssid',
-                          child: InkWell(
-                            borderRadius: const BorderRadius.all(
-                              Radius.circular(NeuRadius.pill),
-                            ),
-                            onTap: () => _removeAllowedSsid(ssid),
-                            child: const SizedBox(
-                              width: 44,
-                              height: 44,
-                              child: Icon(
-                                Icons.close_rounded,
-                                size: 16,
-                                color: NeuTokens.accent,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-              ],
-            ),
-          ],
-          const SizedBox(height: 14),
-          NeuInsetField(
-            controller: _maxKbpsController,
-            label: '上传限速（KB/s，0 为不限速）',
-            hint: '0',
-            keyboardType: TextInputType.number,
-            prefixIcon: Icons.speed_rounded,
-          ),
-          const SizedBox(height: 16),
-          NeuButton(
-            label: '保存备份与网络策略',
-            icon: Icons.check_rounded,
-            tone: NeuButtonTone.primary,
-            loading: _savingPolicy,
-            onPressed: _saveSyncPolicy,
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildNetworkServiceSection(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    final overview = _overview;
-    return NeuCard(
-      padding: const EdgeInsets.all(20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          Text('网络与服务状态', style: textTheme.titleMedium),
-          const SizedBox(height: 14),
-          NeuKeyValueRow(
-            label: '本机局域网 IP',
-            value: overview == null || overview.lanIp.isEmpty
-                ? '未获取'
-                : overview.lanIp,
-          ),
-          const Divider(height: 1),
-          NeuKeyValueRow(
-            label: '本地服务端口',
-            value: overview?.serverRunning == true
-                ? '运行中 · :${overview?.serverPort ?? LanVaultBridge.defaultServerPort}'
-                : '未启动',
-          ),
-          const Divider(height: 1),
-          NeuKeyValueRow(
-            label: '后台保活等级',
-            value: _keepAliveLevel?.displayLabel ?? '检测中',
-          ),
-          const SizedBox(height: 18),
-          Wrap(
-            spacing: NeuSpace.sm,
-            runSpacing: NeuSpace.sm,
-            children: <Widget>[
-              NeuButton(
-                label: '优雅重启服务端',
-                icon: Icons.restart_alt_rounded,
-                tone: NeuButtonTone.primary,
-                loading: _restarting,
-                onPressed: _restartServer,
-              ),
-              NeuButton(
-                label: '刷新状态',
-                icon: Icons.refresh_rounded,
-                onPressed: _loadSettings,
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDiagnosticsSection(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    final filteredLogs = _logFilter == 'ALL'
-        ? _debugLogs
-        : _debugLogs
-            .where((e) => e.level.toUpperCase() == _logFilter)
-            .toList(growable: false);
-
-    return NeuCard(
-      padding: const EdgeInsets.all(20),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: <Widget>[
-          NeuSwitch(
-            title: 'Debug 调试与性能探针模式',
-            subtitle: '开启后启用全链路微秒级探针，并实时写入磁盘 JSONL 日志文件',
-            value: _debugMode,
-            onChanged: _loading ? null : _toggleDebugMode,
-          ),
-          const SizedBox(height: 14),
-          Wrap(
-            spacing: NeuSpace.sm,
-            runSpacing: NeuSpace.sm,
-            children: <Widget>[
-              NeuButton(
-                label: '一键探针自检',
-                icon: Icons.health_and_safety_outlined,
-                tone: NeuButtonTone.primary,
-                loading: _runningDiagnostics,
-                onPressed: _runSelfDiagnostics,
-              ),
-              if (_debugMode) ...<Widget>[
-                NeuButton(
-                  label: '刷新日志',
-                  icon: Icons.refresh_rounded,
-                  loading: _loadingLogs,
-                  onPressed: _refreshDebugLogs,
-                ),
-                NeuButton(
-                  label: '复制日志路径',
-                  icon: Icons.copy_rounded,
-                  onPressed: _copyLogPath,
-                ),
-                if (Platform.isWindows)
-                  NeuButton(
-                    label: '打开日志目录',
-                    icon: Icons.folder_open_rounded,
-                    onPressed: _openLogFolder,
-                  ),
-                NeuButton(
-                  label: '清空日志',
-                  icon: Icons.delete_sweep_outlined,
-                  onPressed: _clearDebugLogs,
-                ),
-              ],
-            ],
-          ),
-          if (_debugMode) ...<Widget>[
-            const SizedBox(height: 14),
-            NeuCard(
-              inset: true,
-              padding: const EdgeInsets.all(12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: <Widget>[
-                  Text('日志文件位置（JSONL 格式，10 MB 自动轮转）',
-                      style: textTheme.labelMedium),
-                  const SizedBox(height: 4),
-                  SelectableText(
-                    _debugLogPath ?? '正在初始化日志路径…',
-                    style: textTheme.bodySmall?.copyWith(
-                      fontFamily: 'monospace',
-                      color: NeuTokens.textPrimary,
-                    ),
-                  ),
-                ],
-              ),
             ),
             const SizedBox(height: 12),
-            NeuSegmentedControl<String>(
-              semanticLabel: '日志级别过滤',
-              value: _logFilter,
-              onChanged: (val) => setState(() => _logFilter = val),
-              segments: const <NeuSegment<String>>[
-                NeuSegment<String>(value: 'ALL', label: '全部'),
-                NeuSegment<String>(value: 'PROBE', label: '探针'),
-                NeuSegment<String>(value: 'ERROR', label: '错误'),
-                NeuSegment<String>(value: 'DEBUG', label: '调试'),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
+              children: <Widget>[
+                Expanded(
+                  child: NeuInsetField(
+                    controller: fallbackCtrl,
+                    label: '备用目录（可选，建议不同磁盘）',
+                    hint: '选择备用磁盘目录',
+                    prefixIcon: Icons.folder_copy_outlined,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                NeuButton(
+                  label: '浏览',
+                  onPressed: () async {
+                    final p = await widget.bridge.pickDirectory(
+                      description: '选择备用存储目录',
+                    );
+                    if (ctx.mounted && p != null && p.isNotEmpty) fallbackCtrl.text = p;
+                  },
+                ),
               ],
             ),
-            const SizedBox(height: 10),
-            NeuCard(
-              inset: true,
-              padding: const EdgeInsets.all(12),
-              child: SizedBox(
-                height: 250,
-                child: filteredLogs.isEmpty
-                    ? Center(
-                        child: Text(
-                          '暂无匹配的日志记录，点击“一键探针自检”即可生成诊断日志。',
-                          style: textTheme.bodySmall,
-                        ),
-                      )
-                    : ListView.separated(
-                        itemCount: filteredLogs.length,
-                        separatorBuilder: (_, __) => const Divider(height: 10),
-                        itemBuilder: (context, index) {
-                          final item = filteredLogs[index];
-                          final durText = item.durationUs == null
-                              ? ''
-                              : ' · ${item.durationUs} us';
-                          final probeText =
-                              item.probe == null ? '' : ' [${item.probe}]';
-                          return Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: <Widget>[
-                              Row(
-                                children: <Widget>[
-                                  Text(
-                                    item.level,
-                                    style: textTheme.labelMedium?.copyWith(
-                                      color: _levelColor(item.level),
-                                      fontFamily: 'monospace',
-                                    ),
-                                  ),
-                                  const SizedBox(width: 8),
-                                  Expanded(
-                                    child: Text(
-                                      '${_formatLogTime(item.timestampMs)} · ${item.source}$probeText$durText',
-                                      overflow: TextOverflow.ellipsis,
-                                      style: textTheme.bodySmall?.copyWith(
-                                        fontFamily: 'monospace',
-                                        fontSize: 12,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                item.message,
-                                style: textTheme.bodySmall?.copyWith(
-                                  color: NeuTokens.textPrimary,
-                                  fontFamily: 'monospace',
-                                  fontSize: 12.5,
-                                ),
-                              ),
-                            ],
+          ],
+        ),
+      ),
+    );
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 350), () { primaryCtrl.dispose(); fallbackCtrl.dispose(); }));
+    if (saved == true && mounted) {
+      NeuToast.success(context, '主 / 备存储目录已更新');
+    }
+  }
+
+  Future<void> _toggleWebPassword(bool enabled) async {
+    if (!enabled) {
+      setState(() => _webPasswordEnabled = false);
+      NeuToast.info(context, '已关闭 Web 密码保护提示');
+      return;
+    }
+    final pwdCtrl = TextEditingController();
+    final port = _lastServerConfig?.port ?? LanVaultBridge.defaultServerPort;
+    final vaultPath = _lastServerConfig?.vaultPath ?? '';
+    final quotaGb = _lastServerConfig?.quotaGb ?? 100;
+
+    final confirmed = await showNeuDialog<String>(
+      context: context,
+      builder: (ctx) => NeuDialog(
+        title: '设置 Web 远程访问密码',
+        subtitle: '开启后，通过浏览器访问本机 Web 管理页需输入此密码（至少 8 位）',
+        maxWidth: 400,
+        actions: <Widget>[
+          NeuButton(label: '取消', onPressed: () => Navigator.of(ctx).pop()),
+          NeuButton(
+            label: '启用密码',
+            tone: NeuButtonTone.primary,
+            onPressed: () {
+              final p = pwdCtrl.text.trim();
+              if (p.length < 8) {
+                NeuToast.warning(ctx, '密码至少需要 8 位字符');
+                return;
+              }
+              Navigator.of(ctx).pop(p);
+            },
+          ),
+        ],
+        child: NeuInsetField(
+          controller: pwdCtrl,
+          hint: '请输入至少 8 位密码',
+          obscureText: true,
+          prefixIcon: Icons.lock_outline_rounded,
+        ),
+      ),
+    );
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 350), pwdCtrl.dispose));
+    if (confirmed == null || !mounted) return;
+
+    if (vaultPath.isNotEmpty) {
+      try {
+        await widget.bridge.startLocalServer(
+          vaultPath: vaultPath,
+          quotaGb: quotaGb,
+          port: port,
+          webPassword: confirmed,
+        );
+        if (!mounted) return;
+        setState(() => _webPasswordEnabled = true);
+        NeuToast.success(context, 'Web 远程访问密码已启用');
+      } catch (err) {
+        if (!mounted) return;
+        NeuToast.error(context, LanVaultBridge.formatUserError(err));
+      }
+    } else {
+      setState(() => _webPasswordEnabled = true);
+      NeuToast.success(context, '已启用 Web 访问密码保护');
+    }
+  }
+
+  Future<void> _openKeyBackupDialog() async {
+    final ctrl = TextEditingController();
+    var exporting = false;
+    await showNeuDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) => NeuDialog(
+          title: '主密钥加密备份',
+          subtitle: '输入至少 12 位高强度口令导出密钥备份，换机时可用于离线恢复数据',
+          maxWidth: 420,
+          actions: <Widget>[
+            NeuButton(
+              label: '取消',
+              onPressed: exporting ? null : () => Navigator.of(ctx).pop(),
+            ),
+            NeuButton(
+              label: '导出并复制',
+              icon: Icons.download_rounded,
+              tone: NeuButtonTone.primary,
+              loading: exporting,
+              onPressed: exporting
+                  ? null
+                  : () async {
+                      final pass = ctrl.text.trim();
+                      if (pass.length < 12) {
+                        NeuToast.warning(ctx, '备份口令至少需要 12 位');
+                        return;
+                      }
+                      setDialogState(() => exporting = true);
+                      try {
+                        final json =
+                            await widget.bridge.exportVaultKeyBackup(pass);
+                        await Clipboard.setData(ClipboardData(text: json));
+                        if (ctx.mounted) Navigator.of(ctx).pop();
+                        if (mounted) {
+                          NeuToast.success(
+                            this.context,
+                            '主密钥加密备份已复制到剪贴板，请妥善离线保存',
                           );
-                        },
-                      ),
-              ),
+                        }
+                      } catch (err) {
+                        if (ctx.mounted) {
+                          setDialogState(() => exporting = false);
+                          NeuToast.error(
+                            ctx,
+                            LanVaultBridge.formatUserError(err),
+                          );
+                        }
+                      }
+                    },
             ),
           ],
+          child: NeuInsetField(
+            controller: ctrl,
+            hint: '请输入至少 12 位高强度口令',
+            obscureText: true,
+            prefixIcon: Icons.vpn_key_outlined,
+          ),
+        ),
+      ),
+    );
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 350), ctrl.dispose));
+  }
+
+  Future<void> _restartServer() async {
+    if (_restarting) return;
+    setState(() => _restarting = true);
+    try {
+      final ok = await widget.bridge.executeGracefulRestart();
+      if (!mounted) return;
+      NeuToast.info(context, ok ? '后台服务已优雅重启' : '重启未完成，请稍后重试');
+      await _loadAll();
+    } catch (err) {
+      if (!mounted) return;
+      NeuToast.error(context, LanVaultBridge.formatUserError(err));
+    } finally {
+      if (mounted) setState(() => _restarting = false);
+    }
+  }
+
+  Future<void> _runSelfDiag() async {
+    if (_runningDiag) return;
+    setState(() => _runningDiag = true);
+    try {
+      final report = await widget.bridge.runSelfDiagnostics();
+      if (!mounted) return;
+      final ok = report['ok'] != false;
+      NeuToast.info(
+        context,
+        ok ? '探针自检通过：服务、存储与网络链路均正常' : '自检发现异常项，请查看诊断日志',
+      );
+    } catch (err) {
+      if (!mounted) return;
+      NeuToast.error(context, LanVaultBridge.formatUserError(err));
+    } finally {
+      if (mounted) setState(() => _runningDiag = false);
+    }
+  }
+
+
+  Future<void> _openAllowedWifiDialog() async {
+    final selected = List<String>.from(_policy.allowedSsids);
+    var discovered = <String>[];
+    var scanning = false;
+    final manualCtrl = TextEditingController();
+
+    await showNeuDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return NeuDialog(
+            title: '允许同步的家庭 Wi-Fi',
+            subtitle: '留空表示不限制网络（包含网线与任意 Wi-Fi）',
+            maxWidth: 440,
+            actions: <Widget>[
+              NeuButton(
+                label: '清空限制',
+                onPressed: () {
+                  selected.clear();
+                  unawaited(_savePolicyImmediate(PowerNetworkPolicyModel(
+                    wifiOnly: _policy.wifiOnly,
+                    allowedSsids: const <String>[],
+                    requireCharging: _policy.requireCharging,
+                    maxKbps: _policy.maxKbps,
+                  )));
+                  Navigator.of(ctx).pop();
+                  NeuToast.info(this.context, '已恢复不限制同步网络');
+                },
+              ),
+              NeuButton(
+                label: '完成',
+                tone: NeuButtonTone.primary,
+                onPressed: () {
+                  unawaited(_savePolicyImmediate(PowerNetworkPolicyModel(
+                    wifiOnly: _policy.wifiOnly,
+                    allowedSsids: List<String>.from(selected),
+                    requireCharging: _policy.requireCharging,
+                    maxKbps: _policy.maxKbps,
+                  )));
+                  Navigator.of(ctx).pop();
+                  NeuToast.success(this.context, '家庭网络列表已生效');
+                },
+              ),
+            ],
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                Row(
+                  children: <Widget>[
+                    Expanded(
+                      child: NeuInsetField(
+                        controller: manualCtrl,
+                        hint: '输入 Wi-Fi 名称后添加',
+                        prefixIcon: Icons.wifi_rounded,
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    NeuButton(
+                      label: '添加',
+                      onPressed: () {
+                        final name = manualCtrl.text.trim();
+                        if (name.isNotEmpty && !selected.contains(name)) {
+                          setDialogState(() {
+                            selected.add(name);
+                            manualCtrl.clear();
+                          });
+                        }
+                      },
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 10),
+                NeuButton(
+                  label: scanning ? '正在扫描周边 Wi-Fi…' : '扫描周边 Wi-Fi',
+                  icon: Icons.radar_rounded,
+                  loading: scanning,
+                  expanded: true,
+                  onPressed: scanning
+                      ? null
+                      : () async {
+                          setDialogState(() => scanning = true);
+                          try {
+                            final snap = await SystemEnvHelper.scanNetworks();
+                            final found = <String>{
+                              if (snap.currentSsid != null &&
+                                  snap.currentSsid!.isNotEmpty)
+                                snap.currentSsid!,
+                              ...snap.availableSsids,
+                            }.toList(growable: false);
+                            if (ctx.mounted) {
+                              setDialogState(() {
+                                discovered = found;
+                                scanning = false;
+                              });
+                            }
+                          } catch (_) {
+                            setDialogState(() => scanning = false);
+                          }
+                        },
+                ),
+                if (discovered.isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: <Widget>[
+                      for (final ssid in discovered)
+                        ActionChip(
+                          label: Text(ssid),
+                          onPressed: () {
+                            if (!selected.contains(ssid)) {
+                              setDialogState(() => selected.add(ssid));
+                            }
+                          },
+                        ),
+                    ],
+                  ),
+                ],
+                if (selected.isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 12),
+                  Wrap(
+                    spacing: 6,
+                    runSpacing: 6,
+                    children: <Widget>[
+                      for (final ssid in selected)
+                        InputChip(
+                          label: Text(ssid),
+                          onDeleted: () =>
+                              setDialogState(() => selected.remove(ssid)),
+                        ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          );
+        },
+      ),
+    );
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 350), manualCtrl.dispose));
+  }
+
+  Future<void> _openDebugLogsDialog() async {
+    var logs = await widget.bridge.getDebugLogs(limit: 80);
+    if (!mounted) return;
+    await showNeuDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (context, setDialogState) => NeuDialog(
+          title: '运行与调试日志',
+          subtitle: '最近 ${logs.length} 条记录',
+          maxWidth: 560,
+          actions: <Widget>[
+            NeuButton(
+              label: '清空日志',
+              tone: NeuButtonTone.danger,
+              onPressed: () async {
+                await widget.bridge.clearDebugLogs();
+                if (ctx.mounted) setDialogState(() => logs = const <DebugLogEntryModel>[]);
+                if (mounted) NeuToast.info(this.context, '调试日志已清空');
+              },
+            ),
+            NeuButton(
+              label: '关闭',
+              tone: NeuButtonTone.primary,
+              onPressed: () => Navigator.of(ctx).pop(),
+            ),
+          ],
+          child: SizedBox(
+            height: 300,
+            child: logs.isEmpty
+                ? const Center(child: Text('暂无调试日志记录'))
+                : ListView.separated(
+                    itemCount: logs.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (_, idx) {
+                      final e = logs[idx];
+                      return Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 6),
+                        child: Text(
+                          '[${e.level}] ${e.source}: ${e.message}',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isWide =
+        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
+
+    if (!isWide) {
+      // 手机端：对标参考图，单一纵向分组白卡列表，零顶部两排药丸
+      return SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(16, 6, 16, 28),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            _buildSectionHeader(context, '常规与节点'),
+            _buildGeneralGroup(context),
+            _buildSectionHeader(context, '备份与容灾'),
+            _buildBackupGroup(context),
+            _buildSectionHeader(context, 'Web 访问与安全'),
+            _buildWebSecurityGroup(context),
+            if (Platform.isAndroid) ...<Widget>[
+              _buildSectionHeader(context, '权限与后台保活'),
+              _buildAndroidPermissionsGroup(context),
+            ],
+            _buildSectionHeader(context, '服务与诊断'),
+            _buildServiceDiagGroup(context),
+            _buildSectionHeader(context, '关于'),
+            _buildAboutGroup(context),
+          ],
+        ),
+      );
+    }
+
+    // 桌面端：左侧 5 项清爽分类 + 右侧最大宽度 720px 分组卡
+    return Padding(
+      padding: const EdgeInsets.all(NeuSpace.lg),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          SizedBox(
+            width: 196,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                Text(
+                  '设置',
+                  style: Theme.of(context)
+                      .textTheme
+                      .headlineSmall
+                      ?.copyWith(fontWeight: FontWeight.w800),
+                ),
+                const SizedBox(height: 16),
+                for (final entry in const <(_SettingsSection, String, IconData)>[
+                  (_SettingsSection.general, '常规与节点', Icons.tune_rounded),
+                  (_SettingsSection.backup, '备份与容灾', Icons.cloud_sync_outlined),
+                  (
+                    _SettingsSection.webSecurity,
+                    'Web 访问与安全',
+                    Icons.shield_outlined
+                  ),
+                  (
+                    _SettingsSection.serviceDiag,
+                    '服务与诊断',
+                    Icons.dns_outlined
+                  ),
+                  (_SettingsSection.about, '关于', Icons.info_outline_rounded),
+                ])
+                  _DesktopSettingNavTile(
+                    label: entry.$2,
+                    icon: entry.$3,
+                    selected: _desktopSection == entry.$1,
+                    onTap: () => setState(() => _desktopSection = entry.$1),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(width: NeuSpace.lg),
+          Expanded(
+            child: SingleChildScrollView(
+              child: Align(
+                alignment: Alignment.topLeft,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 720),
+                  child: _buildDesktopSectionBody(context),
+                ),
+              ),
+            ),
+          ),
         ],
       ),
     );
   }
 
-  Widget _buildAboutSection(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    return NeuCard(
-      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: <Widget>[
-          const BrandLogoFull(height: 54),
-          const SizedBox(height: 14),
-          NeuStatusBadge(
-            label: 'EveryoneNAS v${LanVaultBridge.appVersion}',
-            tone: NeuStatusTone.accent,
-            showDot: false,
-          ),
-          const SizedBox(height: 14),
-          Text(
-            '局域网私有云 · 零知识加密 · 增量备份 · 数据自愈 · 跨端协同',
-            textAlign: TextAlign.center,
-            style: textTheme.bodyMedium?.copyWith(
-              color: NeuTokens.textSecondary,
+  Widget _buildDesktopSectionBody(BuildContext context) {
+    switch (_desktopSection) {
+      case _SettingsSection.general:
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            _buildSectionHeader(context, '常规与节点', topPadding: 0),
+            _buildGeneralGroup(context),
+          ],
+        );
+      case _SettingsSection.backup:
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            _buildSectionHeader(context, '备份与容灾', topPadding: 0),
+            _buildBackupGroup(context),
+          ],
+        );
+      case _SettingsSection.webSecurity:
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            _buildSectionHeader(context, 'Web 访问与安全', topPadding: 0),
+            _buildWebSecurityGroup(context),
+          ],
+        );
+      case _SettingsSection.serviceDiag:
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            _buildSectionHeader(context, '服务与诊断', topPadding: 0),
+            _buildServiceDiagGroup(context),
+          ],
+        );
+      case _SettingsSection.about:
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            _buildSectionHeader(context, '关于', topPadding: 0),
+            _buildAboutGroup(context),
+          ],
+        );
+    }
+  }
+
+  Widget _buildSectionHeader(
+    BuildContext context,
+    String title, {
+    double topPadding = 18,
+  }) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(6, topPadding, 6, 8),
+      child: Text(
+        title,
+        style: Theme.of(context).textTheme.labelLarge?.copyWith(
+              color: NeuTokens.accent,
+              fontWeight: FontWeight.w700,
+              fontSize: 13,
+            ),
+      ),
+    );
+  }
+
+  Widget _buildGeneralGroup(BuildContext context) {
+    return _SettingsGroupCard(
+      children: <Widget>[
+        _SettingsValueRow(
+          title: '节点运行模式',
+          subtitle: '决定本机作为备份端、存储端或双端运行',
+          value: _roleMode.label,
+          icon: Icons.unfold_more_rounded,
+          onTap: _pickRoleMode,
+        ),
+        _SettingsSwitchRow(
+          title: '断线自动重连',
+          subtitle: '局域网恢复后自动重连已配对设备',
+          value: _autoReconnect,
+          onChanged: (v) async {
+            final prev = _autoReconnect;
+            setState(() => _autoReconnect = v);
+            try {
+              await widget.bridge.enableAutoReconnect(v);
+            } catch (err) {
+              if (!mounted) return;
+              setState(() => _autoReconnect = prev);
+              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+            }
+          },
+        ),
+        _SettingsSwitchRow(
+          title: '随软件自动运行本地存储',
+          subtitle: '启动后后台常驻，无需每次手动开启',
+          value: _autostartServer,
+          onChanged: (v) async {
+            final prev = _autostartServer;
+            setState(() => _autostartServer = v);
+            try {
+              await widget.bridge.setAutostartServer(v);
+            } catch (err) {
+              if (!mounted) return;
+              setState(() => _autostartServer = prev);
+              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+            }
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _buildBackupGroup(BuildContext context) {
+    final speedText =
+        _policy.maxKbps > 0 ? '${_policy.maxKbps} KB/s' : '不限速';
+    final primaryText = (_storageConfig?.primaryDir.isNotEmpty ?? false)
+        ? _storageConfig!.primaryDir
+        : '默认目录';
+
+    return _SettingsGroupCard(
+      children: <Widget>[
+        _SettingsSwitchRow(
+          title: '仅 Wi-Fi 下执行同步',
+          subtitle: '避免消耗移动蜂窝流量',
+          value: _policy.wifiOnly,
+          onChanged: (v) => unawaited(
+            _savePolicyImmediate(
+              PowerNetworkPolicyModel(
+                wifiOnly: v,
+                allowedSsids: _policy.allowedSsids,
+                requireCharging: _policy.requireCharging,
+                maxKbps: _policy.maxKbps,
+              ),
             ),
           ),
-          const SizedBox(height: 20),
-          const Divider(height: 1),
-          const SizedBox(height: 8),
-          const NeuKeyValueRow(
-            label: '核心引擎',
-            value: 'Rust Native FFI (FastCDC + Zstd + BLAKE3)',
+        ),
+        _SettingsSwitchRow(
+          title: '仅充电时全速上传',
+          subtitle: '未充电时降低后台耗电',
+          value: _policy.requireCharging,
+          onChanged: (v) => unawaited(
+            _savePolicyImmediate(
+              PowerNetworkPolicyModel(
+                wifiOnly: _policy.wifiOnly,
+                allowedSsids: _policy.allowedSsids,
+                requireCharging: v,
+                maxKbps: _policy.maxKbps,
+              ),
+            ),
           ),
-          const NeuKeyValueRow(
-            label: '快照策略',
-            value: 'GFS 多级保留 (7日 / 4周 / 12月)',
+        ),
+        _SettingsValueRow(
+          title: '允许同步的家庭 Wi-Fi',
+          value: _policy.allowedSsids.isEmpty
+              ? '不限制'
+              : '${_policy.allowedSsids.length} 个网络',
+          icon: Icons.chevron_right_rounded,
+          onTap: _openAllowedWifiDialog,
+        ),
+        _SettingsValueRow(
+          title: '上传限速',
+          value: speedText,
+          icon: Icons.edit_outlined,
+          onTap: _editSpeedLimit,
+        ),
+        _SettingsValueRow(
+          title: '主 / 备异盘存储目录',
+          subtitle: primaryText,
+          value: '配置',
+          icon: Icons.chevron_right_rounded,
+          onTap: _openFailoverDirsDialog,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildWebSecurityGroup(BuildContext context) {
+    final port =
+        _overview?.serverPort ?? _lastServerConfig?.port ?? LanVaultBridge.defaultServerPort;
+    return _SettingsGroupCard(
+      children: <Widget>[
+        _SettingsValueRow(
+          title: '服务端口',
+          value: '$port',
+          icon: Icons.lan_outlined,
+          onTap: null,
+        ),
+        _SettingsSwitchRow(
+          title: 'Web 访问密码保护',
+          subtitle: '开启后，通过浏览器连接 Web 管理页需输入密码',
+          value: _webPasswordEnabled,
+          onChanged: (v) => unawaited(_toggleWebPassword(v)),
+        ),
+        _SettingsSwitchRow(
+          title: '数据完整性定期检查',
+          subtitle: '后台定期校验备份数据块并利用副本自愈',
+          value: _bitRotAutoScrub,
+          onChanged: (v) async {
+            final prev = _bitRotAutoScrub;
+            setState(() => _bitRotAutoScrub = v);
+            try {
+              await widget.bridge.setBitRotAutoScrub(v);
+            } catch (err) {
+              if (!mounted) return;
+              setState(() => _bitRotAutoScrub = prev);
+              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+            }
+          },
+        ),
+        _SettingsValueRow(
+          title: '主密钥加密备份',
+          subtitle: '导出加密主密钥，换机时可离线恢复数据',
+          value: '导出',
+          icon: Icons.chevron_right_rounded,
+          onTap: _openKeyBackupDialog,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAndroidPermissionsGroup(BuildContext context) {
+    return _SettingsGroupCard(
+      children: <Widget>[
+        _SettingsValueRow(
+          title: '所有文件访问权限',
+          subtitle: '用于读写自定义目录与存储池文件',
+          value: '去授权',
+          icon: Icons.chevron_right_rounded,
+          onTap: () async {
+            final ok = await widget.bridge.requestStoragePermission();
+            if (!mounted) return;
+            NeuToast.info(
+              this.context,
+              ok ? '已获得所有文件访问权限' : '请在系统设置中授予所有文件访问权限',
+            );
+          },
+        ),
+        _SettingsValueRow(
+          title: '通知权限',
+          subtitle: '保持后台服务常驻与传输进度提醒',
+          value: '去授权',
+          icon: Icons.chevron_right_rounded,
+          onTap: () async {
+            final ok = await widget.bridge.requestNotificationPermission();
+            if (!mounted) return;
+            NeuToast.info(
+              this.context,
+              ok ? '已获得通知权限' : '请在系统设置中允许通知权限',
+            );
+          },
+        ),
+        _SettingsValueRow(
+          title: '电池优化白名单',
+          subtitle: '防止锁屏后系统休眠中断局域网同步',
+          value: '去设置',
+          icon: Icons.chevron_right_rounded,
+          onTap: () async {
+            final ok = await widget.bridge.requestBatteryExemption();
+            if (!mounted) return;
+            NeuToast.info(
+              this.context,
+              ok ? '已加入电池优化白名单' : '请在系统电池设置中设为无限制',
+            );
+          },
+        ),
+        _SettingsValueRow(
+          title: 'Wi-Fi 定位权限',
+          subtitle: '用于识别当前连接的家庭 Wi-Fi 名称',
+          value: '去授权',
+          icon: Icons.chevron_right_rounded,
+          onTap: () async {
+            final ok = await widget.bridge.requestLocationPermission();
+            if (!mounted) return;
+            NeuToast.info(
+              this.context,
+              ok ? '已获得 Wi-Fi 定位权限' : '请在系统设置中授予位置权限',
+            );
+          },
+        ),
+      ],
+    );
+  }
+
+  Widget _buildServiceDiagGroup(BuildContext context) {
+    final running = _overview?.serverRunning ?? false;
+    final lanIp = _overview?.lanIp ?? '未获取';
+
+    return _SettingsGroupCard(
+      children: <Widget>[
+        _SettingsValueRow(
+          title: '本机局域网地址',
+          value: lanIp,
+          icon: Icons.wifi_rounded,
+          onTap: null,
+        ),
+        _SettingsValueRow(
+          title: '重启后台服务',
+          subtitle: running ? '当前运行中，异常时可优雅重启' : '当前未启动，点击尝试拉起',
+          value: _restarting ? '重启中…' : '重启',
+          icon: Icons.restart_alt_rounded,
+          onTap: _restarting ? null : _restartServer,
+        ),
+        _SettingsSwitchRow(
+          title: 'Debug 调试日志',
+          subtitle: '排查问题时开启，记录详细运行日志',
+          value: _debugMode,
+          onChanged: (v) async {
+            final prev = _debugMode;
+            setState(() => _debugMode = v);
+            try {
+              await widget.bridge.setDebugMode(v);
+            } catch (err) {
+              if (!mounted) return;
+              setState(() => _debugMode = prev);
+              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+            }
+          },
+        ),
+        _SettingsValueRow(
+          title: '查看调试日志',
+          subtitle: '查看或清空近期运行与探针日志',
+          value: '查看',
+          icon: Icons.chevron_right_rounded,
+          onTap: _openDebugLogsDialog,
+        ),
+        _SettingsValueRow(
+          title: '一键链路自检',
+          subtitle: '检测本地存储、网络端口与服务健康状态',
+          value: _runningDiag ? '检测中…' : '运行',
+          icon: Icons.chevron_right_rounded,
+          onTap: _runningDiag ? null : _runSelfDiag,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAboutGroup(BuildContext context) {
+    return _SettingsGroupCard(
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+          child: Row(
+            children: <Widget>[
+              const BrandLogoMark(size: 40),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      'EveryoneNAS',
+                      style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                            fontWeight: FontWeight.w800,
+                          ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      'v${LanVaultBridge.appVersion} · 局域网私有云与跨端备份',
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+              ),
+            ],
           ),
-          const NeuKeyValueRow(
-            label: '支持平台',
-            value: 'Windows 桌面端 & Android 移动端',
-          ),
+        ),
+        const _SettingsValueRow(
+          title: '支持平台',
+          value: 'Windows & Android',
+          icon: Icons.devices_rounded,
+          onTap: null,
+        ),
+        const _SettingsValueRow(
+          title: '安全架构',
+          value: '端到端零知识加密',
+          icon: Icons.verified_user_outlined,
+          onTap: null,
+        ),
+      ],
+    );
+  }
+}
+
+class _SettingsGroupCard extends StatelessWidget {
+  const _SettingsGroupCard({required this.children});
+
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    return NeuCard(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          for (var i = 0; i < children.length; i++) ...<Widget>[
+            children[i],
+            if (i < children.length - 1)
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 16),
+                child: Divider(height: 1),
+              ),
+          ],
         ],
       ),
     );
   }
 }
 
-class _SettingsMenuTile extends StatelessWidget {
-  const _SettingsMenuTile({
-    required this.section,
+class _SettingsSwitchRow extends StatelessWidget {
+  const _SettingsSwitchRow({
+    required this.title,
+    this.subtitle,
+    required this.value,
+    required this.onChanged,
+  });
+
+  final String title;
+  final String? subtitle;
+  final bool value;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      child: Row(
+        children: <Widget>[
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  title,
+                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.w600,
+                      ),
+                ),
+                if (subtitle != null && subtitle!.isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 3),
+                  Text(
+                    subtitle!,
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: NeuTokens.textSecondary,
+                        ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          Switch(value: value, onChanged: onChanged),
+        ],
+      ),
+    );
+  }
+}
+
+class _SettingsValueRow extends StatelessWidget {
+  const _SettingsValueRow({
+    required this.title,
+    this.subtitle,
+    required this.value,
+    required this.icon,
+    required this.onTap,
+  });
+
+  final String title;
+  final String? subtitle;
+  final String value;
+  final IconData icon;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
+        child: Row(
+          children: <Widget>[
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: <Widget>[
+                  Text(
+                    title,
+                    style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
+                  ),
+                  if (subtitle != null && subtitle!.isNotEmpty) ...<Widget>[
+                    const SizedBox(height: 3),
+                    Text(
+                      subtitle!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                            color: NeuTokens.textSecondary,
+                          ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 160),
+              child: Text(
+                value,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                      color: NeuTokens.textSecondary,
+                      fontWeight: FontWeight.w500,
+                    ),
+              ),
+            ),
+            if (onTap != null) ...<Widget>[
+              const SizedBox(width: 4),
+              Icon(icon, size: 17, color: NeuTokens.textSecondary),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _DesktopSettingNavTile extends StatelessWidget {
+  const _DesktopSettingNavTile({
+    required this.label,
+    required this.icon,
     required this.selected,
     required this.onTap,
   });
 
-  final _SettingsSection section;
+  final String label;
+  final IconData icon;
   final bool selected;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    return MouseRegion(
-      cursor: SystemMouseCursors.click,
-      child: GestureDetector(
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: InkWell(
         onTap: onTap,
-        child: AnimatedContainer(
-          duration: NeuMotion.resolveState(context),
+        borderRadius: const BorderRadius.all(Radius.circular(10)),
+        child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
           decoration: BoxDecoration(
             color: selected ? NeuTokens.accentSoft : Colors.transparent,
@@ -1290,58 +1290,24 @@ class _SettingsMenuTile extends StatelessWidget {
           child: Row(
             children: <Widget>[
               Icon(
-                section.icon,
+                icon,
                 size: 18,
                 color: selected ? NeuTokens.accent : NeuTokens.textSecondary,
               ),
               const SizedBox(width: 10),
               Text(
-                section.label,
+                label,
                 style: Theme.of(context).textTheme.labelLarge?.copyWith(
                       color:
                           selected ? NeuTokens.accent : NeuTokens.textPrimary,
-                      fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                      fontWeight:
+                          selected ? FontWeight.w700 : FontWeight.w500,
                     ),
               ),
             ],
           ),
         ),
       ),
-    );
-  }
-}
-
-class _SecurityRow extends StatelessWidget {
-  const _SecurityRow({
-    required this.title,
-    required this.subtitle,
-    required this.status,
-    required this.tone,
-  });
-
-  final String title;
-  final String subtitle;
-  final String status;
-  final NeuStatusTone tone;
-
-  @override
-  Widget build(BuildContext context) {
-    final textTheme = Theme.of(context).textTheme;
-    return Row(
-      children: <Widget>[
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: <Widget>[
-              Text(title, style: textTheme.titleSmall),
-              const SizedBox(height: 2),
-              Text(subtitle, style: textTheme.bodySmall),
-            ],
-          ),
-        ),
-        const SizedBox(width: 12),
-        NeuStatusBadge(label: status, tone: tone),
-      ],
     );
   }
 }

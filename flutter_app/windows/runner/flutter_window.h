@@ -25,6 +25,12 @@ class FlutterWindow : public Win32Window {
                          LPARAM const lparam) noexcept override;
 
  private:
+  // Applies caption-band metrics reported by the Flutter title bar.
+  void ApplyShortcutMetrics(const flutter::EncodableValue* arguments);
+
+  // Notifies the Flutter title bar about maximize/restore changes.
+  void NotifyMaximizeState(HWND window);
+
   // The project to run.
   flutter::DartProject project_;
 
@@ -33,6 +39,9 @@ class FlutterWindow : public Win32Window {
 
   // Native Win32 MethodChannel for fast COM file/folder dialogs without PowerShell.
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> keep_alive_channel_;
+
+  // Native window chrome channel (minimize / maximize / close / drag).
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> window_channel_;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

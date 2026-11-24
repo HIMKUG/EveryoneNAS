@@ -23,7 +23,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use lanvault_client::{
     reconcile_directory, ClipboardClient, DirectoryWatcher, PowerNetworkPolicy,
@@ -33,6 +33,7 @@ use lanvault_client::{
 use lanvault_core::{
     unpack_chunk, CHUNK_MAX_SIZE,
     blake3_hash, decrypt_aead, encrypt_aead, pairing_identity_message, pairing_response_message,
+    session_renew_message,
     parse_role_mode, verify_ed25519, Database, DeviceIdentity, DiscoveredPeerInfo,
     DiscoveryBrowser, PoolMode, RoleMode, SessionKeyExchange, SymmetricKey, SyncRuleRecord,
     TransferHistoryRecord, TrustedPeer, VolumeRole,
@@ -65,6 +66,16 @@ const SETTING_LAST_SERVER_CONFIG_JSON: &str = "last_server_config_json";
 const SETTING_SYNC_PAUSED: &str = "sync_paused";
 const SETTING_BIT_ROT_AUTO_SCRUB: &str = "bit_rot_auto_scrub";
 const SETTING_RULE_SCHEDULE_PREFIX: &str = "rule_schedule:";
+const SETTING_AUTOSTART_SERVER: &str = "autostart_server";
+/// 本地服务管理密码的加密副本，仅用于"启动时自动拉起服务 + 自动登录管理员会话"。
+const SETTING_SERVER_PASSWORD_ENC: &str = "server_web_password_protected";
+
+/// 已配对设备显式握手间隔。服务端租约为 45s，15s 握手留三次容错余量。
+const PEER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// 与 `lanvault-server` 的在线租约保持一致：超过这个时长没有成功握手即视为离线。
+const PEER_PRESENCE_LEASE_SECS: u64 = 45;
+/// 备份目录隔离子目录名：用户选择的目录下总是再建一层，避免与他人文件混放。
+pub const BACKUP_ISOLATION_DIR: &str = "everyonenasbackup";
 
 /// FFI DTO: mDNS / 局域网发现的对端设备。
 #[derive(Debug, Clone, Serialize)]
@@ -145,7 +156,9 @@ struct LifecycleState {
     watchers: Vec<DirectoryWatcher>,
     watcher_dispatch_task: Option<JoinHandle<()>>,
     reconnect_task: Option<JoinHandle<()>>,
+    addr_sync_task: Option<JoinHandle<()>>,
     reconnect_event_task: Option<JoinHandle<()>>,
+    heartbeat_task: Option<JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,17 +227,36 @@ struct FfiRuntimeState {
     policy: Arc<RwLock<PowerNetworkPolicy>>,
     rate_limiter: Arc<TokenBucket>,
     progress_tx: broadcast::Sender<SyncProgressEvent>,
-    latest_progress: Arc<Mutex<SyncProgressEvent>>,
+    latest_progress: Arc<Mutex<HashMap<String, SyncProgressEvent>>>,
     discovered_peers: Arc<Mutex<HashMap<String, DiscoveredPeer>>>,
+    /// `device_id -> 最近一次握手成功的时刻`。UI 的"在线"唯一来源：
+    /// 只有双方真的互相握过手，才会显示在线（不再用 mDNS 缓存或残留会话推断）。
+    peer_last_heartbeat: Arc<Mutex<HashMap<String, Instant>>>,
     mdns_browser_started: Mutex<bool>,
     active_peer: Arc<RwLock<Option<ActivePeerSession>>>,
     environment: Arc<RwLock<DeviceEnvironment>>,
     sync_inflight: Arc<AsyncMutex<HashSet<String>>>,
+    sync_engine_cache: AsyncMutex<Option<(String, Arc<SyncEngine>)>>,
+    fast_backup_mode: AtomicBool,
 }
 
 static GLOBAL_STATE: OnceLock<Arc<FfiRuntimeState>> = OnceLock::new();
 static INIT_LOCK: Mutex<()> = Mutex::new(());
 static DAEMON_MODE: AtomicBool = AtomicBool::new(false);
+
+impl FfiRuntimeState {
+    /// 本机服务端当前监听端口（未启动时回退到最近一次配置的端口），
+    /// 用于握手时告知对端"到我这个端口来连"，使对端的地址簿在 DHCP 变更后自愈。
+    async fn own_server_port(&self) -> Option<u16> {
+        let life = self.lifecycle.lock().await;
+        if let Some(handle) = life.server_handle.as_ref() {
+            if !handle.task.is_finished() {
+                return Some(handle.port);
+            }
+        }
+        life.last_server_config.as_ref().map(|cfg| cfg.port)
+    }
+}
 
 fn client_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LANVAULT_DATA_DIR") {
@@ -339,33 +371,9 @@ fn load_persisted_policy(db: &Database) -> Result<PowerNetworkPolicy> {
 }
 
 fn default_sync_dirs() -> Vec<(&'static str, PathBuf)> {
-    #[cfg(target_os = "android")]
-    {
-        vec![
-            ("rule-photos", PathBuf::from("/storage/emulated/0/DCIM")),
-            ("rule-docs", PathBuf::from("/storage/emulated/0/Documents")),
-        ]
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let home = std::env::var("USERPROFILE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(r"C:\Users\Public"));
-        vec![
-            ("rule-photos", home.join("Pictures")),
-            ("rule-docs", home.join("Documents")),
-        ]
-    }
-    #[cfg(not(any(target_os = "android", target_os = "windows")))]
-    {
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"));
-        vec![
-            ("rule-photos", home.join("Pictures")),
-            ("rule-docs", home.join("Documents")),
-        ]
-    }
+    // 默认不选择任何文件夹：备份范围必须由用户显式指定，
+    // 避免首次启动就把 图片/文档 目录整体上传到局域网存储端。
+    Vec::new()
 }
 
 fn ensure_default_sync_rules(db: &Database, policy: &PowerNetworkPolicy) -> Result<()> {
@@ -388,6 +396,21 @@ fn ensure_default_sync_rules(db: &Database, policy: &PowerNetworkPolicy) -> Resu
             max_kbps: policy.max_kbps,
             enabled: true,
         })?;
+    }
+    // 旧版本留下的"自动替你选好图片/文档"的默认规则必须收回，否则老用户升级后
+    // 仍然会在未授权的情况下备份整目录。
+    for legacy_rule_id in ["rule-photos", "rule-docs"] {
+        if let Ok(Some(rule)) = db.get_sync_rule(legacy_rule_id) {
+            let isolated = Path::new(&rule.local_dir).join(BACKUP_ISOLATION_DIR);
+            if rule.target_vault_id == "default" && !isolated.exists() {
+                db.delete_sync_rule(legacy_rule_id)?;
+                info!(
+                    rule_id = legacy_rule_id,
+                    dir = %rule.local_dir,
+                    "removed legacy auto-selected backup rule"
+                );
+            }
+        }
     }
     db.set_setting(SETTING_DEFAULTS_INITIALIZED, "1")?;
     Ok(())
@@ -433,6 +456,12 @@ fn load_persisted_peer(
         channel_key: SymmetricKey::from_bytes(key_arr),
         default_vault_id: persisted.default_vault_id,
     }))
+}
+
+/// 清除持久化的活跃对端会话（配对被对端撤销或本地解绑后调用）。
+fn clear_persisted_peer(db: &Database) -> Result<()> {
+    db.set_setting(SETTING_ACTIVE_PEER_JSON, "")?;
+    Ok(())
 }
 
 fn save_persisted_peer(
@@ -495,6 +524,288 @@ fn stop_client_background_tasks(life: &mut LifecycleState) {
     }
     if let Some(t) = life.reconnect_event_task.take() {
         t.abort();
+    }
+    if let Some(t) = life.heartbeat_task.take() {
+        t.abort();
+    }
+}
+
+/// 已配对设备的显式双向握手循环。
+///
+/// 每 15s 向对端 `POST /api/peers/heartbeat`（携带 `lv_session` Cookie）。对端据此续期
+/// 在线租约并回传它看到的在线设备集合；本端同时刷新 `active_peer` 的 IP/端口（DHCP、
+/// 路由器重启后 IP 变化可自愈）。这是"手机端显示电脑在线"的唯一凭据——
+/// 没有握手成功，就没有在线。
+fn spawn_peer_heartbeat_task(
+    state: &Arc<FfiRuntimeState>,
+    peer: ActivePeerSession,
+) -> JoinHandle<()> {
+    let state_for_task = Arc::clone(state);
+    state.runtime.spawn(async move {
+        let mut interval = tokio::time::interval(PEER_HEARTBEAT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let current = state_for_task.active_peer.read().await.clone();
+            let Some(current) = current else {
+                // 配对已被解除，握手循环自然结束。
+                break;
+            };
+            if current.device_id != peer.device_id {
+                break;
+            }
+
+            let Some(cookie) = current.session_cookie.clone() else {
+                continue;
+            };
+            let url = format!("{}/api/peers/heartbeat", current.endpoint_base_url);
+            let result = state_for_task
+                .http_client
+                .post(&url)
+                .header("Cookie", format!("lv_session={cookie}"))
+                .json(&serde_json::json!({
+                    "last_port": state_for_task.own_server_port().await,
+                }))
+                .send()
+                .await;
+
+            match result {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: HeartbeatAck = match resp.json().await {
+                        Ok(body) => body,
+                        Err(err) => {
+                            warn!(peer = %current.device_id, "peer heartbeat response invalid JSON: {err}");
+                            continue;
+                        }
+                    };
+                    handle_heartbeat_ack(&state_for_task, &current, body).await;
+                }
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    if status == 401 || status == 403 {
+                        // 服务端重启后内存会话失效，并不代表配对被撤销。先用设备私钥
+                        // 换发新会话，成功了就继续心跳；只有续期也被拒绝时才认定被解绑。
+                        match renew_peer_session(&state_for_task, &current).await {
+                            Ok(_) => {
+                                info!(peer = %current.device_id, "peer session renewed after 401");
+                                continue;
+                            }
+                            Err(err) => {
+                                warn!(
+                                    peer = %current.device_id,
+                                    "peer session renewal rejected ({err:#}); dropping stale pairing"
+                                );
+                                abandon_peer_session(&state_for_task, &current.device_id).await;
+                                break;
+                            }
+                        }
+                    }
+                    warn!(peer = %current.device_id, status, "peer heartbeat rejected");
+                }
+                Err(err) => {
+                    debug!(peer = %current.device_id, "peer heartbeat failed: {err}");
+                }
+            }
+        }
+    })
+}
+
+#[derive(Deserialize)]
+struct HeartbeatAck {
+    #[serde(default)]
+    self_device_id: String,
+    #[serde(default)]
+    peers: Vec<HeartbeatPeer>,
+}
+
+#[derive(Deserialize)]
+struct HeartbeatPeer {
+    device_id: String,
+    #[serde(default)]
+    device_name: String,
+    #[serde(default)]
+    os_type: String,
+    #[serde(default)]
+    ip: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+}
+
+/// 应用对端握手回执：把对端权威的在线视图写回本地 `client_state.db`，
+/// 并校正 `active_peer` 的地址，保证两端状态机看到同一份事实。
+async fn handle_heartbeat_ack(
+    state: &Arc<FfiRuntimeState>,
+    current: &ActivePeerSession,
+    ack: HeartbeatAck,
+) {
+    if ack.self_device_id.is_empty() {
+        return;
+    }
+    // 记录一次成功的双向握手：这是 UI 判定"对端在线"的唯一依据。
+    if let Ok(mut guard) = state.peer_last_heartbeat.lock() {
+        guard.insert(current.device_id.clone(), Instant::now());
+    }
+    // 注意：ack.peers 中 device_id == state.client_device_id 的条目记录的是“客户端自身地址”，
+    // 绝不能用客户端自身 IP/Port 覆盖远端 active_peer.addr，否则双端模式下 15s 心跳后会把后续上传打向本机。
+
+    // 对端把我们解绑时不再回传本设备条目；此时只保留本地记录（用户可手动在 UI 解绑），
+    // 绝不在网络抖动时静默删除合法配对。
+    for peer in ack.peers {
+        if peer.device_id == state.client_device_id {
+            continue;
+        }
+        let Some(existing) = state.client_db.get_trusted_peer(&peer.device_id).ok().flatten() else {
+            continue;
+        };
+        let device_name = if peer.device_name.trim().is_empty() {
+            existing.device_name.clone()
+        } else {
+            peer.device_name
+        };
+        let os_type = if peer.os_type.trim().is_empty() {
+            existing.os_type.clone()
+        } else {
+            peer.os_type
+        };
+        let updated = TrustedPeer {
+            device_id: existing.device_id,
+            device_name,
+            os_type,
+            ed25519_pubkey: existing.ed25519_pubkey,
+            last_ip: peer.ip.or(existing.last_ip),
+            last_port: peer.port.or(existing.last_port),
+            auto_connect: existing.auto_connect,
+            paired_at: existing.paired_at,
+            revoked_at: existing.revoked_at,
+        };
+        if let Err(err) = state.client_db.upsert_trusted_peer(&updated) {
+            warn!(peer = %updated.device_id, "failed to persist peer heartbeat metadata: {err}");
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionRenewChallengeResp {
+    challenge: String,
+    server_device_id: String,
+}
+
+/// 拒绝从加密通道（https/wss）无声降级为明文（http/ws）。
+#[allow(dead_code)]
+fn validate_no_scheme_downgrade(previous_url: &str, next_url: &str) -> Result<()> {
+    let prev_secure = previous_url.starts_with("https://") || previous_url.starts_with("wss://");
+    let next_secure = next_url.starts_with("https://") || next_url.starts_with("wss://");
+    if prev_secure && !next_secure {
+        bail!(
+            "refusing silent transport downgrade from `{previous_url}` to `{next_url}`"
+        );
+    }
+    Ok(())
+}
+
+/// 用本机设备私钥向对端换发新的 `lv_session`，并把新 Cookie 写回活跃会话。
+async fn renew_peer_session(
+    state: &Arc<FfiRuntimeState>,
+    current: &ActivePeerSession,
+) -> Result<ActivePeerSession> {
+    let challenge_url = format!("{}/api/peers/session/challenge", current.endpoint_base_url);
+    let challenge_resp = state
+        .http_client
+        .post(&challenge_url)
+        .json(&serde_json::json!({
+            "device_id": state.client_device_id,
+        }))
+        .send()
+        .await
+        .with_context(|| format!("session renewal challenge request to {challenge_url} failed"))?;
+    if !challenge_resp.status().is_success() {
+        bail!(
+            "session renewal challenge rejected with HTTP {}",
+            challenge_resp.status().as_u16()
+        );
+    }
+    let challenge_body: SessionRenewChallengeResp = challenge_resp
+        .json()
+        .await
+        .context("invalid session renewal challenge JSON")?;
+    if challenge_body.challenge.trim().is_empty() {
+        bail!("session renewal challenge was empty");
+    }
+    if challenge_body.server_device_id != current.device_id {
+        bail!(
+            "session renewal server_device_id mismatch: expected `{}`, got `{}`",
+            current.device_id,
+            challenge_body.server_device_id
+        );
+    }
+
+    let message = session_renew_message(
+        &challenge_body.server_device_id,
+        &state.client_device_id,
+        challenge_body.challenge.trim(),
+    );
+    let signature = state.client_identity.sign(&message);
+    let url = format!("{}/api/peers/session", current.endpoint_base_url);
+    let resp = state
+        .http_client
+        .post(&url)
+        .json(&serde_json::json!({
+            "device_id": state.client_device_id,
+            "client_ed25519_pubkey_hex": hex::encode(state.client_identity.public_key_bytes()),
+            "client_ed25519_signature_hex": hex::encode(signature),
+            "nonce": challenge_body.challenge.trim(),
+        }))
+        .send()
+        .await
+        .with_context(|| format!("session renewal request to {url} failed"))?;
+
+    if !resp.status().is_success() {
+        bail!(
+            "session renewal rejected with HTTP {}",
+            resp.status().as_u16()
+        );
+    }
+    let body: SessionRenewAck = resp
+        .json()
+        .await
+        .context("invalid session renewal response JSON")?;
+    let cookie = body
+        .session_cookie
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| anyhow!("session renewal response missing session cookie"))?;
+
+    let mut refreshed_out = current.clone();
+    refreshed_out.session_cookie = Some(cookie.clone());
+    let mut guard = state.active_peer.write().await;
+    if let Some(session) = guard.as_mut() {
+        if session.device_id == current.device_id {
+            session.session_cookie = Some(cookie);
+            refreshed_out = session.clone();
+            save_persisted_peer(
+                &state.client_db,
+                &refreshed_out,
+                &state.client_identity.derive_local_storage_key("client-state"),
+            )?;
+        }
+    }
+    Ok(refreshed_out)
+}
+
+#[derive(Deserialize)]
+struct SessionRenewAck {
+    #[serde(default)]
+    session_cookie: Option<String>,
+}
+
+/// 对端已撤销本设备会话：清空活跃会话与持久化记录，避免继续向死会话上传。
+async fn abandon_peer_session(state: &Arc<FfiRuntimeState>, device_id: &str) {
+    let mut guard = state.active_peer.write().await;
+    if guard.as_ref().is_some_and(|peer| peer.device_id == device_id) {
+        *guard = None;
+        if let Err(err) = clear_persisted_peer(&state.client_db) {
+            warn!("failed to clear persisted peer session: {err}");
+        }
+        info!(peer = %device_id, "active peer session abandoned after remote revocation");
     }
 }
 
@@ -559,9 +870,25 @@ fn start_client_background_tasks(
     }
 
     if let Some(peer) = active_peer {
+        life.heartbeat_task = Some(spawn_peer_heartbeat_task(state, peer.clone()));
+        let dynamic_addr = Arc::new(std::sync::RwLock::new(peer.addr));
+        let addr_sync_state = Arc::clone(state);
+        let addr_sync_target = Arc::clone(&dynamic_addr);
+        life.addr_sync_task = Some(state.runtime.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                if let Some(active) = addr_sync_state.active_peer.read().await.as_ref() {
+                    if let Ok(mut g) = addr_sync_target.write() {
+                        *g = active.addr;
+                    }
+                }
+            }
+        }));
         life.reconnect_task = Some(state.reconnect.spawn_peer_loop(ReconnectTarget {
             device_id: peer.device_id,
             addr: peer.addr,
+            dynamic_addr: Some(dynamic_addr),
         }));
         let mut rx = state.reconnect.subscribe();
         let db = Arc::clone(&state.client_db);
@@ -714,14 +1041,17 @@ fn runtime_state_with_mode(explicit_daemon: bool) -> Result<Arc<FfiRuntimeState>
             watchers: Vec::new(),
             watcher_dispatch_task: None,
             reconnect_task: None,
+            addr_sync_task: None,
             reconnect_event_task: None,
+            heartbeat_task: None,
         }),
         reconnect: ReconnectController::new(reconnect_enabled),
         policy: Arc::new(RwLock::new(persisted_policy)),
         rate_limiter,
         progress_tx,
-        latest_progress: Arc::new(Mutex::new(SyncProgressEvent::default())),
+        latest_progress: Arc::new(Mutex::new(HashMap::new())),
         discovered_peers: Arc::new(Mutex::new(HashMap::new())),
+        peer_last_heartbeat: Arc::new(Mutex::new(HashMap::new())),
         mdns_browser_started: Mutex::new(false),
         active_peer: Arc::new(RwLock::new(persisted_peer.clone())),
         environment: Arc::new(RwLock::new(DeviceEnvironment {
@@ -730,6 +1060,8 @@ fn runtime_state_with_mode(explicit_daemon: bool) -> Result<Arc<FfiRuntimeState>
             is_charging: !cfg!(target_os = "android"),
         })),
         sync_inflight: Arc::new(AsyncMutex::new(HashSet::new())),
+        sync_engine_cache: AsyncMutex::new(None),
+        fast_backup_mode: AtomicBool::new(false),
     });
 
     if !daemon_mode && persisted_role != RoleMode::ServerOnly {
@@ -742,6 +1074,16 @@ fn runtime_state_with_mode(explicit_daemon: bool) -> Result<Arc<FfiRuntimeState>
             .get()
             .cloned()
             .ok_or_else(|| anyhow!("FFI runtime state initialization race"));
+    }
+
+    // 首次配置之后（存在 last_server_config + 加密密码）自动拉起存储服务，
+    // 用户不需要每次打开软件再手动点一次"启动"。失败只记日志，不影响客户端能力。
+    if !daemon_mode && persisted_role != RoleMode::ClientOnly {
+        match state.runtime.block_on(autostart_local_server()) {
+            Ok(Some(port)) => info!(port, "storage service restored automatically on startup"),
+            Ok(None) => {}
+            Err(err) => warn!("autostart local storage server skipped: {err:#}"),
+        }
     }
     Ok(state)
 }
@@ -764,7 +1106,7 @@ fn read_bit_rot_health_from_db(db_path: &Path) -> (String, u64) {
     if !db_path.exists() {
         return ("unknown".to_string(), 0);
     }
-    let Ok(db) = Database::open(db_path) else {
+    let Ok(db) = Database::shared(db_path) else {
         return ("unknown".to_string(), 0);
     };
     let Ok(corrupted_chunks) = db.count_corrupted_chunks() else {
@@ -813,13 +1155,79 @@ fn emit_progress(state: &FfiRuntimeState, mut event: SyncProgressEvent) {
     event.bit_rot_health = bit_rot_health;
     event.corrupted_chunks = corrupted_chunks;
     match state.latest_progress.lock() {
-        Ok(mut guard) => *guard = event.clone(),
+        Ok(mut guard) => {
+            guard.insert(event.rule_id.clone(), event.clone());
+        }
         Err(_) => error!("internal lock poisoned while updating latest_progress"),
     }
     let _ = state.progress_tx.send(event);
 }
 
+/// 把各规则的最新进度聚合成一个对外视图。
+///
+/// - 只要有规则处于传输态，就返回那个规则（并累加所有规则的已处理字节，速度取传输态的值），
+///   这样"正在传输"绝不会被另一条规则的空闲/完成事件顶掉成 `0 B`。
+/// - 全部空闲时返回最近一次事件，保证 UI 仍能显示"已完成 / 已是最新"。
+fn aggregate_latest_progress(state: &FfiRuntimeState) -> Result<SyncProgressEvent> {
+    let entries: Vec<SyncProgressEvent> = {
+        let guard = state
+            .latest_progress
+            .lock()
+            .map_err(|_| anyhow!("internal lock poisoned"))?;
+        guard.values().cloned().collect()
+    };
+    let is_active = |status: &str| {
+        let lower = status.to_ascii_lowercase();
+        lower.starts_with("sync") || lower.starts_with("upload") || lower == "scanning"
+    };
+
+    let active: Vec<SyncProgressEvent> = entries
+        .iter()
+        .filter(|event| is_active(&event.status))
+        .cloned()
+        .collect();
+
+    let picked = if !active.is_empty() {
+        // 以"已传输最多"的那条规则作为主视图：并发时另一条规则可能刚进入 scanning
+        // (0 字节)，若按 HashMap 任意顺序取第一条，界面又会回到 `0 B`。
+        let mut merged = active
+            .iter()
+            .max_by_key(|event| event.bytes_processed)
+            .cloned()
+            .unwrap_or_default();
+        merged.bytes_processed = active.iter().map(|e| e.bytes_processed).sum();
+        merged.total_bytes = active
+            .iter()
+            .filter(|e| e.total_bytes > 0)
+            .map(|e| e.total_bytes)
+            .sum();
+        merged.chunks_uploaded = active.iter().map(|e| e.chunks_uploaded).sum();
+        merged.chunks_deduplicated = active.iter().map(|e| e.chunks_deduplicated).sum();
+        merged.throughput_bps = active.iter().map(|e| e.throughput_bps).sum();
+        // 只要有规则在真正传数据，就不要让"正在扫描"盖掉传输状态。
+        if let Some(uploading) = active.iter().find(|e| {
+            let lower = e.status.to_ascii_lowercase();
+            lower.starts_with("sync") || lower.starts_with("upload")
+        }) {
+            merged.status = uploading.status.clone();
+        }
+        merged
+    } else {
+        entries
+            .into_iter()
+            .max_by_key(|event| event.bytes_processed)
+            .unwrap_or_default()
+    };
+
+    let mut picked = picked;
+    let (bit_rot_health, corrupted_chunks) = query_local_bit_rot_health(state);
+    picked.bit_rot_health = bit_rot_health;
+    picked.corrupted_chunks = corrupted_chunks;
+    Ok(picked)
+}
+
 async fn stop_local_server_gracefully(lifecycle: &mut LifecycleState) -> Result<()> {
+    // 先清缓存：服务端一停，内存会话表随之销毁，缓存 Cookie 已经无意义。
     lifecycle.local_admin_cookie = None;
     if let Some(mut handle) = lifecycle.server_handle.take() {
         let _ = handle.stop_tx.send(true);
@@ -836,7 +1244,7 @@ async fn stop_local_server_gracefully(lifecycle: &mut LifecycleState) -> Result<
         }
 
         if handle.db_path.exists() {
-            let db = Database::open(&handle.db_path).with_context(|| {
+            let db = Database::shared(&handle.db_path).with_context(|| {
                 format!("failed to open SQLite at {}", handle.db_path.display())
             })?;
             db.wal_checkpoint_truncate()
@@ -855,15 +1263,7 @@ async fn stop_local_server_gracefully(lifecycle: &mut LifecycleState) -> Result<
 /// 供 `c_abi` 轮询获取最新一次同步进度事件。
 pub(crate) fn latest_sync_progress() -> Result<SyncProgressEvent> {
     let state = runtime_state()?;
-    let mut snapshot = state
-        .latest_progress
-        .lock()
-        .map_err(|_| anyhow!("internal lock poisoned"))?
-        .clone();
-    let (bit_rot_health, corrupted_chunks) = query_local_bit_rot_health(&state);
-    snapshot.bit_rot_health = bit_rot_health;
-    snapshot.corrupted_chunks = corrupted_chunks;
-    Ok(snapshot)
+    aggregate_latest_progress(&state)
 }
 
 const MAX_DISCOVERED_PEERS: usize = 256;
@@ -1149,6 +1549,10 @@ async fn finalize_paired_peer(
             .derive_local_storage_key("client-state"),
     )?;
     *state.active_peer.write().await = Some(session.clone());
+    // 配对成功的瞬间即视为一次握手：两端状态机从这一刻起就一致。
+    if let Ok(mut guard) = state.peer_last_heartbeat.lock() {
+        guard.insert(session.device_id.clone(), Instant::now());
+    }
 
     let mut life = state.lifecycle.lock().await;
     start_client_background_tasks(state, &mut life, Some(session));
@@ -1631,6 +2035,25 @@ async fn start_local_server_internal(
         .client_db
         .set_setting(SETTING_LAST_SERVER_CONFIG_JSON, &persisted_json)?;
 
+    // 记住"这台机器已经配置过存储服务"，并把管理密码加密留档：
+    // 之后每次启动都据此自动拉起服务，用户不需要再手动点一次"启动"。
+    const AUTOSTART_AAD: &[u8] = b"lanvault.local.server-password.v1";
+    let protection_key = state
+        .client_identity
+        .derive_local_storage_key("client-state");
+    let encrypted_password =
+        encrypt_setting(trimmed_password.as_bytes(), &protection_key, AUTOSTART_AAD)?;
+    state
+        .client_db
+        .set_setting(SETTING_SERVER_PASSWORD_ENC, &encrypted_password)?;
+    if state
+        .client_db
+        .get_setting(SETTING_AUTOSTART_SERVER)?
+        .is_none()
+    {
+        state.client_db.set_setting(SETTING_AUTOSTART_SERVER, "1")?;
+    }
+
     info!(
         port = actual_port,
         quota_gb,
@@ -1654,6 +2077,105 @@ pub async fn prepare_graceful_restart() -> Result<()> {
     let state = runtime_state()?;
     let mut life = state.lifecycle.lock().await;
     stop_local_server_gracefully(&mut life).await
+}
+
+/// 启动时自动拉起上次配置好的本地存储服务。
+///
+/// 只在"这台机器已完成过一次配置"时动作（`last_server_config` + 加密留档的密码都在），
+/// 因此新装用户不会莫名多出一个监听端口，而老用户每次打开软件都能直接处于存储服务在线状态。
+/// 返回自动启动后的端口；未满足条件时返回 `None`。
+pub async fn autostart_local_server() -> Result<Option<u16>> {
+    let state = runtime_state()?;
+
+    {
+        let autostart = state
+            .client_db
+            .get_setting(SETTING_AUTOSTART_SERVER)?
+            .as_deref()
+            != Some("0");
+        if !autostart {
+            return Ok(None);
+        }
+        let life = state.lifecycle.lock().await;
+        if life.role_mode == RoleMode::ClientOnly {
+            return Ok(None);
+        }
+        if let Some(handle) = life.server_handle.as_ref() {
+            if !handle.task.is_finished() {
+                return Ok(Some(handle.port));
+            }
+        }
+    }
+
+    let Some(raw) = state
+        .client_db
+        .get_setting(SETTING_LAST_SERVER_CONFIG_JSON)?
+    else {
+        return Ok(None);
+    };
+    let cfg: LastServerConfigDto =
+        serde_json::from_str(&raw).context("invalid persisted last_server_config_json")?;
+    if !Path::new(&cfg.vault_path).is_dir() {
+        warn!(
+            vault = %cfg.vault_path,
+            "autostart skipped: previous vault path is no longer reachable"
+        );
+        return Ok(None);
+    }
+
+    const AUTOSTART_AAD: &[u8] = b"lanvault.local.server-password.v1";
+    let protection_key = state
+        .client_identity
+        .derive_local_storage_key("client-state");
+    let Some(encrypted) = state
+        .client_db
+        .get_setting(SETTING_SERVER_PASSWORD_ENC)?
+    else {
+        return Ok(None);
+    };
+    let password_bytes = decrypt_setting(&encrypted, &protection_key, AUTOSTART_AAD)?;
+    let password = String::from_utf8(password_bytes)
+        .context("persisted server password is not valid UTF-8")?;
+
+    match start_local_server_with_port(
+        cfg.vault_path.clone(),
+        cfg.quota_gb,
+        password,
+        Some(cfg.port),
+    )
+    .await
+    {
+        Ok(port) => {
+            info!(port, "local storage server autostarted from previous configuration");
+            Ok(Some(port))
+        }
+        Err(err) => {
+            // 自动启动失败不能阻塞 UI：日志留痕，用户在"存储"页仍可手动启动。
+            warn!(error = %err, "local storage server autostart failed");
+            Ok(None)
+        }
+    }
+}
+
+/// 读取"启动时自动开启存储服务"开关。
+pub async fn get_autostart_server() -> Result<bool> {
+    let state = runtime_state()?;
+    Ok(state
+        .client_db
+        .get_setting(SETTING_AUTOSTART_SERVER)?
+        .as_deref()
+        != Some("0"))
+}
+
+/// 设置"启动时自动开启存储服务"开关。
+pub async fn set_autostart_server(enabled: bool) -> Result<bool> {
+    let state = runtime_state()?;
+    state.client_db.set_setting(
+        SETTING_AUTOSTART_SERVER,
+        if enabled { "1" } else { "0" },
+    )?;
+    info!(enabled, "autostart local storage server preference updated");
+    Ok(enabled)
 }
 
 /// 6. 订阅实时同步进度事件流。
@@ -1695,11 +2217,13 @@ pub async fn trigger_incremental_scan(rule_id: String) -> Result<()> {
     let result = trigger_incremental_scan_inner(rule_id.clone()).await;
     state.sync_inflight.lock().await.remove(&rule_id);
     if let Err(err) = &result {
-        let previous = state
-            .latest_progress
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+        let previous = {
+            let guard = state
+                .latest_progress
+                .lock()
+                .map_err(|_| anyhow!("internal lock poisoned"))?;
+            guard.get(&rule_id).cloned().unwrap_or_default()
+        };
         emit_progress(
             &state,
             SyncProgressEvent {
@@ -1799,15 +2323,44 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
 
     let policy = state.policy.read().await.clone();
     let environment = state.environment.read().await.clone();
-    let engine = SyncEngine::new(
-        peer.endpoint_base_url.clone(),
-        peer.session_cookie.clone(),
-        state.client_device_id.clone(),
-        state.vault_master_key.read().await.clone(),
-        policy,
-        environment,
-        Some(Arc::clone(&state.rate_limiter)),
-    )?;
+    let engine = {
+        let mut cache = state.sync_engine_cache.lock().await;
+        if let Some((cached_url, existing)) = cache.as_ref() {
+            if cached_url == &peer.endpoint_base_url {
+                existing.update_session_cookie(peer.session_cookie.clone()).await;
+                existing.update_policy(policy.clone()).await;
+                existing.update_environment(environment.clone()).await;
+                existing.set_fast_mode(state.fast_backup_mode.load(Ordering::Relaxed));
+                Arc::clone(existing)
+            } else {
+                let created = Arc::new(SyncEngine::new(
+                    peer.endpoint_base_url.clone(),
+                    peer.session_cookie.clone(),
+                    state.client_device_id.clone(),
+                    state.vault_master_key.read().await.clone(),
+                    policy.clone(),
+                    environment.clone(),
+                    Some(Arc::clone(&state.rate_limiter)),
+                )?);
+                created.set_fast_mode(state.fast_backup_mode.load(Ordering::Relaxed));
+                *cache = Some((peer.endpoint_base_url.clone(), Arc::clone(&created)));
+                created
+            }
+        } else {
+            let created = Arc::new(SyncEngine::new(
+                peer.endpoint_base_url.clone(),
+                peer.session_cookie.clone(),
+                state.client_device_id.clone(),
+                state.vault_master_key.read().await.clone(),
+                policy.clone(),
+                environment.clone(),
+                Some(Arc::clone(&state.rate_limiter)),
+            )?);
+            created.set_fast_mode(state.fast_backup_mode.load(Ordering::Relaxed));
+            *cache = Some((peer.endpoint_base_url.clone(), Arc::clone(&created)));
+            created
+        }
+    };
 
     let mut engine_rx = engine.subscribe_progress();
     let forward_state = Arc::clone(&state);
@@ -1828,9 +2381,20 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
         }
     });
 
-    let sync_result = engine
+    let mut sync_result = engine
         .sync_diff(&state.client_db, &rule_id, &resolved_vault_id, &diff)
         .await;
+    if matches!(
+        sync_result,
+        Err(lanvault_client::ClientError::RemoteRejected { status: 401, .. })
+    ) {
+        if let Ok(renewed) = renew_peer_session(&state, &peer).await {
+            engine.update_session_cookie(renewed.session_cookie).await;
+            sync_result = engine
+                .sync_diff(&state.client_db, &rule_id, &resolved_vault_id, &diff)
+                .await;
+        }
+    }
     forwarder.abort();
     let summary = sync_result?;
 
@@ -2031,7 +2595,7 @@ pub async fn push_clipboard_text(target_device_id: Option<String>, text: String)
         now_ts,
     );
     info!(
-        delivered_to = resp.delivered_to,
+        delivered_to = 1usize,
         peer = %peer.device_id,
         "clipboard text pushed via encrypted channel"
     );
@@ -2299,10 +2863,38 @@ pub struct PairedPeerDto {
 }
 
 /// FFI DTO: 主备份文件夹与备用备份文件夹配置（跨盘符冗余）。
+///
+/// `primary_dir` / `fallback_dir` 是**用户选择的目录**（UI 直接展示、可编辑）；
+/// `primary_root` / `fallback_root` 是后端在该目录下自动创建的隔离子目录
+/// `<所选目录>/everyonenasbackup`，所有备份产物只写进它，绝不与用户自己的文件混放。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupStorageConfigDto {
     pub primary_dir: String,
+    #[serde(default)]
+    pub primary_root: String,
     pub fallback_dir: Option<String>,
+    #[serde(default)]
+    pub fallback_root: Option<String>,
+}
+
+/// 把用户选择的目录规范化成隔离后的备份根：`<selected>/everyonenasbackup`。
+fn backup_isolation_root(selected: &str) -> PathBuf {
+    let trimmed = selected.trim().trim_end_matches(['/', '\\']);
+    let base = if trimmed.is_empty() {
+        PathBuf::from(selected.trim())
+    } else {
+        PathBuf::from(trimmed)
+    };
+    // 用户可能直接选到隔离目录本身，此时不要重复嵌套。
+    if base
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case(BACKUP_ISOLATION_DIR))
+    {
+        base
+    } else {
+        base.join(BACKUP_ISOLATION_DIR)
+    }
 }
 
 fn normalized_drive_key(raw_path: &str) -> Option<String> {
@@ -2357,50 +2949,95 @@ fn normalized_drive_key(raw_path: &str) -> Option<String> {
 }
 
 /// 20. 列出已配对设备（优先展示持久化可信列表中的真实设备名与系统类型，并合并去重当前活跃会话）。
+///
+/// 关键修正：一次配对会**同时**写两端各自的一份记录，但本机如果同时是服务端，
+/// 对端是"在它的服务端库里"登记本机的，本机 `client_state.db` 里可能还没有对端条目。
+/// 因此这里把「本机服务端 index.db 的可信列表」和「本机客户端 client_state.db」的列表
+/// 取并集，再用握手术语判定在线，避免出现"手机端显示电脑在线、电脑端没有这台手机"。
 pub async fn list_paired_peers() -> Result<Vec<PairedPeerDto>> {
     let state = runtime_state()?;
     let active = state.active_peer.read().await.clone();
-    let trusted_list = state.client_db.list_trusted_peers()?;
+    let mut trusted_list = state.client_db.list_trusted_peers()?;
 
-    let mut online_ids: HashSet<String> = HashSet::new();
-    let mut last_seen_map: HashMap<String, i64> = HashMap::new();
-    {
-        let peers_cache = state
-            .discovered_peers
-            .lock()
-            .map_err(|_| anyhow!("internal lock poisoned"))?;
-        for (id, cached) in peers_cache.iter() {
-            let elapsed = cached.last_seen.elapsed().as_secs() as i64;
-            last_seen_map.insert(id.clone(), elapsed);
-            if elapsed < 30 {
-                online_ids.insert(id.clone());
+    // 合并本机服务端侧的可信设备（可能是对端在配对时写入我们服务端 index.db 的那一份）。
+    let mut server_online_ids: HashSet<String> = HashSet::new();
+    if let Some((db_path, server_running, port)) = resolve_local_server_db_path(&state).await? {
+        if db_path.exists() {
+            let server_peers = tokio::task::spawn_blocking(move || -> Result<Vec<TrustedPeer>> {
+                let db = Database::shared(&db_path)?;
+                Ok(db.list_trusted_peers()?)
+            })
+            .await
+            .context("list_paired_peers worker panicked")??;
+
+            for peer in server_peers {
+                if let Some(existing) = trusted_list
+                    .iter_mut()
+                    .find(|candidate| candidate.device_id == peer.device_id)
+                {
+                    // 服务端侧的 IP/端口是真实观测值，比客户端缓存更可信。
+                    if existing.last_ip.is_none() {
+                        existing.last_ip = peer.last_ip.clone();
+                    }
+                    if existing.last_port.is_none() {
+                        existing.last_port = peer.last_port;
+                    }
+                    if existing.device_name == existing.device_id
+                        && peer.device_name != peer.device_id
+                    {
+                        existing.device_name = peer.device_name.clone();
+                        existing.os_type = peer.os_type.clone();
+                    }
+                } else {
+                    trusted_list.push(peer);
+                }
+            }
+
+            // 本机服务端观察到的在线（对端主动握手到我们）。
+            if server_running {
+                if let Ok(live) = fetch_local_server_peers_live(&state, port).await {
+                    for entry in live.peers {
+                        if entry.online {
+                            server_online_ids.insert(entry.device_id);
+                        }
+                    }
+                }
             }
         }
     }
-    if let Some((_, true, port)) = resolve_local_server_db_path(&state).await? {
-        if let Ok(live) = fetch_local_server_peers_live(&state, port).await {
-            for entry in live.peers {
-                if entry.online {
-                    online_ids.insert(entry.device_id);
-                }
+
+    let mut online_ids: HashSet<String> = server_online_ids;
+    let mut last_seen_map: HashMap<String, i64> = HashMap::new();
+    // 只信任"双方握手成功"这一件事推导在线状态：先取本地记录的成功握手时刻。
+    {
+        let heartbeats = state
+            .peer_last_heartbeat
+            .lock()
+            .map_err(|_| anyhow!("internal lock poisoned"))?;
+        for (id, at) in heartbeats.iter() {
+            let elapsed = at.elapsed().as_secs() as i64;
+            last_seen_map.insert(id.clone(), elapsed);
+            if at.elapsed() < Duration::from_secs(PEER_PRESENCE_LEASE_SECS) {
+                online_ids.insert(id.clone());
             }
         }
     }
 
     let mut peers = Vec::with_capacity(trusted_list.len() + usize::from(active.is_some()));
     let mut seen = HashSet::new();
+    let active_online = active
+        .as_ref()
+        .is_some_and(|a| online_ids.contains(&a.device_id));
 
     for trusted in trusted_list {
-        let is_active = active
-            .as_ref()
-            .is_some_and(|a| a.device_id == trusted.device_id);
         let (ip, port) = match active.as_ref() {
             Some(a) if a.device_id == trusted.device_id => {
                 (Some(a.addr.ip().to_string()), Some(a.addr.port()))
             }
             _ => (trusted.last_ip, trusted.last_port),
         };
-        let online = is_active || online_ids.contains(&trusted.device_id);
+        // 有活跃会话但握手失败时不算在线：避免"手机端显示电脑在线、电脑端却没这台手机"。
+        let online = online_ids.contains(&trusted.device_id);
         let last_seen_secs = if online {
             Some(0)
         } else {
@@ -2426,7 +3063,7 @@ pub async fn list_paired_peers() -> Result<Vec<PairedPeerDto>> {
                 os_type: "peer".to_string(),
                 ip: Some(active.addr.ip().to_string()),
                 port: Some(active.addr.port()),
-                online: true,
+                online: active_online,
                 last_seen_secs: Some(0),
             });
         }
@@ -2452,13 +3089,27 @@ pub async fn get_auto_reconnect() -> Result<bool> {
 pub async fn get_backup_storage_config() -> Result<BackupStorageConfigDto> {
     let state = runtime_state()?;
     if let Some(raw) = state.client_db.get_setting(SETTING_BACKUP_STORAGE_JSON)? {
-        let cfg: BackupStorageConfigDto = serde_json::from_str(&raw)
+        let mut cfg: BackupStorageConfigDto = serde_json::from_str(&raw)
             .context("invalid persisted backup_storage_config_json")?;
+        // 兼容升级前只存 `primary_dir` 的旧配置：隔离根在读取时补齐。
+        if cfg.primary_root.trim().is_empty() && !cfg.primary_dir.trim().is_empty() {
+            cfg.primary_root = backup_isolation_root(&cfg.primary_dir)
+                .to_string_lossy()
+                .into_owned();
+        }
+        if cfg.fallback_root.is_none() {
+            cfg.fallback_root = cfg
+                .fallback_dir
+                .as_deref()
+                .map(|dir| backup_isolation_root(dir).to_string_lossy().into_owned());
+        }
         return Ok(cfg);
     }
     Ok(BackupStorageConfigDto {
         primary_dir: String::new(),
+        primary_root: String::new(),
         fallback_dir: None,
+        fallback_root: None,
     })
 }
 
@@ -2489,9 +3140,26 @@ pub async fn set_backup_storage_config(
     }
 
     let state = runtime_state()?;
+    // 隔离根必须真实存在：用户只选一次目录，之后备份只写进 everyonenasbackup。
+    let primary_root = backup_isolation_root(&primary);
+    fs::create_dir_all(&primary_root).with_context(|| {
+        format!("无法创建备份隔离子目录 {}", primary_root.display())
+    })?;
+    let fallback_root = match fallback {
+        Some(ref fb) => {
+            let root = backup_isolation_root(fb);
+            fs::create_dir_all(&root)
+                .with_context(|| format!("无法创建备用备份隔离子目录 {}", root.display()))?;
+            Some(root.to_string_lossy().into_owned())
+        }
+        None => None,
+    };
+
     let cfg = BackupStorageConfigDto {
         primary_dir: primary,
+        primary_root: primary_root.to_string_lossy().into_owned(),
         fallback_dir: fallback,
+        fallback_root,
     };
     let json = serde_json::to_string(&cfg)?;
     state
@@ -3054,6 +3722,16 @@ async fn ensure_local_admin_cookie(state: &FfiRuntimeState, port: u16) -> Result
     Ok(fresh_cookie)
 }
 
+/// 作废缓存的本地管理会话。
+///
+/// 本地服务端重启后内存里的会话表会被清空，缓存的 Cookie 就永久失效。若不主动清除，
+/// 每个 UI 轮询都会先发一次注定 401 的请求再重新登录，白跑两倍往返。服务端停止与
+/// 收到 401/403 时都必须调用这里。
+async fn invalidate_local_admin_cookie(state: &FfiRuntimeState) {
+    let mut life = state.lifecycle.lock().await;
+    life.local_admin_cookie = None;
+}
+
 async fn fetch_local_server_peers_live(
     state: &FfiRuntimeState,
     port: u16,
@@ -3083,6 +3761,13 @@ async fn fetch_local_server_peers_live(
                 .json::<LocalServerPeersResponse>()
                 .await
                 .context("invalid local server /api/peers JSON response");
+        }
+        // 401/403 说明这个缓存会话已随服务端重启失效，清掉它再重新登录，
+        // 否则后续每次轮询都会重复"发一次 401 + 再登录"的双倍往返。
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            invalidate_local_admin_cookie(state).await;
         }
     }
 
@@ -3191,7 +3876,7 @@ pub async fn get_system_overview() -> Result<SystemOverviewDto> {
 
         if let Some(ref db_path) = db_path_opt {
             if db_path.exists() {
-                let db = Database::open(db_path)?;
+                let db = Database::shared(db_path)?;
                 let vaults = db.list_vaults()?;
                 vault_count = vaults.len();
                 for v in &vaults {
@@ -3367,7 +4052,7 @@ pub async fn list_vaults() -> Result<Vec<VaultSummaryDto>> {
     }
 
     let vaults = tokio::task::spawn_blocking(move || -> Result<Vec<VaultSummaryDto>> {
-        let db = Database::open(&db_path)?;
+        let db = Database::shared(&db_path)?;
         let vaults = db.list_vaults()?;
         let mut volumes_by_vault: HashMap<String, Vec<lanvault_core::VaultVolumeRecord>> =
             HashMap::new();
@@ -3460,7 +4145,7 @@ pub async fn create_vault(
                 extra_volumes,
             )?
         } else {
-            let db = Arc::new(Database::open(&db_path)?);
+            let db = Database::shared(&db_path)?;
             let store = VaultStore::new(db);
             store.create_vault(
                 trimmed_name,
@@ -3494,7 +4179,7 @@ pub async fn list_snapshots(vault_id: Option<String>) -> Result<Vec<SnapshotSumm
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     tokio::task::spawn_blocking(move || -> Result<Vec<SnapshotSummaryDto>> {
-        let db = Database::open(&db_path)?;
+        let db = Database::shared(&db_path)?;
         let snapshots = db.list_snapshots(filter.as_deref())?;
         Ok(snapshots
             .into_iter()
@@ -3514,20 +4199,42 @@ pub async fn list_snapshots(vault_id: Option<String>) -> Result<Vec<SnapshotSumm
 }
 
 /// 32. 在本地服务端全部存储库上执行真实 `BitRotScrubber` 完整性巡检并返回聚合报告。
+pub async fn set_fast_backup_mode(enabled: bool) -> Result<bool> {
+    let state = runtime_state()?;
+    state.fast_backup_mode.store(enabled, Ordering::Relaxed);
+    if let Some((_, engine)) = state.sync_engine_cache.lock().await.as_ref() {
+        engine.set_fast_mode(enabled);
+    }
+    Ok(enabled)
+}
+
 pub async fn trigger_bit_rot_scrub() -> Result<ScrubResultDto> {
     let state = runtime_state()?;
-    let (db_path, _, _) = resolve_local_server_db_path(&state)
-        .await?
-        .ok_or_else(|| anyhow!("local server database is not initialized"))?;
-    if !db_path.exists() {
-        bail!(
-            "local server database does not exist at {}",
-            db_path.display()
-        );
+    let local_db = resolve_local_server_db_path(&state).await?;
+    let local_available = local_db.as_ref().map(|(p, _, _)| p.exists()).unwrap_or(false);
+    if !local_available {
+        let peer = state
+            .active_peer
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("local server database is not initialized and no paired peer connected"))?;
+        let url = format!("{}/api/scrub/trigger", peer.endpoint_base_url);
+        let mut req = state.http_client.post(&url);
+        if let Some(ref c) = peer.session_cookie {
+            req = req.header("Cookie", format!("lv_session={c}"));
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            bail!("remote integrity scrub failed: HTTP {}", resp.status());
+        }
+        let dto: ScrubResultDto = resp.json().await?;
+        return Ok(dto);
     }
+    let (db_path, _, _) = local_db.unwrap();
 
     let result = tokio::task::spawn_blocking(move || -> Result<ScrubResultDto> {
-        let db = Arc::new(Database::open(&db_path)?);
+        let db = Database::shared(&db_path)?;
         let vaults = db.list_vaults()?;
         if vaults.is_empty() {
             bail!("no vaults found in local server database");
@@ -3625,7 +4332,7 @@ pub async fn revoke_paired_peer(device_id: String) -> Result<RevokePeerResultDto
         if db_path.exists() {
             let tid = target_id.clone();
             server_revoked = tokio::task::spawn_blocking(move || -> Result<bool> {
-                let server_db = Database::open(&db_path)?;
+                let server_db = Database::shared(&db_path)?;
                 Ok(server_db.delete_trusted_peer(&tid)?)
             })
             .await
@@ -3743,18 +4450,32 @@ pub async fn push_clipboard_file(
         .clone()
         .ok_or_else(|| anyhow!("no paired peer session active for clipboard file push"))?;
 
-    let client = ClipboardClient::new(
-        peer.endpoint_base_url,
-        peer.session_cookie,
-        peer.channel_key,
-    )?;
     let target_label = target_device_id
         .as_deref()
         .map(str::to_string)
         .unwrap_or_else(|| peer.device_id.clone());
-    let resp = client
-        .push_temp_file(target_device_id, Path::new(&trimmed_path))
-        .await?;
+    let transfer_client = lanvault_client::ResumableFileTransferClient::new(
+        peer.endpoint_base_url.clone(),
+        peer.session_cookie.clone(),
+    )?;
+    let send_res = transfer_client
+        .send_file_resumable(Path::new(&trimmed_path))
+        .await;
+    if matches!(
+        send_res,
+        Err(lanvault_client::ClientError::RemoteRejected { status: 401, .. })
+    ) {
+        let renewed = renew_peer_session(&state, &peer).await?;
+        let retry_client = lanvault_client::ResumableFileTransferClient::new(
+            renewed.endpoint_base_url,
+            renewed.session_cookie,
+        )?;
+        retry_client
+            .send_file_resumable(Path::new(&trimmed_path))
+            .await?;
+    } else {
+        send_res?;
+    }
     let file_size = tokio::fs::metadata(&trimmed_path).await.map(|m| m.len()).unwrap_or(0);
     let file_name = Path::new(&trimmed_path)
         .file_name()
@@ -3782,14 +4503,14 @@ pub async fn push_clipboard_file(
         Some("clipboard.push_file"),
         None,
         format!(
-            "pushed temp file {} to {} peer(s)",
-            trimmed_path, resp.delivered_to
+            "pushed resumable file {} to {}",
+            trimmed_path, target_label
         ),
         None,
     );
 
     info!(
-        delivered_to = resp.delivered_to,
+        delivered_to = 1usize,
         peer = %peer.device_id,
         file_path = %trimmed_path,
         "clipboard temp file pushed via encrypted channel"
@@ -3849,119 +4570,253 @@ pub async fn restore_snapshot(
 ) -> Result<RestoreSnapshotResultDto> {
     let snap_id = snapshot_id.trim().to_string();
     let target_trim = target_dir.trim().to_string();
-    if snap_id.is_empty() || target_trim.is_empty() {
-        bail!("snapshot_id and target_dir must not be empty");
+    if snap_id.is_empty()
+        || snap_id.len() > 128
+        || !snap_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || target_trim.is_empty()
+    {
+        bail!("invalid snapshot_id or empty target_dir");
     }
 
     let state = runtime_state()?;
-    let (db_path, _, _) = resolve_local_server_db_path(&state)
-        .await?
-        .ok_or_else(|| anyhow!("local server database is not initialized"))?;
-    if !db_path.exists() {
-        bail!("local server database does not exist at {}", db_path.display());
-    }
-
     let vault_key = state.vault_master_key.read().await.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<RestoreSnapshotResultDto> {
-        let db = Arc::new(Database::open(&db_path)?);
-        let snap = db
-            .get_snapshot(&snap_id)?
-            .ok_or_else(|| anyhow!("snapshot `{snap_id}` not found"))?;
-        let vault_store = VaultStore::new(Arc::clone(&db));
-        let chunk_key = vault_key.derive_vault_chunk_key(&snap.vault_id);
+    let local_db_opt = resolve_local_server_db_path(&state).await?;
+    let has_local_snap = if let Some((ref db_path, _, _)) = local_db_opt {
+        if db_path.exists() {
+            Database::shared(db_path)
+                .ok()
+                .and_then(|db| db.get_snapshot(&snap_id).ok().flatten())
+                .is_some()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
-        let out_dir = PathBuf::from(&target_trim);
-        std::fs::create_dir_all(&out_dir)
-            .with_context(|| format!("failed to create restore directory {}", out_dir.display()))?;
+    let result = if has_local_snap {
+        let (db_path, _, _) = local_db_opt.unwrap();
+        let snap_id_local = snap_id.clone();
+        let target_local = target_trim.clone();
+        let key_local = vault_key.clone();
+        tokio::task::spawn_blocking(move || -> Result<RestoreSnapshotResultDto> {
+            let db = Database::shared(&db_path)?;
+            let snap = db
+                .get_snapshot(&snap_id_local)?
+                .ok_or_else(|| anyhow!("snapshot `{snap_id_local}` not found"))?;
+            let vault_store = VaultStore::new(Arc::clone(&db));
+            let chunk_key = key_local.derive_vault_chunk_key(&snap.vault_id);
 
-        // 1. Prefer reading the snapshot manifest so every file is reconstructed at its exact relative path.
-        let mut loaded_manifest: Option<RestoreSnapshotManifest> = None;
-        if let Ok(roots) = vault_store.manifest_backup_roots(&snap.vault_id) {
-            for root in roots {
-                let candidate = root.join("manifests").join(format!("{}.json", snap.snapshot_id));
-                if candidate.is_file() {
-                    let bytes = std::fs::read(&candidate).with_context(|| {
-                        format!("failed to read snapshot manifest {}", candidate.display())
-                    })?;
-                    loaded_manifest = Some(
-                        serde_json::from_slice::<RestoreSnapshotManifest>(&bytes)
-                            .context("invalid snapshot manifest JSON")?,
-                    );
-                    break;
+            let out_dir = PathBuf::from(&target_local);
+            std::fs::create_dir_all(&out_dir)
+                .with_context(|| format!("failed to create restore directory {}", out_dir.display()))?;
+
+            let mut loaded_manifest: Option<RestoreSnapshotManifest> = None;
+            if let Ok(roots) = vault_store.manifest_backup_roots(&snap.vault_id) {
+                for root in roots {
+                    let candidate = root.join("manifests").join(format!("{}.json", snap.snapshot_id));
+                    if candidate.is_file() {
+                        let bytes = std::fs::read(&candidate)?;
+                        loaded_manifest = Some(serde_json::from_slice::<RestoreSnapshotManifest>(&bytes)?);
+                        break;
+                    }
                 }
             }
+
+            let mut restored_chunks = 0u64;
+            let mut restored_bytes = 0u64;
+            let output_path_str: String;
+
+            if let Some(manifest) = loaded_manifest {
+                let restore_root = out_dir.join(format!("restore_{}", snap.snapshot_id));
+                std::fs::create_dir_all(&restore_root)?;
+                for file in &manifest.files {
+                    let rel = sanitize_restore_rel_path(&file.rel_path)?;
+                    let dest_path = restore_root.join(rel);
+                    if let Some(parent) = dest_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let part_path = PathBuf::from(format!("{}.lanvault.part", dest_path.display()));
+                    {
+                        let mut dest_file = std::fs::File::create(&part_path)?;
+                        for hash_hex in &file.chunk_hashes_hex {
+                            let hash_bytes = hex::decode(hash_hex)?;
+                            let hash: [u8; 32] = hash_bytes
+                                .try_into()
+                                .map_err(|_| anyhow!("invalid chunk hash length"))?;
+                            let stored_bytes = vault_store.get_chunk(&snap.vault_id, &hash)?;
+                            let comp = lanvault_core::ChunkCompression::from_db_tag(
+                                &db.get_chunk_compression(&snap.vault_id, &hash),
+                            );
+                            let plain = lanvault_core::unpack_chunk_with_compression(
+                                &stored_bytes,
+                                &hash,
+                                Some(&chunk_key),
+                                snap.vault_id.as_bytes(),
+                                CHUNK_MAX_SIZE as usize,
+                                comp,
+                            )?;
+                            std::io::Write::write_all(&mut dest_file, &plain)?;
+                            restored_chunks += 1;
+                            restored_bytes += plain.len() as u64;
+                        }
+                        dest_file.sync_all()?;
+                    }
+                    std::fs::rename(&part_path, &dest_path)?;
+                }
+                output_path_str = restore_root.to_string_lossy().into_owned();
+            } else {
+                let hashes = db.list_snapshot_chunks(&snap.snapshot_id)?;
+                let out_file_path = out_dir.join(format!("restore_{}.bin", snap.snapshot_id));
+                let part_path = PathBuf::from(format!("{}.lanvault.part", out_file_path.display()));
+                {
+                    let mut out_file = std::fs::File::create(&part_path)?;
+                    for hash in &hashes {
+                        let stored_bytes = vault_store.get_chunk(&snap.vault_id, hash)?;
+                        let comp = lanvault_core::ChunkCompression::from_db_tag(
+                            &db.get_chunk_compression(&snap.vault_id, hash),
+                        );
+                        let plain = lanvault_core::unpack_chunk_with_compression(
+                            &stored_bytes,
+                            hash,
+                            Some(&chunk_key),
+                            snap.vault_id.as_bytes(),
+                            CHUNK_MAX_SIZE as usize,
+                            comp,
+                        )?;
+                        std::io::Write::write_all(&mut out_file, &plain)?;
+                        restored_chunks += 1;
+                        restored_bytes += plain.len() as u64;
+                    }
+                    out_file.sync_all()?;
+                }
+                std::fs::rename(&part_path, &out_file_path)?;
+                output_path_str = out_file_path.to_string_lossy().into_owned();
+            }
+
+            Ok(RestoreSnapshotResultDto {
+                snapshot_id: snap.snapshot_id,
+                restored_chunks,
+                restored_bytes,
+                output_path: output_path_str,
+            })
+        })
+        .await
+        .context("snapshot restore worker panicked")??
+    } else {
+        // 远端 HTTP 回传恢复：纯客户端（如手机）从对端 NAS 拉取 manifest 与块并在本地校验解密落盘
+        let peer = state
+            .active_peer
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("local snapshot not found and no paired peer connected for remote restore"))?;
+        let http = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .read_timeout(Duration::from_secs(30))
+            .build()?;
+        let manifest_url = format!("{}/api/snapshots/{}/manifest", peer.endpoint_base_url, snap_id);
+        let mut req = http.get(&manifest_url);
+        if let Some(ref c) = peer.session_cookie {
+            req = req.header("Cookie", format!("lv_session={c}"));
         }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            bail!("failed to fetch remote snapshot manifest: HTTP {}", resp.status());
+        }
+        #[derive(Deserialize)]
+        struct RemoteManifestResp {
+            vault_id: String,
+            snapshot_id: String,
+            manifest: RestoreSnapshotManifest,
+        }
+        let remote: RemoteManifestResp = resp.json().await?;
+        let chunk_key = vault_key.derive_vault_chunk_key(&remote.vault_id);
+        if remote.snapshot_id.is_empty()
+            || remote.snapshot_id.len() > 128
+            || !remote.snapshot_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            bail!("invalid remote snapshot_id");
+        }
+        let restore_root = PathBuf::from(&target_trim).join(format!("restore_{}", remote.snapshot_id));
+        tokio::fs::create_dir_all(&restore_root).await?;
 
         let mut restored_chunks = 0u64;
         let mut restored_bytes = 0u64;
-        let output_path_str: String;
-
-        if let Some(manifest) = loaded_manifest {
-            let restore_root = out_dir.join(format!("restore_{}", snap.snapshot_id));
-            std::fs::create_dir_all(&restore_root)?;
-            for file in &manifest.files {
-                let rel = sanitize_restore_rel_path(&file.rel_path)?;
-                let dest_path = restore_root.join(rel);
-                if let Some(parent) = dest_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let mut dest_file = std::fs::File::create(&dest_path).with_context(|| {
-                    format!("failed to create restored file {}", dest_path.display())
-                })?;
-                for hash_hex in &file.chunk_hashes_hex {
-                    let hash_bytes = hex::decode(hash_hex)
-                        .with_context(|| format!("invalid chunk hash hex `{hash_hex}`"))?;
-                    let hash: [u8; 32] = hash_bytes
-                        .try_into()
-                        .map_err(|_| anyhow!("invalid chunk hash length"))?;
-                    let stored_bytes = vault_store.get_chunk(&snap.vault_id, &hash)?;
-                    let plain = unpack_chunk(
-                        &stored_bytes,
-                        &hash,
-                        Some(&chunk_key),
-                        snap.vault_id.as_bytes(),
-                        CHUNK_MAX_SIZE as usize,
-                    )?;
-                    std::io::Write::write_all(&mut dest_file, &plain)?;
-                    restored_chunks += 1;
-                    restored_bytes += plain.len() as u64;
-                }
-                std::io::Write::flush(&mut dest_file)?;
+        for file in &remote.manifest.files {
+            let rel = sanitize_restore_rel_path(&file.rel_path)?;
+            let dest_path = restore_root.join(rel);
+            if let Some(parent) = dest_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
             }
-            output_path_str = restore_root.to_string_lossy().into_owned();
-        } else {
-            // Fallback for legacy manifestless snapshots.
-            let hashes = db.list_snapshot_chunks(&snap.snapshot_id)?;
-            let out_file_path = out_dir.join(format!("restore_{}.bin", snap.snapshot_id));
-            let mut out_file = std::fs::File::create(&out_file_path).with_context(|| {
-                format!("failed to create restore output {}", out_file_path.display())
-            })?;
-            for hash in &hashes {
-                let stored_bytes = vault_store.get_chunk(&snap.vault_id, hash)?;
-                let plain = unpack_chunk(
-                    &stored_bytes,
-                    hash,
+            let part_path = PathBuf::from(format!("{}.lanvault.part", dest_path.display()));
+            let mut out_file = std::fs::File::create(&part_path)?;
+            for hash_hex in &file.chunk_hashes_hex {
+                let hash_bytes = hex::decode(hash_hex)?;
+                let hash: [u8; 32] = hash_bytes
+                    .try_into()
+                    .map_err(|_| anyhow!("invalid chunk hash length"))?;
+                let chunk_url = format!(
+                    "{}/api/vaults/{}/chunks/{}",
+                    peer.endpoint_base_url, remote.vault_id, hash_hex
+                );
+                let mut cresp_opt = None;
+                for attempt in 1..=4u32 {
+                    let mut creq = http.get(&chunk_url);
+                    if let Some(ref c) = peer.session_cookie {
+                        creq = creq.header("Cookie", format!("lv_session={c}"));
+                    }
+                    match creq.send().await {
+                        Ok(r) if r.status().is_success() => {
+                            cresp_opt = Some(r);
+                            break;
+                        }
+                        Ok(r) if matches!(r.status().as_u16(), 408 | 429 | 500 | 502 | 503 | 504) && attempt < 4 => {
+                            tokio::time::sleep(Duration::from_millis(400u64 << (attempt - 1))).await;
+                        }
+                        Ok(r) => bail!("failed to download chunk {}: HTTP {}", hash_hex, r.status()),
+                        Err(_) if attempt < 4 => {
+                            tokio::time::sleep(Duration::from_millis(400u64 << (attempt - 1))).await;
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
+                }
+                let cresp = cresp_opt.ok_or_else(|| anyhow!("failed to download chunk {hash_hex} after retries"))?;
+                let enc_hdr = cresp
+                    .headers()
+                    .get("x-lanvault-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("xchacha20poly1305+zstd")
+                    .to_string();
+                let comp = if enc_hdr.ends_with("+raw") {
+                    lanvault_core::ChunkCompression::Raw
+                } else {
+                    lanvault_core::ChunkCompression::Zstd
+                };
+                let stored = cresp.bytes().await?;
+                let plain = lanvault_core::unpack_chunk_with_compression(
+                    &stored,
+                    &hash,
                     Some(&chunk_key),
-                    snap.vault_id.as_bytes(),
+                    remote.vault_id.as_bytes(),
                     CHUNK_MAX_SIZE as usize,
+                    comp,
                 )?;
                 std::io::Write::write_all(&mut out_file, &plain)?;
                 restored_chunks += 1;
                 restored_bytes += plain.len() as u64;
             }
-            std::io::Write::flush(&mut out_file)?;
-            output_path_str = out_file_path.to_string_lossy().into_owned();
+            out_file.sync_all()?;
+            drop(out_file);
+            std::fs::rename(&part_path, &dest_path)?;
         }
-
-        Ok(RestoreSnapshotResultDto {
-            snapshot_id: snap.snapshot_id,
+        RestoreSnapshotResultDto {
+            snapshot_id: remote.snapshot_id,
             restored_chunks,
             restored_bytes,
-            output_path: output_path_str,
-        })
-    })
-    .await
-    .context("snapshot restore worker panicked")??;
+            output_path: restore_root.to_string_lossy().into_owned(),
+        }
+    };
 
     lanvault_core::record_event_always(
         "INFO",

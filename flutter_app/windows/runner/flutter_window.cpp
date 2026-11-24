@@ -6,10 +6,13 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "flutter/generated_plugin_registrant.h"
 
 namespace {
+
+constexpr char kWindowChannelName[] = "com.lanvault.app/window";
 
 template <typename T>
 class ComPtrGuard {
@@ -80,6 +83,23 @@ std::optional<std::string> ExtractTitleArg(
     return *str;
   }
   return std::nullopt;
+}
+
+double ReadDouble(const flutter::EncodableMap& map, const char* key) {
+  const auto it = map.find(flutter::EncodableValue(std::string(key)));
+  if (it == map.end()) {
+    return 0.0;
+  }
+  if (const auto* value = std::get_if<double>(&it->second)) {
+    return *value;
+  }
+  if (const auto* value = std::get_if<int32_t>(&it->second)) {
+    return static_cast<double>(*value);
+  }
+  if (const auto* value = std::get_if<bool>(&it->second)) {
+    return *value ? 1.0 : 0.0;
+  }
+  return 0.0;
 }
 
 void ShowNativeItemDialog(
@@ -186,7 +206,7 @@ bool FlutterWindow::OnCreate() {
           const auto title_utf8 = ExtractTitleArg(call);
           const std::wstring title = title_utf8
                                          ? Utf8ToWide(*title_utf8)
-                                         : L"\u9009\u62E9\u6587\u4EF6\u5939";
+                                         : L"选择文件夹";
           ShowNativeItemDialog(GetHandle(), true, title, std::move(result));
           return;
         }
@@ -194,8 +214,52 @@ bool FlutterWindow::OnCreate() {
           const auto title_utf8 = ExtractTitleArg(call);
           const std::wstring title = title_utf8
                                          ? Utf8ToWide(*title_utf8)
-                                         : L"\u9009\u62E9\u6587\u4EF6";
+                                         : L"选择文件";
           ShowNativeItemDialog(GetHandle(), false, title, std::move(result));
+          return;
+        }
+        result->NotImplemented();
+      });
+
+  window_channel_ =
+      std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+          flutter_controller_->engine()->messenger(), kWindowChannelName,
+          &flutter::StandardMethodCodec::GetInstance());
+  window_channel_->SetMethodCallHandler(
+      [this](const flutter::MethodCall<flutter::EncodableValue>& call,
+             std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>>
+                 result) {
+        HWND window = GetHandle();
+        const std::string& method = call.method_name();
+        if (method == "minimize") {
+          if (window != nullptr) {
+            ShowWindow(window, SW_MINIMIZE);
+          }
+          result->Success();
+          return;
+        }
+        if (method == "toggleMaximize") {
+          if (window != nullptr) {
+            ShowWindow(window, IsZoomed(window) ? SW_RESTORE : SW_MAXIMIZE);
+          }
+          result->Success();
+          return;
+        }
+        if (method == "close") {
+          if (window != nullptr) {
+            PostMessage(window, WM_CLOSE, 0, 0);
+          }
+          result->Success();
+          return;
+        }
+        if (method == "isMaximized") {
+          result->Success(flutter::EncodableValue(
+              window != nullptr && IsZoomed(window) != FALSE));
+          return;
+        }
+        if (method == "setCaptionMetrics") {
+          ApplyShortcutMetrics(call.arguments());
+          result->Success();
           return;
         }
         result->NotImplemented();
@@ -205,6 +269,7 @@ bool FlutterWindow::OnCreate() {
 
   flutter_controller_->engine()->SetNextFrameCallback([&]() {
     this->Show();
+    NotifyMaximizeState(GetHandle());
   });
 
   // Flutter can complete the first frame before the "show window" callback is
@@ -215,7 +280,48 @@ bool FlutterWindow::OnCreate() {
   return true;
 }
 
+void FlutterWindow::ApplyShortcutMetrics(const flutter::EncodableValue* arguments) {
+  const auto* args = std::get_if<flutter::EncodableMap>(arguments);
+  if (args == nullptr) {
+    return;
+  }
+  const double caption_height = ReadDouble(*args, "captionHeight");
+  std::vector<Win32Window::FrameRect> excluded;
+  const auto exclusions = args->find(flutter::EncodableValue("exclusions"));
+  if (exclusions != args->end()) {
+    if (const auto* list =
+            std::get_if<std::vector<flutter::EncodableValue>>(
+                &exclusions->second)) {
+      for (const flutter::EncodableValue& entry : *list) {
+        const auto* rect = std::get_if<flutter::EncodableMap>(&entry);
+        if (rect == nullptr) {
+          continue;
+        }
+        Win32Window::FrameRect frame_rect{
+            ReadDouble(*rect, "left"), ReadDouble(*rect, "top"),
+            ReadDouble(*rect, "right"), ReadDouble(*rect, "bottom")};
+        excluded.push_back(frame_rect);
+      }
+    }
+  }
+  SetCustomFrame(caption_height, std::move(excluded));
+}
+
+void FlutterWindow::NotifyMaximizeState(HWND window) {
+  if (window_channel_ == nullptr || window == nullptr) {
+    return;
+  }
+  window_channel_->InvokeMethod(
+      "maximizedChanged",
+      std::make_unique<flutter::EncodableValue>(static_cast<bool>(
+          IsZoomed(window) != FALSE)));
+}
+
 void FlutterWindow::OnDestroy() {
+  if (window_channel_) {
+    window_channel_->SetMethodCallHandler(nullptr);
+    window_channel_ = nullptr;
+  }
   if (keep_alive_channel_) {
     keep_alive_channel_->SetMethodCallHandler(nullptr);
     keep_alive_channel_ = nullptr;
@@ -244,6 +350,15 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
   switch (message) {
     case WM_FONTCHANGE:
       flutter_controller_->engine()->ReloadSystemFonts();
+      break;
+
+    case WM_SIZE:
+      // Maximize/restore can be driven by the app's own caption buttons, by a
+      // caption double-click, or by Aero snap, so the title bar state is pushed
+      // from the source of truth rather than inferred in Dart.
+      if (wparam == SIZE_MAXIMIZED || wparam == SIZE_RESTORED) {
+        NotifyMaximizeState(hwnd);
+      }
       break;
   }
 

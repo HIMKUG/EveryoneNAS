@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 // A class abstraction for a high DPI-aware Win32 Window. Intended to be
 // inherited from by classes that wish to specialize with custom
@@ -23,6 +24,15 @@ class Win32Window {
     unsigned int height;
     Size(unsigned int width, unsigned int height)
         : width(width), height(height) {}
+  };
+
+  // A rectangle of app-drawn caption content in logical (DIP) coordinates
+  // relative to the window's top-left corner.
+  struct FrameRect {
+    double left;
+    double top;
+    double right;
+    double bottom;
   };
 
   Win32Window();
@@ -54,6 +64,18 @@ class Win32Window {
 
   // Return a RECT representing the bounds of the current client area.
   RECT GetClientArea();
+
+  // Configures the app-drawn (borderless) window chrome. The whole window is
+  // client area; the top |caption_height_logical| DIPs behave like a native
+  // title bar (drag, double-click maximize, Aero snap, system menu), while
+  // |excluded_logical| rectangles inside that band stay client area so the
+  // app's own caption buttons keep receiving mouse input.
+  void SetCustomFrame(double caption_height_logical,
+                      std::vector<FrameRect> excluded_logical);
+
+  // Resolves the non-client hit test for |screen_point| on |window|. Returns
+  // HTCLIENT when the point belongs to app content.
+  LRESULT HitTestCustomFrame(HWND window, POINT screen_point);
 
  protected:
   // Processes and route salient window messages for mouse handling,
@@ -97,6 +119,13 @@ class Win32Window {
 
   // window handle for hosted content.
   HWND child_content_ = nullptr;
+
+  // App-drawn caption band height in DIPs; 0 means the chrome is not configured
+  // and every point is client area.
+  double custom_caption_height_ = 0.0;
+
+  // App-drawn controls inside the caption band that must stay client area.
+  std::vector<FrameRect> custom_frame_excluded_;
 };
 
 #endif  // RUNNER_WIN32_WINDOW_H_

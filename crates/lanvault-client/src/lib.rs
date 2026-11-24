@@ -8,7 +8,7 @@ pub mod sync_engine;
 pub mod watcher;
 
 pub use clipboard::{
-    ClipboardClient, ClipboardPushRequest, ClipboardPushResponse, DecryptedClipboardItem,
+    ClipboardClient, ResumableFileTransferClient, ClipboardPushRequest, ClipboardPushResponse, DecryptedClipboardItem,
     MAX_CLIPBOARD_JSON_BYTES, MAX_TEMP_FILE_BYTES,
 };
 pub use error::ClientError;

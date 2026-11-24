@@ -253,6 +253,9 @@ class _FakeLanVaultFfi implements LanVaultRustFfi {
   Future<bool> setSyncPaused(bool paused) async => paused;
 
   @override
+  Future<bool> setFastBackupMode(bool enabled) async => enabled;
+
+  @override
   Future<String> setSyncRuleSchedule({
     required String ruleId,
     required String scheduleMode,
@@ -309,6 +312,18 @@ class _FakeLanVaultFfi implements LanVaultRustFfi {
         targetVaultId: targetVaultId,
         enabled: enabled,
       );
+
+  @override
+  Future<int?> autostartLocalServer() async => serverRunning ? 7842 : null;
+
+  @override
+  Future<bool> getAutostartServer() async => serverRunning;
+
+  @override
+  Future<bool> setAutostartServer(bool enabled) async {
+    serverRunning = enabled;
+    return enabled;
+  }
 }
 
 void main() {
@@ -368,7 +383,7 @@ void main() {
     expect(decoration.color, NeuTokens.disabledDarkSurface);
     expect(decoration.gradient, isNull);
 
-    await tester.tap(find.text('新建存储池'));
+    await tester.tap(find.text('新建存储池').first);
     await tester.pump();
     expect(tapped, 1);
   });
@@ -387,10 +402,10 @@ void main() {
     );
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('新建存储池'));
+    await tester.tap(find.text('新建存储池').first);
     await tester.pump(const Duration(milliseconds: 50));
 
-    expect(find.text('请先启动本地存储服务后再新建存储池'), findsOneWidget);
+    expect(find.text('请先在设置中确认本地存储目录'), findsOneWidget);
     expect(find.text('创建存储池'), findsNothing);
     NeuToast.dismiss();
     await tester.pump(const Duration(milliseconds: 50));

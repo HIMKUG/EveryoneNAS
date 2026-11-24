@@ -214,6 +214,119 @@ pub fn pack_chunk_with_context(
 }
 
 /// Verifies stored BLAKE3 integrity, decrypts if E2EE is active, and zstd-decompresses the chunk.
+
+/// 块压缩编码类型：`Zstd` 为默认压缩，`Raw` 跳过压缩（用于高熵媒体或快速模式）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkCompression {
+    Zstd,
+    Raw,
+}
+
+impl ChunkCompression {
+    pub fn wire_encoding(self) -> &'static str {
+        match self {
+            ChunkCompression::Zstd => "xchacha20poly1305+zstd",
+            ChunkCompression::Raw => "xchacha20poly1305+raw",
+        }
+    }
+
+    pub fn db_tag(self) -> &'static str {
+        match self {
+            ChunkCompression::Zstd => "zstd",
+            ChunkCompression::Raw => "raw",
+        }
+    }
+
+    pub fn from_db_tag(tag: &str) -> Self {
+        if tag.eq_ignore_ascii_case("raw") {
+            ChunkCompression::Raw
+        } else {
+            ChunkCompression::Zstd
+        }
+    }
+}
+
+/// 高熵已压缩格式黑名单：这类文件再跑 zstd 几乎零收益却白耗 CPU。
+pub fn is_incompressible_extension(path: &std::path::Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "jpg" | "jpeg" | "heic" | "heif" | "png" | "webp" | "avif" | "gif"
+            | "mp4" | "mov" | "mkv" | "avi" | "webm" | "m4v"
+            | "mp3" | "aac" | "flac" | "ogg" | "m4a"
+            | "zip" | "7z" | "rar" | "gz" | "xz" | "zst" | "bz2" | "apk" | "ipa"
+    )
+}
+
+/// 自适应打包：根据 `force_raw` 与前 4 KiB 试压收益自动决定走 `Zstd` 还是 `Raw`。
+pub fn pack_chunk_adaptive_with_context(
+    plaintext: &[u8],
+    seal_ctx: Option<&ChunkSealContext>,
+    zstd_level: i32,
+    force_raw: bool,
+) -> Result<(PackedChunk, ChunkCompression)> {
+    let mut use_raw = force_raw;
+    if !use_raw && plaintext.len() >= 4096 {
+        if let Ok(sample) = compress_zstd(&plaintext[..4096], 1) {
+            if sample.len() * 100 > 4096 * 92 {
+                use_raw = true;
+            }
+        }
+    }
+    let (payload, compression) = if use_raw {
+        (plaintext.to_vec(), ChunkCompression::Raw)
+    } else {
+        (compress_zstd(plaintext, zstd_level)?, ChunkCompression::Zstd)
+    };
+    let stored_bytes = match seal_ctx {
+        Some(ctx) => ctx.encrypt_deterministic(&payload)?,
+        None => payload,
+    };
+    let stored_hash = blake3_hash(&stored_bytes);
+    Ok((
+        PackedChunk {
+            stored_hash,
+            raw_size: plaintext.len(),
+            stored_bytes,
+        },
+        compression,
+    ))
+}
+
+/// 按存储压缩标记解包数据块。
+pub fn unpack_chunk_with_compression(
+    stored_bytes: &[u8],
+    expected_stored_hash: &[u8; 32],
+    e2ee_key: Option<&SymmetricKey>,
+    aad: &[u8],
+    max_raw_size: usize,
+    compression: ChunkCompression,
+) -> Result<Vec<u8>> {
+    let actual_hash = blake3_hash(stored_bytes);
+    if actual_hash != *expected_stored_hash {
+        return Err(LanVaultError::CorruptedChunk {
+            hash: hex::encode(expected_stored_hash),
+        });
+    }
+    let inner = match e2ee_key {
+        Some(key) => decrypt_aead(key, stored_bytes, aad)?,
+        None => stored_bytes.to_vec(),
+    };
+    match compression {
+        ChunkCompression::Raw => {
+            if inner.len() > max_raw_size {
+                return Err(LanVaultError::Compression(format!(
+                    "raw chunk exceeded limit of {max_raw_size} bytes"
+                )));
+            }
+            Ok(inner)
+        }
+        ChunkCompression::Zstd => decompress_zstd(&inner, max_raw_size),
+    }
+}
+
 pub fn unpack_chunk(
     stored_bytes: &[u8],
     expected_stored_hash: &[u8; 32],

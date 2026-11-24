@@ -368,6 +368,20 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
             let config = api::block_on(api::get_last_server_config())??;
             Ok(json!({ "ok": true, "config": config }))
         }
+        "autostart_local_server" => {
+            let port = api::block_on(api::autostart_local_server())??;
+            Ok(json!({ "ok": true, "port": port }))
+        }
+        "get_autostart_server" => {
+            let enabled = api::block_on(api::get_autostart_server())??;
+            Ok(json!({ "ok": true, "enabled": enabled }))
+        }
+        "set_autostart_server" => {
+            let req: SetBoolPayload = serde_json::from_str(payload_json)
+                .context("invalid set_autostart_server JSON payload")?;
+            let enabled = api::block_on(api::set_autostart_server(req.enabled))??;
+            Ok(json!({ "ok": true, "enabled": enabled }))
+        }
         "run_self_diagnostics" => {
             let report = api::block_on(api::run_self_diagnostics())??;
             Ok(json!({ "ok": true, "report": report }))
@@ -467,6 +481,16 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
             };
             let records = api::block_on(api::list_transfer_history(req.limit))??;
             Ok(json!({ "ok": true, "records": records }))
+        }
+        "set_fast_backup_mode" => {
+            #[derive(Deserialize)]
+            struct FastModePayload {
+                enabled: bool,
+            }
+            let req: FastModePayload = serde_json::from_str(payload_json)
+                .context("invalid set_fast_backup_mode JSON payload")?;
+            let applied = api::block_on(api::set_fast_backup_mode(req.enabled))??;
+            Ok(json!({ "ok": true, "enabled": applied }))
         }
         "set_sync_paused" => {
             let req: SetSyncPausedPayload = serde_json::from_str(payload_json)

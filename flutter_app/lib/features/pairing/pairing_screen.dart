@@ -25,6 +25,8 @@ class PairingScreen extends StatefulWidget {
 class _PairingScreenState extends State<PairingScreen> {
   final Map<String, DiscoveredPeer> _discovered = <String, DiscoveredPeer>{};
   StreamSubscription<DiscoveredPeer>? _scanSub;
+  Timer? _refreshTimer;
+  Timer? _scanTimeoutTimer;
 
   _DeviceTab _activeTab = _DeviceTab.paired;
   bool _scanning = false;
@@ -37,13 +39,45 @@ class _PairingScreenState extends State<PairingScreen> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // 定期刷新已配对列表，让"在线/离线"随握手租约（45s）及时收敛，
+    // 用户不需要切页或重启就能看到两端状态一致。
+    _refreshTimer ??= Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => unawaited(_refreshPairedPeers(silent: true)),
+    );
+  }
+
+  @override
   void dispose() {
+    _refreshTimer?.cancel();
+    _refreshTimer = null;
+    _scanTimeoutTimer?.cancel();
+    _scanTimeoutTimer = null;
     _scanSub?.cancel();
+    _scanSub = null;
     super.dispose();
   }
 
-  Future<void> _refreshPairedPeers() async {
-    setState(() => _loadingPaired = true);
+  void _stopScan({bool silent = true}) {
+    _scanTimeoutTimer?.cancel();
+    _scanTimeoutTimer = null;
+    _scanSub?.cancel();
+    _scanSub = null;
+    if (_scanning && mounted) {
+      setState(() => _scanning = false);
+      if (!silent) {
+        NeuToast.info(context, '已停止局域网设备扫描');
+      }
+    } else {
+      _scanning = false;
+    }
+  }
+
+  Future<void> _refreshPairedPeers({bool silent = false}) async {
+    if (_loadingPaired) return;
+    if (!silent) setState(() => _loadingPaired = true);
     try {
       await widget.bridge.refreshPairedPeers();
       if (!mounted) return;
@@ -51,18 +85,23 @@ class _PairingScreenState extends State<PairingScreen> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _loadingPaired = false);
-      NeuToast.error(context, '读取已配对设备失败：${LanVaultBridge.formatUserError(err)}');
+      if (!silent) {
+        NeuToast.error(context, '读取已配对设备失败：${LanVaultBridge.formatUserError(err)}');
+      }
     }
   }
 
   void _toggleScan() {
     if (_scanning) {
-      _scanSub?.cancel();
-      _scanSub = null;
-      setState(() => _scanning = false);
-      NeuToast.info(context, '已停止局域网设备扫描');
+      _stopScan(silent: false);
       return;
     }
+    _scanTimeoutTimer?.cancel();
+    _scanTimeoutTimer = Timer(const Duration(seconds: 20), () {
+      if (!mounted || !_scanning) return;
+      _stopScan(silent: true);
+      NeuToast.info(context, '局域网扫描已完成，如需继续可点击重新扫描');
+    });
 
     setState(() {
       _scanning = true;
@@ -77,22 +116,20 @@ class _PairingScreenState extends State<PairingScreen> {
           setState(() => _discovered[peer.deviceId] = peer);
         },
         onError: (Object err) {
-          _scanSub?.cancel();
-          _scanSub = null;
+          _stopScan(silent: true);
           if (!mounted) return;
-          setState(() => _scanning = false);
           NeuToast.error(context, '扫描失败：${LanVaultBridge.formatUserError(err)}');
         },
         onDone: () {
-          _scanSub = null;
-          if (!mounted) return;
-          setState(() => _scanning = false);
+          _stopScan(silent: true);
         },
         cancelOnError: true,
       );
     } catch (err) {
-      setState(() => _scanning = false);
-      NeuToast.error(context, '启动扫描失败：${LanVaultBridge.formatUserError(err)}');
+      _stopScan(silent: true);
+      if (mounted) {
+        NeuToast.error(context, '启动扫描失败：${LanVaultBridge.formatUserError(err)}');
+      }
     }
   }
 
@@ -123,6 +160,7 @@ class _PairingScreenState extends State<PairingScreen> {
           dialogClosed = true;
           Navigator.of(context, rootNavigator: true).pop();
         }
+        _stopScan(silent: true);
         NeuToast.success(context, '已与 ${peer.deviceName} 完成配对');
         setState(() => _activeTab = _DeviceTab.paired);
         await _refreshPairedPeers();
@@ -199,6 +237,8 @@ class _PairingScreenState extends State<PairingScreen> {
       ),
     );
     if (paired == true && mounted) {
+      _stopScan(silent: true);
+      setState(() => _activeTab = _DeviceTab.paired);
       await _refreshPairedPeers();
     }
   }
@@ -239,7 +279,12 @@ class _PairingScreenState extends State<PairingScreen> {
         final segmentControl = NeuSegmentedControl<_DeviceTab>(
           semanticLabel: '设备列表分类',
           value: _activeTab,
-          onChanged: (tab) => setState(() => _activeTab = tab),
+          onChanged: (tab) {
+            if (tab == _DeviceTab.paired && _scanning) {
+              _stopScan(silent: true);
+            }
+            setState(() => _activeTab = tab);
+          },
           segments: <NeuSegment<_DeviceTab>>[
             NeuSegment<_DeviceTab>(
               value: _DeviceTab.paired,
@@ -307,14 +352,18 @@ class _PairingScreenState extends State<PairingScreen> {
                         child: segmentControl,
                       ),
                     ),
-                    const SizedBox(width: NeuSpace.sm),
-                    scanButton,
+                    if (_activeTab == _DeviceTab.discovered) ...<Widget>[
+                      const SizedBox(width: NeuSpace.sm),
+                      scanButton,
+                    ],
                   ],
                 )
               else ...<Widget>[
                 segmentControl,
-                const SizedBox(height: NeuSpace.sm),
-                scanButton,
+                if (_activeTab == _DeviceTab.discovered) ...<Widget>[
+                  const SizedBox(height: NeuSpace.sm),
+                  scanButton,
+                ],
               ],
               const SizedBox(height: NeuSpace.md),
               if (_activeTab == _DeviceTab.paired)
@@ -360,8 +409,14 @@ class _PairingScreenState extends State<PairingScreen> {
                 final peer = peers[i];
                 final (icon, fg, bg) = _deviceIcon(peer.osType);
                 final hasIp = peer.ip != null && peer.ip!.isNotEmpty;
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 12),
+                return InkWell(
+                  onTap: () {
+                    widget.bridge.selectPeer(peer.deviceId);
+                    NeuToast.success(context, '已切换当前目标设备为 ${peer.deviceName}');
+                  },
+                  borderRadius: const BorderRadius.all(Radius.circular(12)),
+                  child: Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
                   child: Row(
                     children: <Widget>[
                       NeuIconBadge(
@@ -437,6 +492,7 @@ class _PairingScreenState extends State<PairingScreen> {
                         ],
                       ),
                     ],
+                  ),
                   ),
                 );
               },

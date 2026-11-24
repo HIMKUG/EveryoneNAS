@@ -313,10 +313,16 @@ pub async fn serve_with_shutdown_and_state(
         transfer_bytes: AtomicU64::new(0),
         throughput_sample: std::sync::Mutex::new((Instant::now(), 0)),
         active_chunk_writes: AtomicU64::new(0),
+        upload_semaphore: tokio::sync::Semaphore::new(32),
         accepting_tasks: AtomicBool::new(true),
         pairing_pin: std::sync::Mutex::new(pairing_pin),
+        pending_pair_lock: std::sync::Mutex::new(()),
         pending_pair_requests: DashMap::new(),
+        renew_challenges: DashMap::new(),
+        transfer_budget_lock: std::sync::Mutex::new(()),
+        transfer_locks: std::array::from_fn(|_| Arc::new(tokio::sync::RwLock::new(()))),
         online_peers: DashMap::new(),
+        peer_leases: DashMap::new(),
         db: Arc::clone(&db),
         vault_store: Arc::clone(&vault_store),
         scrubber: Arc::clone(&scrubber),
@@ -332,6 +338,7 @@ pub async fn serve_with_shutdown_and_state(
 
     let gc_db = Arc::clone(&db);
     let gc_store = Arc::clone(&vault_store);
+    let gc_state = Arc::clone(&state);
     let gc_task = tokio::spawn(async move {
         let interval_dur = Duration::from_secs(GC_CHECK_INTERVAL_SECS);
         let mut ticker = tokio::time::interval(interval_dur);
@@ -340,8 +347,12 @@ pub async fn serve_with_shutdown_and_state(
             ticker.tick().await;
             let db_clone = Arc::clone(&gc_db);
             let store_clone = Arc::clone(&gc_store);
+            let state_clone = Arc::clone(&gc_state);
             let run_res = tokio::task::spawn_blocking(move || -> Result<()> {
                 let now = unix_timestamp_secs();
+                if let Err(error) = state_clone.reclaim_expired_transfers(now) {
+                    warn!(%error, "transfer cleanup failed");
+                }
                 let last_run = db_clone
                     .get_setting(GC_LAST_RUN_SETTING)?
                     .and_then(|value| value.parse::<i64>().ok())
