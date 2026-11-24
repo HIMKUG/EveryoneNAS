@@ -264,8 +264,8 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
             Ok(json!({ "ok": true }))
         }
         "set_role_mode" => {
-            let req: SetRoleModePayload = serde_json::from_str(payload_json)
-                .context("invalid set_role_mode JSON payload")?;
+            let req: SetRoleModePayload =
+                serde_json::from_str(payload_json).context("invalid set_role_mode JSON payload")?;
             let role_mode = api::block_on(api::set_role_mode(req.mode))??;
             Ok(json!({ "ok": true, "role_mode": role_mode }))
         }
@@ -323,7 +323,9 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
             let req: GetDebugLogsPayload = serde_json::from_str(payload_json)
                 .context("invalid get_debug_logs JSON payload")?;
             let entries = api::block_on(api::get_debug_logs(req.limit))??;
-            Ok(json!({ "ok": true, "debug_enabled": lanvault_core::is_debug_enabled(), "entries": entries }))
+            Ok(
+                json!({ "ok": true, "debug_enabled": lanvault_core::is_debug_enabled(), "entries": entries }),
+            )
         }
         "clear_debug_logs" => {
             api::block_on(api::clear_debug_logs())??;
@@ -332,7 +334,12 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
         "report_client_log" => {
             let req: ReportClientLogPayload = serde_json::from_str(payload_json)
                 .context("invalid report_client_log JSON payload")?;
-            api::block_on(api::report_client_log(req.level, req.source, req.message, req.detail))??;
+            api::block_on(api::report_client_log(
+                req.level,
+                req.source,
+                req.message,
+                req.detail,
+            ))??;
             Ok(json!({ "ok": true }))
         }
         "list_paired_peers" => {
@@ -399,8 +406,8 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
             Ok(json!({ "ok": true, "vaults": vaults }))
         }
         "create_vault" => {
-            let req: CreateVaultPayload = serde_json::from_str(payload_json)
-                .context("invalid create_vault JSON payload")?;
+            let req: CreateVaultPayload =
+                serde_json::from_str(payload_json).context("invalid create_vault JSON payload")?;
             let vault = api::block_on(api::create_vault(
                 req.name,
                 req.mount_path,
@@ -419,8 +426,7 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
             let req: ListSnapshotsPayload = if payload_json.trim().is_empty() {
                 ListSnapshotsPayload::default()
             } else {
-                serde_json::from_str(payload_json)
-                    .context("invalid list_snapshots JSON payload")?
+                serde_json::from_str(payload_json).context("invalid list_snapshots JSON payload")?
             };
             let snapshots = api::block_on(api::list_snapshots(req.vault_id))??;
             Ok(json!({ "ok": true, "snapshots": snapshots }))
@@ -515,11 +521,181 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
         "set_sync_rule_schedule" => {
             let req: SetSyncRuleSchedulePayload = serde_json::from_str(payload_json)
                 .context("invalid set_sync_rule_schedule JSON payload")?;
-            let mode = api::block_on(api::set_sync_rule_schedule(
-                req.rule_id,
-                req.schedule_mode,
-            ))??;
+            let mode = api::block_on(api::set_sync_rule_schedule(req.rule_id, req.schedule_mode))??;
             Ok(json!({ "ok": true, "schedule_mode": mode }))
+        }
+        // -----------------------------------------------------------------
+        // v2 Device Groups, Group Sync Rules, Catalog & Message Outbox
+        // -----------------------------------------------------------------
+        "list_device_groups" => {
+            let groups = api::block_on(api::list_device_groups())??;
+            Ok(json!({ "ok": true, "groups": groups }))
+        }
+        "create_device_group" => {
+            let req: CreateDeviceGroupPayload = serde_json::from_str(payload_json)
+                .context("invalid create_device_group JSON payload")?;
+            let group = api::block_on(api::create_device_group(req.name))??;
+            Ok(json!({ "ok": true, "group": group }))
+        }
+        "rename_device_group" => {
+            let req: RenameDeviceGroupPayload = serde_json::from_str(payload_json)
+                .context("invalid rename_device_group JSON payload")?;
+            let group = api::block_on(api::rename_device_group(req.group_id, req.name))??;
+            Ok(json!({ "ok": true, "group": group }))
+        }
+        "delete_device_group" => {
+            let req: GroupIdPayload = serde_json::from_str(payload_json)
+                .context("invalid delete_device_group JSON payload")?;
+            api::block_on(api::delete_device_group(req.group_id))??;
+            Ok(json!({ "ok": true }))
+        }
+        "add_group_member" => {
+            let req: AddGroupMemberPayload = serde_json::from_str(payload_json)
+                .context("invalid add_group_member JSON payload")?;
+            api::block_on(api::add_group_member(req.group_id, req.device_id, req.role))??;
+            Ok(json!({ "ok": true }))
+        }
+        "remove_group_member" => {
+            let req: RemoveGroupMemberPayload = serde_json::from_str(payload_json)
+                .context("invalid remove_group_member JSON payload")?;
+            api::block_on(api::remove_group_member(req.group_id, req.device_id))??;
+            Ok(json!({ "ok": true }))
+        }
+        "list_group_rules" => {
+            let req: ListGroupRulesPayload = if payload_json.trim().is_empty() {
+                ListGroupRulesPayload::default()
+            } else {
+                serde_json::from_str(payload_json)
+                    .context("invalid list_group_rules JSON payload")?
+            };
+            let rules = api::block_on(api::list_group_rules(req.group_id))??;
+            Ok(json!({ "ok": true, "rules": rules }))
+        }
+        "upsert_group_rule" => {
+            let req: api::UpsertGroupRuleInput = serde_json::from_str(payload_json)
+                .context("invalid upsert_group_rule JSON payload")?;
+            let rule = api::block_on(api::upsert_group_rule(req))??;
+            Ok(json!({ "ok": true, "rule": rule }))
+        }
+        "delete_group_rule" => {
+            let req: DeleteSyncRulePayload = serde_json::from_str(payload_json)
+                .context("invalid delete_group_rule JSON payload")?;
+            api::block_on(api::delete_group_rule(req.rule_id))??;
+            Ok(json!({ "ok": true }))
+        }
+        "toggle_group_rule" => {
+            let req: ToggleSyncRulePayload = serde_json::from_str(payload_json)
+                .context("invalid toggle_group_rule JSON payload")?;
+            api::block_on(api::toggle_group_rule(req.rule_id, req.enabled))??;
+            Ok(json!({ "ok": true }))
+        }
+        "upsert_rule_target_binding" => {
+            let req: api::UpsertBindingInput = serde_json::from_str(payload_json)
+                .context("invalid upsert_rule_target_binding JSON payload")?;
+            let binding = api::block_on(api::upsert_rule_target_binding(req))??;
+            Ok(json!({ "ok": true, "binding": binding }))
+        }
+        "disable_rule_target_binding" => {
+            let req: BindingIdPayload = serde_json::from_str(payload_json)
+                .context("invalid disable_rule_target_binding JSON payload")?;
+            api::block_on(api::disable_rule_target_binding(req.binding_id))??;
+            Ok(json!({ "ok": true }))
+        }
+        "register_mirror_root" => {
+            let req: RegisterMirrorRootPayload = serde_json::from_str(payload_json)
+                .context("invalid register_mirror_root JSON payload")?;
+            let mirror_root = api::block_on(api::register_mirror_root(
+                req.canonical_path,
+                req.display_name,
+            ))??;
+            Ok(json!({ "ok": true, "mirror_root": mirror_root }))
+        }
+        "list_mirror_roots" => {
+            let mirror_roots = api::block_on(api::list_mirror_roots())??;
+            Ok(json!({ "ok": true, "mirror_roots": mirror_roots }))
+        }
+        "revoke_mirror_root" => {
+            let req: RevokeMirrorRootPayload = serde_json::from_str(payload_json)
+                .context("invalid revoke_mirror_root JSON payload")?;
+            api::block_on(api::revoke_mirror_root(req.root_id))??;
+            Ok(json!({ "ok": true }))
+        }
+        "preview_group_rule" => {
+            let req: DeleteSyncRulePayload = serde_json::from_str(payload_json)
+                .context("invalid preview_group_rule JSON payload")?;
+            let previews = api::block_on(api::preview_group_rule(req.rule_id))??;
+            Ok(json!({ "ok": true, "previews": previews }))
+        }
+        "trigger_group_rule_sync" => {
+            let req: DeleteSyncRulePayload = serde_json::from_str(payload_json)
+                .context("invalid trigger_group_rule_sync JSON payload")?;
+            let outcome = api::block_on(api::trigger_group_rule_sync(req.rule_id))??;
+            Ok(json!({ "ok": true, "outcome": outcome }))
+        }
+        "list_binding_catalog" => {
+            let req: ListBindingCatalogPayload = serde_json::from_str(payload_json)
+                .context("invalid list_binding_catalog JSON payload")?;
+            let entries = api::block_on(api::list_binding_catalog(
+                req.binding_id,
+                req.after_path_key,
+                req.limit,
+                req.source_deleted_only,
+            ))??;
+            Ok(json!({ "ok": true, "entries": entries }))
+        }
+        "list_binding_versions" => {
+            let req: ListBindingVersionsPayload = serde_json::from_str(payload_json)
+                .context("invalid list_binding_versions JSON payload")?;
+            let versions = api::block_on(api::list_binding_versions(
+                req.binding_id,
+                req.path_key,
+                req.after_archived_at,
+                req.after_version_id,
+                req.limit,
+            ))??;
+            Ok(json!({ "ok": true, "versions": versions }))
+        }
+        "restore_catalog_version" => {
+            let req: RestoreCatalogVersionPayload = serde_json::from_str(payload_json)
+                .context("invalid restore_catalog_version JSON payload")?;
+            let result = api::block_on(api::restore_catalog_version(
+                req.binding_id,
+                req.version_id,
+                req.target_dir,
+            ))??;
+            Ok(json!({ "ok": true, "result": result }))
+        }
+        "enqueue_message_text" => {
+            let req: EnqueueMessageTextPayload = serde_json::from_str(payload_json)
+                .context("invalid enqueue_message_text JSON payload")?;
+            let outbox =
+                api::block_on(api::enqueue_message_text(req.target_device_ids, req.text))??;
+            Ok(json!({ "ok": true, "outbox": outbox }))
+        }
+        "enqueue_message_file" => {
+            let req: EnqueueMessageFilePayload = serde_json::from_str(payload_json)
+                .context("invalid enqueue_message_file JSON payload")?;
+            let outbox = api::block_on(api::enqueue_message_file(
+                req.target_device_ids,
+                req.file_path,
+            ))??;
+            Ok(json!({ "ok": true, "outbox": outbox }))
+        }
+        "retry_outbox_message" => {
+            let req: RetryOutboxMessagePayload = serde_json::from_str(payload_json)
+                .context("invalid retry_outbox_message JSON payload")?;
+            let reset_targets = api::block_on(api::retry_outbox_message(req.client_msg_id))??;
+            Ok(json!({ "ok": true, "reset_targets": reset_targets }))
+        }
+        "list_outbox_messages" => {
+            let req: ListOutboxMessagesPayload = if payload_json.trim().is_empty() {
+                ListOutboxMessagesPayload::default()
+            } else {
+                serde_json::from_str(payload_json)
+                    .context("invalid list_outbox_messages JSON payload")?
+            };
+            let messages = api::block_on(api::list_outbox_messages(req.limit))??;
+            Ok(json!({ "ok": true, "messages": messages }))
         }
         other => bail!("unsupported FFI function: `{other}`"),
     }
@@ -852,7 +1028,9 @@ mod android_jni {
         _class: JClass,
     ) -> JBoolean {
         catch_unwind(|| jni_graceful_restart_impl(true)).unwrap_or_else(|_| {
-            error!("panic across JNI boundary in RootDaemonService_nativeGracefulRestartRootServer");
+            error!(
+                "panic across JNI boundary in RootDaemonService_nativeGracefulRestartRootServer"
+            );
             JNI_FALSE
         })
     }
@@ -957,4 +1135,110 @@ struct PushClipboardFilePayload {
     #[serde(default)]
     target_device_id: Option<String>,
     file_path: String,
+}
+#[derive(Deserialize)]
+struct CreateDeviceGroupPayload {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct RenameDeviceGroupPayload {
+    group_id: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct GroupIdPayload {
+    group_id: String,
+}
+
+#[derive(Deserialize)]
+struct AddGroupMemberPayload {
+    group_id: String,
+    device_id: String,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RemoveGroupMemberPayload {
+    group_id: String,
+    device_id: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ListGroupRulesPayload {
+    #[serde(default)]
+    group_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BindingIdPayload {
+    binding_id: String,
+}
+
+#[derive(Deserialize)]
+struct RegisterMirrorRootPayload {
+    canonical_path: String,
+    #[serde(default)]
+    display_name: String,
+}
+
+#[derive(Deserialize)]
+struct RevokeMirrorRootPayload {
+    root_id: String,
+}
+
+#[derive(Deserialize)]
+struct ListBindingCatalogPayload {
+    binding_id: String,
+    #[serde(default)]
+    after_path_key: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    source_deleted_only: bool,
+}
+
+#[derive(Deserialize)]
+struct ListBindingVersionsPayload {
+    binding_id: String,
+    #[serde(default)]
+    path_key: Option<String>,
+    #[serde(default)]
+    after_archived_at: Option<i64>,
+    #[serde(default)]
+    after_version_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct RestoreCatalogVersionPayload {
+    binding_id: String,
+    version_id: String,
+    target_dir: String,
+}
+
+#[derive(Deserialize)]
+struct EnqueueMessageTextPayload {
+    target_device_ids: Vec<String>,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct EnqueueMessageFilePayload {
+    target_device_ids: Vec<String>,
+    file_path: String,
+}
+
+#[derive(Deserialize)]
+struct RetryOutboxMessagePayload {
+    client_msg_id: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ListOutboxMessagesPayload {
+    #[serde(default)]
+    limit: Option<usize>,
 }

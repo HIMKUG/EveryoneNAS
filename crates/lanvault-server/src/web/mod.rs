@@ -4,8 +4,12 @@
 //!
 //! 100% aligned with `ARCHITECTURE_CONTRACTS.md` §3.1 (REST endpoints + `/ws`).
 
+mod catalog_routes;
 mod debug_routes;
+mod groups_routes;
+use catalog_routes::*;
 use debug_routes::*;
+use groups_routes::*;
 
 use std::collections::HashSet;
 use std::path::{Component, Path as StdPath, PathBuf};
@@ -15,13 +19,13 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::Request;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::header::{HeaderName, HeaderValue, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
-use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use std::fs::{self, File};
 use std::io::Write;
@@ -32,8 +36,8 @@ use lanvault_core::crypto::constant_time_eq;
 use lanvault_core::{
     blake3_hash, encrypt_aead, pairing_identity_message, pairing_response_message,
     public_key_fingerprint, session_renew_message, verify_ed25519, ClipboardKind, Database,
-    DeviceIdentity, LanVaultError, PoolMode, RetentionTier, SessionKeyExchange, SnapshotRecord,
-    SymmetricKey, TrustedPeer, VolumeRole, CHUNK_MAX_SIZE, CLIPBOARD_AAD,
+    DeviceIdentity, LanVaultError, MessageTargetAck, PoolMode, RetentionTier, SessionKeyExchange,
+    SnapshotRecord, SymmetricKey, TrustedPeer, VolumeRole, CHUNK_MAX_SIZE, CLIPBOARD_AAD,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, Notify};
@@ -135,7 +139,9 @@ impl ActiveChunkWriteGuard {
 
 impl Drop for ActiveChunkWriteGuard {
     fn drop(&mut self) {
-        self.state.active_chunk_writes.fetch_sub(1, Ordering::SeqCst);
+        self.state
+            .active_chunk_writes
+            .fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -149,12 +155,31 @@ pub enum WsServerEvent {
     },
     BitRotAlert(BitRotAlertEvent),
     ClipboardReceived {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_msg_id: Option<String>,
         from_device_id: String,
         target_device_id: Option<String>,
         kind: ClipboardKind,
         content: String,
         filename: Option<String>,
         encrypted: bool,
+        timestamp: i64,
+    },
+    ClipboardStatus {
+        client_msg_id: String,
+        from_device_id: String,
+        delivered_to: usize,
+        accepted_to: usize,
+        server_ack_at: i64,
+        targets: Vec<MessageTargetAck>,
+    },
+    GroupSyncUpdate {
+        group_id: String,
+        rule_id: String,
+        binding_id: String,
+        operation_id: String,
+        new_revision: i64,
+        applied_ops: usize,
         timestamp: i64,
     },
     PairingRequested(PendingPairRequestDto),
@@ -357,8 +382,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/auth/logout", post(handle_logout))
         .route("/api/system/status", get(handle_system_status))
         .route("/api/system/restart", post(handle_system_restart))
-        .route("/api/vaults", get(handle_list_vaults).post(handle_create_vault))
-        .route("/api/vaults/{vault_id}/devices/{device_id}", put(handle_grant_vault_access))
+        .route(
+            "/api/vaults",
+            get(handle_list_vaults).post(handle_create_vault),
+        )
+        .route(
+            "/api/vaults/{vault_id}/devices/{device_id}",
+            put(handle_grant_vault_access),
+        )
         .route(
             "/api/vaults/{vault_id}/chunks/exists",
             post(handle_check_chunks_exists).layer(DefaultBodyLimit::max(1024 * 1024)),
@@ -400,10 +431,93 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/transfers/{transfer_id}/parts/{part_index}",
             put(handle_transfer_part).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
         )
-        .route("/api/transfers/{transfer_id}/status", get(handle_transfer_status))
-        .route("/api/transfers/{transfer_id}/commit", post(handle_transfer_commit))
-        .route("/api/debug/config", get(handle_get_debug_config).post(handle_set_debug_config))
-        .route("/api/debug/logs", get(handle_get_debug_logs).delete(handle_clear_debug_logs))
+        .route(
+            "/api/transfers/{transfer_id}/status",
+            get(handle_transfer_status),
+        )
+        .route(
+            "/api/transfers/{transfer_id}/commit",
+            post(handle_transfer_commit),
+        )
+        .route("/api/clipboard/history", get(handle_clipboard_history))
+        .route("/api/capabilities", get(handle_get_capabilities))
+        .route(
+            "/api/groups",
+            get(handle_list_groups).post(handle_create_group),
+        )
+        .route(
+            "/api/groups/{group_id}",
+            patch(handle_update_group).delete(handle_delete_group),
+        )
+        .route(
+            "/api/groups/{group_id}/members",
+            get(handle_list_group_members).post(handle_add_group_member),
+        )
+        .route(
+            "/api/groups/{group_id}/members/{device_id}",
+            delete(handle_remove_group_member),
+        )
+        .route(
+            "/api/groups/{group_id}/rules",
+            get(handle_list_group_rules).post(handle_create_group_rule),
+        )
+        .route(
+            "/api/rules/{rule_id}",
+            patch(handle_update_group_rule).delete(handle_delete_group_rule),
+        )
+        .route(
+            "/api/rules/{rule_id}/bindings",
+            get(handle_list_rule_bindings).post(handle_create_rule_binding),
+        )
+        .route(
+            "/api/rules/{rule_id}/bindings/{binding_id}",
+            delete(handle_delete_rule_binding),
+        )
+        .route("/api/mirror-roots", get(handle_list_mirror_roots))
+        .route(
+            "/api/mirror-roots/register",
+            post(handle_register_mirror_root),
+        )
+        .route(
+            "/api/mirror-roots/{root_id}",
+            delete(handle_revoke_mirror_root),
+        )
+        .route(
+            "/api/vaults/{vault_id}/chunks/check",
+            post(handle_check_chunks),
+        )
+        .route(
+            "/api/bindings/{binding_id}/leases",
+            post(handle_acquire_sync_lease),
+        )
+        .route(
+            "/api/bindings/{binding_id}/catalog/commit",
+            post(handle_commit_catalog).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        )
+        .route(
+            "/api/bindings/{binding_id}/catalog/operations/{operation_id}",
+            get(handle_get_catalog_operation),
+        )
+        .route(
+            "/api/bindings/{binding_id}/catalog",
+            get(handle_list_catalog_entries),
+        )
+        .route(
+            "/api/bindings/{binding_id}/versions",
+            get(handle_list_catalog_versions),
+        )
+        .route(
+            "/api/bindings/{binding_id}/versions/{version_id}/download",
+            get(handle_download_catalog_version),
+        )
+        .route(
+            "/api/debug/config",
+            get(handle_get_debug_config).post(handle_set_debug_config),
+        )
+        .route(
+            "/api/debug/logs",
+            get(handle_get_debug_logs).delete(handle_clear_debug_logs),
+        )
         .route(
             "/api/debug/logs/client",
             post(handle_report_client_log).layer(DefaultBodyLimit::max(1024 * 1024)),
@@ -422,7 +536,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(handle_peer_session_challenge),
         )
         .route("/api/peers/session", post(handle_peer_session_renew))
-        .route("/api/peers/pair-request", post(handle_pair_request_initiate))
+        .route(
+            "/api/peers/pair-request",
+            post(handle_pair_request_initiate),
+        )
         .route("/api/peers/pair-status", post(handle_pair_request_status))
         .merge(protected_router)
         .layer(CookieManagerLayer::new())
@@ -837,10 +954,20 @@ struct PeerDto {
 
 #[derive(Debug, Deserialize)]
 struct ClipboardRequest {
+    #[serde(default)]
+    client_msg_id: Option<String>,
     target_device_id: Option<String>,
+    #[serde(default)]
+    target_device_ids: Option<Vec<String>>,
     kind: ClipboardKind,
     content: String,
     filename: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClipboardHistoryQuery {
+    limit: Option<usize>,
+    session_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1079,7 +1206,9 @@ async fn handle_grant_vault_access(
         if !peer.is_some_and(|peer| peer.revoked_at.is_none()) {
             return Err(LanVaultError::NotFound(format!("trusted peer {device_id}")));
         }
-        state.db.grant_vault_access(&vault_id, &device_id, unix_timestamp_secs())
+        state
+            .db
+            .grant_vault_access(&vault_id, &device_id, unix_timestamp_secs())
     })
     .await;
     match result {
@@ -1156,12 +1285,10 @@ async fn handle_create_vault(
     }
 }
 
-
 #[derive(Debug, Deserialize)]
 struct CheckChunksExistsRequest {
     hashes_hex: Vec<String>,
 }
-
 
 fn internal_error(msg: String) -> Response {
     warn!(error = %msg, "internal server error");
@@ -1194,7 +1321,12 @@ fn require_vault_access(
     if session.is_admin {
         return Ok(None);
     }
-    let Some(dev_id) = session.device_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(dev_id) = session
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
         return Err(unauthorized_response());
     };
     if !state.auth.validate_session_device_active(dev_id) {
@@ -1202,11 +1334,15 @@ fn require_vault_access(
     }
     match state.db.is_device_authorized_for_vault(vault_id, dev_id) {
         Ok(true) => Ok(Some(dev_id.to_string())),
-        Ok(false) => Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "vault_access_denied" })),
-        )
-            .into_response()),
+        Ok(false) => match state.db.is_group_source_for_vault(dev_id, vault_id) {
+            Ok(true) => Ok(Some(dev_id.to_string())),
+            Ok(false) => Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "vault_access_denied" })),
+            )
+                .into_response()),
+            Err(err) => Err(map_domain_error(err)),
+        },
         Err(err) => Err(map_domain_error(err)),
     }
 }
@@ -1244,12 +1380,15 @@ async fn handle_check_chunks_exists(
     .await;
 
     match join_res {
-        Ok(Ok(missing)) => (StatusCode::OK, Json(serde_json::json!({ "missing": missing }))).into_response(),
+        Ok(Ok(missing)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "missing": missing })),
+        )
+            .into_response(),
         Ok(Err(err)) => map_domain_error(err),
         Err(err) => internal_error(format!("chunks exists task failed: {err}")),
     }
 }
-
 
 async fn handle_get_chunk(
     State(state): State<Arc<AppState>>,
@@ -1267,24 +1406,25 @@ async fn handle_get_chunk(
     let vault_store = Arc::clone(&state.vault_store);
     let db = Arc::clone(&state.db);
     let vid = vault_id.clone();
-    let res = tokio::task::spawn_blocking(move || -> lanvault_core::Result<(Vec<u8>, &'static str)> {
-        if let Some(dev_id) = peer_device_id.as_deref() {
-            if !db.is_chunk_accessible_to_device(&vid, &hash, dev_id)? {
-                return Err(LanVaultError::Auth(
-                    "chunk is not referenced by any snapshot owned by this device".to_string(),
-                ));
+    let res =
+        tokio::task::spawn_blocking(move || -> lanvault_core::Result<(Vec<u8>, &'static str)> {
+            if let Some(dev_id) = peer_device_id.as_deref() {
+                if !db.is_chunk_accessible_to_device(&vid, &hash, dev_id)? {
+                    return Err(LanVaultError::Auth(
+                        "chunk is not referenced by any snapshot owned by this device".to_string(),
+                    ));
+                }
             }
-        }
-        let bytes = vault_store.get_chunk(&vid, &hash)?;
-        let comp = db.get_chunk_compression(&vid, &hash);
-        let enc: &'static str = if comp.eq_ignore_ascii_case("raw") {
-            "xchacha20poly1305+raw"
-        } else {
-            "xchacha20poly1305+zstd"
-        };
-        Ok((bytes, enc))
-    })
-    .await;
+            let bytes = vault_store.get_chunk(&vid, &hash)?;
+            let comp = db.get_chunk_compression(&vid, &hash);
+            let enc: &'static str = if comp.eq_ignore_ascii_case("raw") {
+                "xchacha20poly1305+raw"
+            } else {
+                "xchacha20poly1305+zstd"
+            };
+            Ok((bytes, enc))
+        })
+        .await;
 
     match res {
         Ok(Ok((bytes, enc))) => (
@@ -1318,15 +1458,20 @@ async fn handle_get_snapshot_manifest(
             .get_snapshot(&sid)?
             .ok_or_else(|| LanVaultError::NotFound(format!("snapshot {sid}")))?;
         if !session.is_admin && session.device_id.as_deref() != Some(snap.device_id.as_str()) {
-            return Err(LanVaultError::Auth("snapshot belongs to another device".to_string()));
+            return Err(LanVaultError::Auth(
+                "snapshot belongs to another device".to_string(),
+            ));
         }
         if let Ok(roots) = vault_store.manifest_backup_roots(&snap.vault_id) {
             for root in roots {
-                let candidate = root.join("manifests").join(format!("{}.json", snap.snapshot_id));
+                let candidate = root
+                    .join("manifests")
+                    .join(format!("{}.json", snap.snapshot_id));
                 if candidate.is_file() {
                     let bytes = std::fs::read(&candidate)?;
-                    let val: serde_json::Value = serde_json::from_slice(&bytes)
-                        .map_err(|e| LanVaultError::InvalidInput(format!("invalid manifest: {e}")))?;
+                    let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|e| {
+                        LanVaultError::InvalidInput(format!("invalid manifest: {e}"))
+                    })?;
                     return Ok(serde_json::json!({
                         "vault_id": snap.vault_id,
                         "snapshot_id": snap.snapshot_id,
@@ -1335,7 +1480,9 @@ async fn handle_get_snapshot_manifest(
                 }
             }
         }
-        Err(LanVaultError::NotFound(format!("manifest for snapshot {sid}")))
+        Err(LanVaultError::NotFound(format!(
+            "manifest for snapshot {sid}"
+        )))
     })
     .await;
 
@@ -1463,34 +1610,35 @@ async fn handle_list_snapshots(
     let is_admin = session.is_admin;
     let session_device_id = session.device_id;
 
-    let join_res = tokio::task::spawn_blocking(move || -> lanvault_core::Result<Vec<SnapshotDto>> {
-        let snaps = if is_admin {
-            db.list_snapshots_filtered_paginated(vault_id.as_deref(), None, limit, offset)?
-        } else if let Some(dev_id) = session_device_id.as_deref() {
-            db.list_snapshots_filtered_paginated(
-                vault_id.as_deref(),
-                Some(dev_id),
-                limit,
-                offset,
-            )?
-        } else {
-            Vec::new()
-        };
-        Ok(snaps
-            .into_iter()
-            .map(|s| SnapshotDto {
-                snapshot_id: s.snapshot_id,
-                vault_id: s.vault_id,
-                rule_id: s.rule_id,
-                device_id: s.device_id,
-                retention_tier: s.retention_tier.as_str().to_string(),
-                file_count: s.file_count,
-                total_bytes: s.total_bytes,
-                created_at: s.created_at,
-            })
-            .collect())
-    })
-    .await;
+    let join_res =
+        tokio::task::spawn_blocking(move || -> lanvault_core::Result<Vec<SnapshotDto>> {
+            let snaps = if is_admin {
+                db.list_snapshots_filtered_paginated(vault_id.as_deref(), None, limit, offset)?
+            } else if let Some(dev_id) = session_device_id.as_deref() {
+                db.list_snapshots_filtered_paginated(
+                    vault_id.as_deref(),
+                    Some(dev_id),
+                    limit,
+                    offset,
+                )?
+            } else {
+                Vec::new()
+            };
+            Ok(snaps
+                .into_iter()
+                .map(|s| SnapshotDto {
+                    snapshot_id: s.snapshot_id,
+                    vault_id: s.vault_id,
+                    rule_id: s.rule_id,
+                    device_id: s.device_id,
+                    retention_tier: s.retention_tier.as_str().to_string(),
+                    file_count: s.file_count,
+                    total_bytes: s.total_bytes,
+                    created_at: s.created_at,
+                })
+                .collect())
+        })
+        .await;
 
     match join_res {
         Ok(Ok(dtos)) => (
@@ -1605,104 +1753,105 @@ async fn handle_create_snapshot(
         }
 
         vault_store.with_write_lock(|| {
-        let vault = db
-            .get_vault(&vid)?
-            .ok_or_else(|| LanVaultError::NotFound(format!("vault {vid}")))?;
-        if db.get_trusted_peer(&device_id)?.is_none() {
-            return Err(LanVaultError::NotFound(format!("trusted peer {device_id}")));
-        }
-        let manifest_roots = vault_store.manifest_backup_roots(&vid)?;
-
-        let created_at = unix_timestamp_secs();
-        let file_count = normalized_files.len() as u64;
-        let total_bytes = normalized_files
-            .iter()
-            .fold(0u64, |acc, f| acc.saturating_add(f.size));
-
-        let canonical_root = manifest_root_hash(&normalized_files)?;
-        let root_tree_hash = match explicit_root_hash {
-            Some(hash) if hash == canonical_root => hash,
-            Some(_) => {
-                return Err(LanVaultError::InvalidInput(
-                    "root_tree_hash_hex does not match the canonical manifest".to_string(),
-                ))
+            let vault = db
+                .get_vault(&vid)?
+                .ok_or_else(|| LanVaultError::NotFound(format!("vault {vid}")))?;
+            if db.get_trusted_peer(&device_id)?.is_none() {
+                return Err(LanVaultError::NotFound(format!("trusted peer {device_id}")));
             }
-            None => canonical_root,
-        };
+            let manifest_roots = vault_store.manifest_backup_roots(&vid)?;
 
-        let record = SnapshotRecord {
-            snapshot_id: snapshot_id.clone(),
-            vault_id: vid.clone(),
-            rule_id: rule_id.clone(),
-            device_id: device_id.clone(),
-            root_tree_hash,
-            retention_tier,
-            file_count,
-            total_bytes,
-            created_at,
-        };
-        if let Some(existing) = db.get_snapshot(&snapshot_id)? {
-            if existing.vault_id == record.vault_id
-                && existing.rule_id == record.rule_id
-                && existing.device_id == record.device_id
-                && existing.root_tree_hash == record.root_tree_hash
-                && existing.retention_tier == record.retention_tier
-                && existing.file_count == record.file_count
-                && existing.total_bytes == record.total_bytes
-            {
-                return Ok(existing);
-            }
-            return Err(LanVaultError::InvalidInput(format!(
-                "snapshot_id {snapshot_id} already exists with different contents"
-            )));
-        }
+            let created_at = unix_timestamp_secs();
+            let file_count = normalized_files.len() as u64;
+            let total_bytes = normalized_files
+                .iter()
+                .fold(0u64, |acc, f| acc.saturating_add(f.size));
 
-        let manifest = SnapshotManifest {
-            snapshot_id: snapshot_id.clone(),
-            vault_id: vid.clone(),
-            rule_id: rule_id.clone(),
-            device_id: device_id.clone(),
-            root_tree_hash_hex: hex::encode(root_tree_hash),
-            e2ee_enabled: vault.e2ee_enabled,
-            created_at,
-            files: normalized_files,
-        };
-
-        let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-        let mut manifest_paths = Vec::with_capacity(manifest_roots.len());
-        let write_manifests = (|| -> lanvault_core::Result<()> {
-            for root_dir in &manifest_roots {
-                let manifests_dir = root_dir.join("manifests");
-                let staging_dir = root_dir.join("staging");
-                fs::create_dir_all(&manifests_dir)?;
-                fs::create_dir_all(&staging_dir)?;
-                let tmp_path = staging_dir.join(format!("manifest.{}.tmp", uuid::Uuid::new_v4()));
-                let final_path = manifests_dir.join(format!("{snapshot_id}.json"));
-                {
-                    let mut file = File::create(&tmp_path)?;
-                    file.write_all(&manifest_bytes)?;
-                    file.sync_all()?;
+            let canonical_root = manifest_root_hash(&normalized_files)?;
+            let root_tree_hash = match explicit_root_hash {
+                Some(hash) if hash == canonical_root => hash,
+                Some(_) => {
+                    return Err(LanVaultError::InvalidInput(
+                        "root_tree_hash_hex does not match the canonical manifest".to_string(),
+                    ))
                 }
-                fs::rename(&tmp_path, &final_path)?;
-                manifest_paths.push(final_path);
-            }
-            Ok(())
-        })();
-        if let Err(err) = write_manifests {
-            for path in &manifest_paths {
-                let _ = fs::remove_file(path);
-            }
-            return Err(err);
-        }
-        let hashes: Vec<[u8; 32]> = unique_hashes.into_iter().collect();
-        if let Err(err) = db.insert_snapshot_with_chunks(&record, &hashes) {
-            for path in &manifest_paths {
-                let _ = fs::remove_file(path);
-            }
-            return Err(err);
-        }
+                None => canonical_root,
+            };
 
-        Ok(record)
+            let record = SnapshotRecord {
+                snapshot_id: snapshot_id.clone(),
+                vault_id: vid.clone(),
+                rule_id: rule_id.clone(),
+                device_id: device_id.clone(),
+                root_tree_hash,
+                retention_tier,
+                file_count,
+                total_bytes,
+                created_at,
+            };
+            if let Some(existing) = db.get_snapshot(&snapshot_id)? {
+                if existing.vault_id == record.vault_id
+                    && existing.rule_id == record.rule_id
+                    && existing.device_id == record.device_id
+                    && existing.root_tree_hash == record.root_tree_hash
+                    && existing.retention_tier == record.retention_tier
+                    && existing.file_count == record.file_count
+                    && existing.total_bytes == record.total_bytes
+                {
+                    return Ok(existing);
+                }
+                return Err(LanVaultError::InvalidInput(format!(
+                    "snapshot_id {snapshot_id} already exists with different contents"
+                )));
+            }
+
+            let manifest = SnapshotManifest {
+                snapshot_id: snapshot_id.clone(),
+                vault_id: vid.clone(),
+                rule_id: rule_id.clone(),
+                device_id: device_id.clone(),
+                root_tree_hash_hex: hex::encode(root_tree_hash),
+                e2ee_enabled: vault.e2ee_enabled,
+                created_at,
+                files: normalized_files,
+            };
+
+            let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+            let mut manifest_paths = Vec::with_capacity(manifest_roots.len());
+            let write_manifests = (|| -> lanvault_core::Result<()> {
+                for root_dir in &manifest_roots {
+                    let manifests_dir = root_dir.join("manifests");
+                    let staging_dir = root_dir.join("staging");
+                    fs::create_dir_all(&manifests_dir)?;
+                    fs::create_dir_all(&staging_dir)?;
+                    let tmp_path =
+                        staging_dir.join(format!("manifest.{}.tmp", uuid::Uuid::new_v4()));
+                    let final_path = manifests_dir.join(format!("{snapshot_id}.json"));
+                    {
+                        let mut file = File::create(&tmp_path)?;
+                        file.write_all(&manifest_bytes)?;
+                        file.sync_all()?;
+                    }
+                    fs::rename(&tmp_path, &final_path)?;
+                    manifest_paths.push(final_path);
+                }
+                Ok(())
+            })();
+            if let Err(err) = write_manifests {
+                for path in &manifest_paths {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(err);
+            }
+            let hashes: Vec<[u8; 32]> = unique_hashes.into_iter().collect();
+            if let Err(err) = db.insert_snapshot_with_chunks(&record, &hashes) {
+                for path in &manifest_paths {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(err);
+            }
+
+            Ok(record)
         })
     })
     .await;
@@ -1740,7 +1889,6 @@ async fn handle_snapshot_file_download(
     Path(snapshot_id): Path<String>,
     Query(query): Query<SnapshotFileQuery>,
 ) -> Response {
-
     if let Err(err) = validate_snapshot_id(&snapshot_id) {
         return map_domain_error(err);
     }
@@ -1766,70 +1914,70 @@ async fn handle_snapshot_file_download(
     let scan_vault_id = vault_id.clone();
     let join_res =
         tokio::task::spawn_blocking(move || -> lanvault_core::Result<(Vec<[u8; 32]>, bool)> {
-        let vault_id = scan_vault_id;
-        let snap = db
-            .get_snapshot(&snap_id)?
-            .ok_or_else(|| LanVaultError::NotFound(format!("snapshot {snap_id}")))?;
-        if snap.vault_id != vault_id {
-            return Err(LanVaultError::NotFound(format!(
-                "snapshot {snap_id} in vault {vault_id}"
-            )));
-        }
-        if !session.is_admin && session.device_id.as_deref() != Some(snap.device_id.as_str()) {
-            return Err(LanVaultError::NotFound(format!(
-                "snapshot {snap_id} in vault {vault_id}"
-            )));
-        }
-
-        let vault = db
-            .get_vault(&vault_id)?
-            .ok_or_else(|| LanVaultError::NotFound(format!("vault {vault_id}")))?;
-
-        let mut valid_manifest = None;
-        for root in vault_store.manifest_backup_roots(&vault_id)? {
-            let Ok(bytes) = fs::read(root.join("manifests").join(format!("{snap_id}.json"))) else {
-                continue;
-            };
-            let Ok(candidate) = serde_json::from_slice::<SnapshotManifest>(&bytes) else {
-                continue;
-            };
-            if candidate.snapshot_id == snap.snapshot_id
-                && candidate.vault_id == snap.vault_id
-                && candidate.device_id == snap.device_id
-                && candidate.rule_id == snap.rule_id
-                && manifest_root_hash(&candidate.files).ok() == Some(snap.root_tree_hash)
-            {
-                valid_manifest = Some(candidate);
-                break;
+            let vault_id = scan_vault_id;
+            let snap = db
+                .get_snapshot(&snap_id)?
+                .ok_or_else(|| LanVaultError::NotFound(format!("snapshot {snap_id}")))?;
+            if snap.vault_id != vault_id {
+                return Err(LanVaultError::NotFound(format!(
+                    "snapshot {snap_id} in vault {vault_id}"
+                )));
             }
-        }
-        let manifest = valid_manifest.ok_or_else(|| {
-            LanVaultError::NotFound(format!("valid snapshot manifest for {snap_id}"))
-        })?;
+            if !session.is_admin && session.device_id.as_deref() != Some(snap.device_id.as_str()) {
+                return Err(LanVaultError::NotFound(format!(
+                    "snapshot {snap_id} in vault {vault_id}"
+                )));
+            }
 
-        let file_entry = manifest
-            .files
-            .iter()
-            .find(|f| f.rel_path == normalized_rel_path)
-            .ok_or_else(|| {
-                LanVaultError::NotFound(format!(
-                    "file {normalized_rel_path} in snapshot {snap_id}"
-                ))
+            let vault = db
+                .get_vault(&vault_id)?
+                .ok_or_else(|| LanVaultError::NotFound(format!("vault {vault_id}")))?;
+
+            let mut valid_manifest = None;
+            for root in vault_store.manifest_backup_roots(&vault_id)? {
+                let Ok(bytes) = fs::read(root.join("manifests").join(format!("{snap_id}.json")))
+                else {
+                    continue;
+                };
+                let Ok(candidate) = serde_json::from_slice::<SnapshotManifest>(&bytes) else {
+                    continue;
+                };
+                if candidate.snapshot_id == snap.snapshot_id
+                    && candidate.vault_id == snap.vault_id
+                    && candidate.device_id == snap.device_id
+                    && candidate.rule_id == snap.rule_id
+                    && manifest_root_hash(&candidate.files).ok() == Some(snap.root_tree_hash)
+                {
+                    valid_manifest = Some(candidate);
+                    break;
+                }
+            }
+            let manifest = valid_manifest.ok_or_else(|| {
+                LanVaultError::NotFound(format!("valid snapshot manifest for {snap_id}"))
             })?;
 
-        let mut chunk_hashes = Vec::with_capacity(file_entry.chunk_hashes_hex.len());
-        for hash_hex in &file_entry.chunk_hashes_hex {
-            chunk_hashes.push(decode_hex_32(hash_hex, "manifest chunk hash")?);
-        }
+            let file_entry = manifest
+                .files
+                .iter()
+                .find(|f| f.rel_path == normalized_rel_path)
+                .ok_or_else(|| {
+                    LanVaultError::NotFound(format!(
+                        "file {normalized_rel_path} in snapshot {snap_id}"
+                    ))
+                })?;
 
-        Ok((chunk_hashes, vault.e2ee_enabled))
-    })
-    .await;
+            let mut chunk_hashes = Vec::with_capacity(file_entry.chunk_hashes_hex.len());
+            for hash_hex in &file_entry.chunk_hashes_hex {
+                chunk_hashes.push(decode_hex_32(hash_hex, "manifest chunk hash")?);
+            }
+
+            Ok((chunk_hashes, vault.e2ee_enabled))
+        })
+        .await;
 
     match join_res {
         Ok(Ok((chunk_hashes, e2ee_enabled))) => {
-            let disposition =
-                format!("attachment; filename=\"{filename}.lanvault-chunks\"");
+            let disposition = format!("attachment; filename=\"{filename}.lanvault-chunks\"");
             let stream_store = Arc::clone(&state.vault_store);
             let stream_vault_id = vault_id.clone();
             let chunk_stream = futures_util::stream::try_unfold(
@@ -1840,10 +1988,13 @@ async fn handle_snapshot_file_download(
                     };
                     let store_bg = Arc::clone(&store);
                     let vid_bg = vid.clone();
-                    let bytes = tokio::task::spawn_blocking(move || store_bg.get_chunk(&vid_bg, &hash))
-                        .await
-                        .map_err(|e| std::io::Error::other(format!("chunk stream join error: {e}")))?
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    let bytes =
+                        tokio::task::spawn_blocking(move || store_bg.get_chunk(&vid_bg, &hash))
+                            .await
+                            .map_err(|e| {
+                                std::io::Error::other(format!("chunk stream join error: {e}"))
+                            })?
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
                     let frame_len: u32 = bytes.len().try_into().map_err(|_| {
                         std::io::Error::other(format!(
                             "chunk exceeds u32 frame limit: {}",
@@ -1999,7 +2150,11 @@ async fn handle_list_peers(
     };
     let pairing_qr_uri = format!(
         "lanvault://pair?id={}&ip={}&port={}&pin={}&fp={}",
-        state.device_id, state.lan_ip, state.port, pairing_pin, state.identity.fingerprint_hex()
+        state.device_id,
+        state.lan_ip,
+        state.port,
+        pairing_pin,
+        state.identity.fingerprint_hex()
     );
 
     (
@@ -2299,11 +2454,7 @@ async fn handle_pair_peer(
             )))
         }
     };
-    if let Err(err) = verify_ed25519(
-        &client_ed25519_pubkey,
-        &identity_message,
-        &signature_bytes,
-    ) {
+    if let Err(err) = verify_ed25519(&client_ed25519_pubkey, &identity_message, &signature_bytes) {
         return map_domain_error(err);
     }
 
@@ -2457,7 +2608,9 @@ async fn handle_pair_request_initiate(
     };
     if let Err(reason) = state.enqueue_pair_request(entry, now) {
         let code = match reason {
-            PairQueueRejectReason::SourceLimitReached => "too_many_pending_pair_requests_from_source",
+            PairQueueRejectReason::SourceLimitReached => {
+                "too_many_pending_pair_requests_from_source"
+            }
             PairQueueRejectReason::GlobalLimitReached => "too_many_pending_pair_requests",
         };
         return (
@@ -2603,10 +2756,7 @@ async fn handle_peer_heartbeat(
         return unauthorized_response();
     }
 
-    let reported_port = req
-        .last_port
-        .filter(|port| *port > 0)
-        .or(peer.last_port);
+    let reported_port = req.last_port.filter(|port| *port > 0).or(peer.last_port);
     let observed_ip = addr.ip().to_string();
     let ip_changed = peer.last_ip.as_deref() != Some(observed_ip.as_str());
     let port_changed = peer.last_port != reported_port;
@@ -2711,11 +2861,11 @@ async fn handle_peer_session_renew(
             "device_id and challenge must not be empty".to_string(),
         ));
     }
-    let declared_pubkey = match decode_hex_32(&req.client_ed25519_pubkey_hex, "client_ed25519_pubkey_hex")
-    {
-        Ok(pk) => pk,
-        Err(err) => return map_domain_error(err),
-    };
+    let declared_pubkey =
+        match decode_hex_32(&req.client_ed25519_pubkey_hex, "client_ed25519_pubkey_hex") {
+            Ok(pk) => pk,
+            Err(err) => return map_domain_error(err),
+        };
     let signature = match hex::decode(&req.client_ed25519_signature_hex) {
         Ok(bytes) => bytes,
         Err(err) => {
@@ -2726,14 +2876,14 @@ async fn handle_peer_session_renew(
     };
 
     // 设备 ID 必须由公钥指纹推出，且与请求声明一致，杜绝冒用他人 ID。
-    let expected_device_id = format!(
-        "lv-{}",
-        &public_key_fingerprint(&declared_pubkey)[..12]
-    );
+    let expected_device_id = format!("lv-{}", &public_key_fingerprint(&declared_pubkey)[..12]);
     if expected_device_id != req.device_id.trim() {
         return unauthorized_response();
     }
-    if !state.auth.validate_session_device_active(&expected_device_id) {
+    if !state
+        .auth
+        .validate_session_device_active(&expected_device_id)
+    {
         return unauthorized_response();
     }
 
@@ -2757,9 +2907,7 @@ async fn handle_peer_session_renew(
         return unauthorized_response();
     }
 
-    let token = state
-        .auth
-        .issue_peer_session(expected_device_id.clone());
+    let token = state.auth.issue_peer_session(expected_device_id.clone());
     if addr.ip().to_string() != peer.last_ip.clone().unwrap_or_default() {
         let updated = TrustedPeer {
             last_ip: Some(addr.ip().to_string()),
@@ -2792,7 +2940,11 @@ async fn handle_delete_peer(
     }
     match state.db.delete_trusted_peer(&device_id) {
         Ok(true) => {
+            if let Err(err) = state.db.revoke_peer_from_all_groups(&device_id) {
+                return map_domain_error(err);
+            }
             state.online_peers.remove(&device_id);
+            state.peer_leases.remove(&device_id);
             state.auth.revoke_device_sessions(&device_id);
             (
                 StatusCode::OK,
@@ -2808,7 +2960,6 @@ async fn handle_delete_peer(
     }
 }
 
-
 #[derive(Debug, Deserialize)]
 struct TransferInitRequest {
     transfer_id: String,
@@ -2818,7 +2969,9 @@ struct TransferInitRequest {
     file_blake3_hex: String,
 }
 
-fn resolve_transfer_dirs(state: &AppState) -> lanvault_core::Result<(std::path::PathBuf, std::path::PathBuf)> {
+fn resolve_transfer_dirs(
+    state: &AppState,
+) -> lanvault_core::Result<(std::path::PathBuf, std::path::PathBuf)> {
     let vaults = state.db.list_vaults()?;
     let base_root = if let Some(v) = vaults.first() {
         let vols = state.vault_store.online_volumes(&v.vault_id)?;
@@ -2844,13 +2997,28 @@ fn sanitize_transfer_filename(raw: &str) -> String {
         .unwrap_or("received_file");
     let cleaned: String = name
         .chars()
-        .map(|c| if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .map(|c| {
+            if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
-    if cleaned.is_empty() { "received_file".to_string() } else { cleaned }
+    if cleaned.is_empty() {
+        "received_file".to_string()
+    } else {
+        cleaned
+    }
 }
 
 fn transfer_owner_id(session: &SessionInfo) -> Result<String, Response> {
-    if let Some(device_id) = session.device_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(device_id) = session
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Ok(device_id.to_string())
     } else if session.is_admin {
         Ok("__admin__".to_string())
@@ -2863,7 +3031,12 @@ fn scoped_transfer_id(owner_id: &str, client_transfer_id: &str) -> String {
     format!("{owner_id}__{client_transfer_id}")
 }
 
-fn expected_transfer_part_len(total_size: u64, chunk_size: u64, total_parts: u64, part_index: u64) -> Option<u64> {
+fn expected_transfer_part_len(
+    total_size: u64,
+    chunk_size: u64,
+    total_parts: u64,
+    part_index: u64,
+) -> Option<u64> {
     if part_index >= total_parts || chunk_size == 0 {
         return None;
     }
@@ -2885,7 +3058,12 @@ fn is_disk_full_io_error(err: &std::io::Error) -> bool {
 impl AppState {
     pub(crate) fn reclaim_expired_transfers(&self, now_secs: i64) -> lanvault_core::Result<()> {
         // Run cleanup only when all transfer operations have released their locks.
-        let Ok(_locks) = self.transfer_locks.iter().map(|lock| lock.try_write()).collect::<Result<Vec<_>, _>>() else {
+        let Ok(_locks) = self
+            .transfer_locks
+            .iter()
+            .map(|lock| lock.try_write())
+            .collect::<Result<Vec<_>, _>>()
+        else {
             return Ok(());
         };
         let (staging, _) = resolve_transfer_dirs(self)?;
@@ -2893,7 +3071,9 @@ impl AppState {
         for entry in fs::read_dir(staging)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("part") || !entry.file_type()?.is_file() {
+            if path.extension().and_then(|ext| ext.to_str()) != Some("part")
+                || !entry.file_type()?.is_file()
+            {
                 continue;
             }
             let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
@@ -2916,7 +3096,10 @@ fn received_usage(path: &StdPath) -> std::io::Result<(usize, u64)> {
     fs::read_dir(path)?.try_fold((0usize, 0u64), |(count, bytes), entry| {
         let entry = entry?;
         if entry.file_type()?.is_file() {
-            Ok((count.saturating_add(1), bytes.saturating_add(entry.metadata()?.len())))
+            Ok((
+                count.saturating_add(1),
+                bytes.saturating_add(entry.metadata()?.len()),
+            ))
         } else {
             Ok((count, bytes))
         }
@@ -2930,13 +3113,14 @@ fn allocate_unique_received_path(
 ) -> std::path::PathBuf {
     let available = |candidate: &StdPath| {
         let key = candidate.to_string_lossy();
-        !candidate.exists() && !reserved.iter().any(|path| {
-            if cfg!(windows) {
-                path.to_lowercase() == key.to_lowercase()
-            } else {
-                path == key.as_ref()
-            }
-        })
+        !candidate.exists()
+            && !reserved.iter().any(|path| {
+                if cfg!(windows) {
+                    path.to_lowercase() == key.to_lowercase()
+                } else {
+                    path == key.as_ref()
+                }
+            })
     };
     let direct = received_dir.join(filename);
     if available(&direct) {
@@ -3004,7 +3188,9 @@ async fn handle_transfer_init(
         req.total_size.div_ceil(req.chunk_size)
     };
     if total_parts > MAX_TRANSFER_PARTS {
-        return map_domain_error(LanVaultError::InvalidInput("transfer has too many parts".to_string()));
+        return map_domain_error(LanVaultError::InvalidInput(
+            "transfer has too many parts".to_string(),
+        ));
     }
     let init_guard = transfer_lock(&state, &scoped_id).write_owned().await;
     let write_guard = ActiveChunkWriteGuard::new(Arc::clone(&state));
@@ -3028,7 +3214,9 @@ async fn handle_transfer_init(
                 && (existing.expires_at > now || existing.saved_path.is_some())
                 && existing.total_size == req.total_size
                 && existing.chunk_size == req.chunk_size
-                && existing.file_blake3.eq_ignore_ascii_case(&req.file_blake3_hex)
+                && existing
+                    .file_blake3
+                    .eq_ignore_ascii_case(&req.file_blake3_hex)
             {
                 return (
                     StatusCode::OK,
@@ -3061,7 +3249,9 @@ async fn handle_transfer_init(
             )
                 .into_response();
         }
-        let (retained_count, retained_bytes) = match resolve_transfer_dirs(&state).and_then(|(_, received)| Ok(received_usage(&received)?)) {
+        let (retained_count, retained_bytes) = match resolve_transfer_dirs(&state)
+            .and_then(|(_, received)| Ok(received_usage(&received)?))
+        {
             Ok(usage) => usage,
             Err(error) => return map_domain_error(error),
         };
@@ -3069,7 +3259,8 @@ async fn handle_transfer_init(
             return (
                 StatusCode::INSUFFICIENT_STORAGE,
                 Json(serde_json::json!({ "error": "received_file_count_limit" })),
-            ).into_response();
+            )
+                .into_response();
         }
         let reserved_and_retained = global_bytes.saturating_add(retained_bytes);
         if owner_bytes.saturating_add(req.total_size) > MAX_STAGING_BYTES_PER_DEVICE
@@ -3077,21 +3268,24 @@ async fn handle_transfer_init(
         {
             return map_domain_error(LanVaultError::QuotaExceeded {
                 required: req.total_size,
-                available: MAX_STAGING_BYTES_PER_DEVICE.saturating_sub(owner_bytes)
+                available: MAX_STAGING_BYTES_PER_DEVICE
+                    .saturating_sub(owner_bytes)
                     .min(MAX_STAGING_BYTES_GLOBAL.saturating_sub(reserved_and_retained)),
             });
         }
         match state.db.list_vaults() {
-            Ok(vaults) => if let Some(vault) = vaults.first() {
-                let used_with_staging = vault.used_bytes.saturating_add(reserved_and_retained);
-                let available = vault.quota_bytes.saturating_sub(used_with_staging);
-                if vault.quota_bytes > 0 && req.total_size > available {
-                    return map_domain_error(LanVaultError::QuotaExceeded {
-                        required: req.total_size,
-                        available,
-                    });
+            Ok(vaults) => {
+                if let Some(vault) = vaults.first() {
+                    let used_with_staging = vault.used_bytes.saturating_add(reserved_and_retained);
+                    let available = vault.quota_bytes.saturating_sub(used_with_staging);
+                    if vault.quota_bytes > 0 && req.total_size > available {
+                        return map_domain_error(LanVaultError::QuotaExceeded {
+                            required: req.total_size,
+                            available,
+                        });
+                    }
                 }
-            },
+            }
             Err(error) => return map_domain_error(error),
         }
 
@@ -3123,7 +3317,8 @@ async fn handle_transfer_init(
                 .into_response(),
             Err(err) => map_domain_error(err),
         }
-    }).await;
+    })
+    .await;
     match result {
         Ok(response) => response,
         Err(error) => internal_error(format!("transfer init task failed: {error}")),
@@ -3157,7 +3352,9 @@ async fn handle_transfer_part(
 
     let session_rec = match state.db.get_transfer_session_metadata(&scoped_id) {
         Ok(Some(r)) => r,
-        Ok(None) => return map_domain_error(LanVaultError::NotFound(format!("transfer {safe_tid}"))),
+        Ok(None) => {
+            return map_domain_error(LanVaultError::NotFound(format!("transfer {safe_tid}")))
+        }
         Err(err) => return map_domain_error(err),
     };
     if session_rec.owner_device_id != owner_id {
@@ -3167,7 +3364,10 @@ async fn handle_transfer_part(
         )
             .into_response();
     }
-    if session_rec.status != "active" || session_rec.saved_path.is_some() || session_rec.expires_at <= unix_timestamp_secs() {
+    if session_rec.status != "active"
+        || session_rec.saved_path.is_some()
+        || session_rec.expires_at <= unix_timestamp_secs()
+    {
         return map_domain_error(LanVaultError::InvalidState(
             "transfer session is not active".to_string(),
         ));
@@ -3188,7 +3388,10 @@ async fn handle_transfer_part(
             body.len()
         )));
     }
-    if let Some(expected_hex) = headers.get("x-lanvault-part-blake3").and_then(|v| v.to_str().ok()) {
+    if let Some(expected_hex) = headers
+        .get("x-lanvault-part-blake3")
+        .and_then(|v| v.to_str().ok())
+    {
         let actual_hex = hex::encode(lanvault_core::blake3_hash(&body));
         if !actual_hex.eq_ignore_ascii_case(expected_hex) {
             return map_domain_error(LanVaultError::InvalidInput(
@@ -3217,7 +3420,10 @@ async fn handle_transfer_part(
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(&body_vec)?;
         state.db.mark_transfer_part_received(
-            &session_rec.transfer_id, part_index, part_len, unix_timestamp_secs(),
+            &session_rec.transfer_id,
+            part_index,
+            part_len,
+            unix_timestamp_secs(),
         )?;
         state.transfer_bytes.fetch_add(part_len, Ordering::Relaxed);
         Ok(())
@@ -3225,13 +3431,11 @@ async fn handle_transfer_part(
     .await;
 
     match write_res {
-        Ok(Ok(())) => {
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "part_index": part_index })),
-            )
-                .into_response()
-        }
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "part_index": part_index })),
+        )
+            .into_response(),
         Ok(Err(LanVaultError::Io(ref err))) if is_disk_full_io_error(err) => {
             map_domain_error(LanVaultError::QuotaExceeded {
                 required: part_len,
@@ -3307,7 +3511,9 @@ async fn handle_transfer_commit(
 
     let session_rec = match state.db.get_transfer_session(&scoped_id) {
         Ok(Some(r)) => r,
-        Ok(None) => return map_domain_error(LanVaultError::NotFound(format!("transfer {safe_tid}"))),
+        Ok(None) => {
+            return map_domain_error(LanVaultError::NotFound(format!("transfer {safe_tid}")))
+        }
         Err(err) => return map_domain_error(err),
     };
     if session_rec.owner_device_id != owner_id {
@@ -3489,12 +3695,21 @@ async fn handle_clipboard_push(
     }
 
     let timestamp = unix_timestamp_secs();
+    let raw_size_bytes = req.content.len() as u64;
+    let sender_device_id = session
+        .device_id
+        .clone()
+        .unwrap_or_else(|| state.device_id.clone());
+    let client_msg_id = req
+        .client_msg_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
     let content = if session.is_admin {
-        let wire = match encrypt_aead(
-            &state.clipboard_key,
-            req.content.as_bytes(),
-            CLIPBOARD_AAD,
-        ) {
+        let wire = match encrypt_aead(&state.clipboard_key, req.content.as_bytes(), CLIPBOARD_AAD) {
             Ok(wire) => wire,
             Err(err) => return map_domain_error(err),
         };
@@ -3512,44 +3727,200 @@ async fn handle_clipboard_push(
         }
         req.content
     };
-    if let Some(target_id) = req.target_device_id.as_deref() {
-        if session.device_id.as_deref() == Some(target_id) || !state.is_peer_online(target_id) {
-            return map_domain_error(LanVaultError::InvalidInput(
-                "clipboard target is not an online peer".to_string(),
-            ));
+
+    let explicit_targets: Option<Vec<String>> = match (req.target_device_ids, req.target_device_id)
+    {
+        (Some(ids), _) => {
+            let mut seen = HashSet::new();
+            let mut deduped = Vec::with_capacity(ids.len());
+            for id in ids {
+                let trimmed = id.trim();
+                if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                    deduped.push(trimmed.to_string());
+                }
+            }
+            Some(deduped)
         }
-    }
-    let delivered_to = match &req.target_device_id {
-        Some(target_id) => usize::from(state.is_peer_online(target_id)),
-        None => state
-            .online_peer_ids()
-            .len()
-            .saturating_sub(usize::from(
-                session
-                    .device_id
-                    .as_ref()
-                    .is_some_and(|device_id| state.is_peer_online(device_id)),
-            )),
+        (None, Some(single)) => {
+            let trimmed = single.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(vec![trimmed.to_string()])
+            }
+        }
+        (None, None) => None,
     };
 
-    let _ = state.ws_tx.send(WsServerEvent::ClipboardReceived {
-        from_device_id: session
-            .device_id
-            .clone()
-            .unwrap_or_else(|| state.device_id.clone()),
-        target_device_id: req.target_device_id,
-        kind: req.kind,
-        content,
-        filename: req.filename,
-        encrypted: true,
+    let target_ids: Vec<String> = match &explicit_targets {
+        Some(list) => list.clone(),
+        None => {
+            let mut online: Vec<String> = state
+                .online_peer_ids()
+                .into_iter()
+                .filter(|id| id != &sender_device_id)
+                .collect();
+            online.sort();
+            online
+        }
+    };
+
+    let mut targets: Vec<MessageTargetAck> = Vec::with_capacity(target_ids.len());
+    let mut delivered_targets: Vec<String> = Vec::new();
+    for target_id in &target_ids {
+        if target_id == &sender_device_id {
+            targets.push(MessageTargetAck {
+                target_device_id: target_id.clone(),
+                status: "failed".to_string(),
+                error_code: Some("self_target".to_string()),
+                error_message: Some("cannot send clipboard payload to self".to_string()),
+            });
+            continue;
+        }
+        let trusted = match state.db.get_trusted_peer(target_id) {
+            Ok(peer) => peer,
+            Err(err) => return map_domain_error(err),
+        };
+        if trusted.is_none() {
+            targets.push(MessageTargetAck {
+                target_device_id: target_id.clone(),
+                status: "revoked".to_string(),
+                error_code: Some("peer_revoked".to_string()),
+                error_message: Some("target peer is revoked or not trusted".to_string()),
+            });
+        } else if state.is_peer_online(target_id) {
+            delivered_targets.push(target_id.clone());
+            targets.push(MessageTargetAck {
+                target_device_id: target_id.clone(),
+                status: "delivered".to_string(),
+                error_code: None,
+                error_message: None,
+            });
+        } else {
+            targets.push(MessageTargetAck {
+                target_device_id: target_id.clone(),
+                status: "offline".to_string(),
+                error_code: Some("peer_offline".to_string()),
+                error_message: Some("target peer is currently offline".to_string()),
+            });
+        }
+    }
+
+    let delivered_to = delivered_targets.len();
+    let accepted_to = delivered_to;
+    let response_value = serde_json::json!({
+        "client_msg_id": client_msg_id,
+        "delivered_to": delivered_to,
+        "accepted_to": accepted_to,
+        "server_ack_at": timestamp,
+        "timestamp": timestamp,
+        "targets": targets,
+    });
+    let ack_json = match serde_json::to_string(&response_value) {
+        Ok(s) => s,
+        Err(err) => return map_domain_error(err.into()),
+    };
+
+    // Enforce idempotency per (sender_device_id, client_msg_id, server_device_id).
+    match state.db.record_or_check_message_dedup(
+        &sender_device_id,
+        &client_msg_id,
+        &state.device_id,
+        &ack_json,
+    ) {
+        Ok(Some(existing_ack_json)) => {
+            let existing: serde_json::Value = match serde_json::from_str(&existing_ack_json) {
+                Ok(v) => v,
+                Err(err) => return map_domain_error(err.into()),
+            };
+            return (StatusCode::OK, Json(existing)).into_response();
+        }
+        Ok(None) => {}
+        Err(err) => return map_domain_error(err),
+    }
+
+    let kind_str = match req.kind {
+        ClipboardKind::Text => "text",
+        ClipboardKind::File => "file",
+    };
+    let title = req
+        .filename
+        .clone()
+        .unwrap_or_else(|| format!("clipboard:{client_msg_id}"));
+    let subtitle = format!("delivered={delivered_to}/{}", targets.len());
+    if let Err(err) = state.db.insert_transfer_record(
+        "send",
+        kind_str,
+        &title,
+        &subtitle,
+        &sender_device_id,
+        None,
+        raw_size_bytes,
         timestamp,
+    ) {
+        return map_domain_error(err);
+    }
+
+    if explicit_targets.is_some() {
+        for target_id in delivered_targets {
+            let _ = state.ws_tx.send(WsServerEvent::ClipboardReceived {
+                client_msg_id: Some(client_msg_id.clone()),
+                from_device_id: sender_device_id.clone(),
+                target_device_id: Some(target_id),
+                kind: req.kind,
+                content: content.clone(),
+                filename: req.filename.clone(),
+                encrypted: true,
+                timestamp,
+            });
+        }
+    } else if delivered_to > 0 {
+        let _ = state.ws_tx.send(WsServerEvent::ClipboardReceived {
+            client_msg_id: Some(client_msg_id.clone()),
+            from_device_id: sender_device_id.clone(),
+            target_device_id: None,
+            kind: req.kind,
+            content,
+            filename: req.filename,
+            encrypted: true,
+            timestamp,
+        });
+    }
+
+    let _ = state.ws_tx.send(WsServerEvent::ClipboardStatus {
+        client_msg_id,
+        from_device_id: sender_device_id,
+        delivered_to,
+        accepted_to,
+        server_ack_at: timestamp,
+        targets,
     });
 
+    (StatusCode::OK, Json(response_value)).into_response()
+}
+
+async fn handle_clipboard_history(
+    State(state): State<Arc<AppState>>,
+    Extension(_session): Extension<SessionInfo>,
+    Query(query): Query<ClipboardHistoryQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let transfers = match state.db.list_transfer_records(limit) {
+        Ok(records) => records,
+        Err(err) => return map_domain_error(err),
+    };
+    let outbox = match state
+        .db
+        .list_outbox_messages(query.session_key.as_deref(), limit)
+    {
+        Ok(records) => records,
+        Err(err) => return map_domain_error(err),
+    };
     (
         StatusCode::OK,
         Json(serde_json::json!({
-            "delivered_to": delivered_to,
-            "timestamp": timestamp,
+            "transfers": transfers,
+            "outbox": outbox,
         })),
     )
         .into_response()
@@ -3570,9 +3941,7 @@ async fn handle_ws_upgrade(
         .map(|cookie| cookie.value().to_string())
         .unwrap_or_default();
     let connected_device_id = session.device_id;
-    ws.on_upgrade(move |socket| {
-        serve_ws_connection(socket, state, connected_device_id, token)
-    })
+    ws.on_upgrade(move |socket| serve_ws_connection(socket, state, connected_device_id, token))
 }
 
 async fn serve_ws_connection(
@@ -3661,6 +4030,28 @@ async fn serve_ws_connection(
                                 continue;
                             }
                         }
+                        if let WsServerEvent::ClipboardStatus {
+                            ref from_device_id,
+                            ..
+                        } = ev
+                        {
+                            if let Some(ref dev_id) = connected_device_id {
+                                if dev_id != from_device_id {
+                                    continue;
+                                }
+                            }
+                        }
+                        if let WsServerEvent::GroupSyncUpdate { ref group_id, .. } = ev {
+                            if let Some(ref dev_id) = connected_device_id {
+                                if !state
+                                    .db
+                                    .is_active_group_member(group_id, dev_id)
+                                    .unwrap_or(false)
+                                {
+                                    continue;
+                                }
+                            }
+                        }
                         if let Ok(json) = serde_json::to_string(&ev) {
                             if out_tx.try_send(Message::Text(json.into())).is_err() {
                                 warn!("closing slow WebSocket client during event broadcast");
@@ -3716,17 +4107,14 @@ async fn serve_ws_connection(
     }
 }
 
-
 #[cfg(test)]
 mod batch_security_tests {
     use super::*;
     use crate::scrub::BitRotAlertEvent;
 
     fn make_test_state() -> (Arc<AppState>, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "everyonenas-web-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("everyonenas-web-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create temp test dir");
         let db = Arc::new(Database::open(&dir.join("index.db")).expect("open test db"));
         let vault_store = Arc::new(VaultStore::new(Arc::clone(&db)));
@@ -3793,20 +4181,29 @@ mod batch_security_tests {
     }
 
     fn insert_fixture_peer(state: &AppState, device_id: &str) {
-        state.db.upsert_trusted_peer(&TrustedPeer {
-            device_id: device_id.to_string(),
-            device_name: device_id.to_string(),
-            os_type: "test".into(),
-            ed25519_pubkey: vec![0; 32],
-            last_ip: None,
-            last_port: None,
-            auto_connect: false,
-            paired_at: unix_timestamp_secs(),
-            revoked_at: None,
-        }).expect("seed trusted device");
+        state
+            .db
+            .upsert_trusted_peer(&TrustedPeer {
+                device_id: device_id.to_string(),
+                device_name: device_id.to_string(),
+                os_type: "test".into(),
+                ed25519_pubkey: vec![0; 32],
+                last_ip: None,
+                last_port: None,
+                auto_connect: false,
+                paired_at: unix_timestamp_secs(),
+                revoked_at: None,
+            })
+            .expect("seed trusted device");
     }
 
-    fn dummy_pair_entry(req_id: &str, device_id: &str, ip: &str, now: i64, ttl: i64) -> PendingPairEntry {
+    fn dummy_pair_entry(
+        req_id: &str,
+        device_id: &str,
+        ip: &str,
+        now: i64,
+        ttl: i64,
+    ) -> PendingPairEntry {
         PendingPairEntry {
             dto: PendingPairRequestDto {
                 request_id: req_id.to_string(),
@@ -3834,7 +4231,13 @@ mod batch_security_tests {
 
         // Same IP fills up to per-IP cap with distinct devices
         for i in 0..MAX_PENDING_PAIR_REQUESTS_PER_IP {
-            let entry = dummy_pair_entry(&format!("r-{i}"), &format!("lv-attacker{i}"), "192.168.1.50", now, 60);
+            let entry = dummy_pair_entry(
+                &format!("r-{i}"),
+                &format!("lv-attacker{i}"),
+                "192.168.1.50",
+                now,
+                60,
+            );
             assert!(state.enqueue_pair_request(entry, now).is_ok());
         }
         // Extra device from same IP is rejected
@@ -3860,7 +4263,13 @@ mod batch_security_tests {
         let now = unix_timestamp_secs();
 
         for i in 0..MAX_PENDING_PAIR_REQUESTS {
-            let entry = dummy_pair_entry(&format!("g-{i}"), &format!("lv-dev{i:04}"), &format!("10.0.0.{}", i + 1), now, 60);
+            let entry = dummy_pair_entry(
+                &format!("g-{i}"),
+                &format!("lv-dev{i:04}"),
+                &format!("10.0.0.{}", i + 1),
+                now,
+                60,
+            );
             assert!(state.enqueue_pair_request(entry, now).is_ok());
         }
         let overflow = dummy_pair_entry("g-over", "lv-over", "10.0.1.1", now, 60);
@@ -3900,13 +4309,17 @@ mod batch_security_tests {
         assert!(state.issue_renew_challenge("lv-unknown").is_err());
 
         // Valid challenge issued, mismatched device rejected without succeeding, replay rejected
-        let chal = state.issue_renew_challenge(&peer_id).expect("issue challenge");
+        let chal = state
+            .issue_renew_challenge(&peer_id)
+            .expect("issue challenge");
         assert!(!state.consume_renew_challenge(&chal, "lv-other"));
         // Even after failed mismatch, challenge was consumed/removed to prevent probing
         assert!(!state.consume_renew_challenge(&chal, &peer_id));
 
         // Concurrent race: only 1 of 8 threads may succeed on the same challenge
-        let chal_race = state.issue_renew_challenge(&peer_id).expect("issue race challenge");
+        let chal_race = state
+            .issue_renew_challenge(&peer_id)
+            .expect("issue race challenge");
         let wins = Arc::new(AtomicU64::new(0));
         let mut handles = Vec::new();
         for _ in 0..8 {
@@ -3977,22 +4390,50 @@ mod batch_security_tests {
         state.db.upsert_transfer_session(&rec_b).expect("upsert b");
 
         // Incremental part recording is idempotent and sorted
-        state.db.mark_transfer_part_received(&scoped_a, 1, 512, now).expect("part 1");
-        state.db.mark_transfer_part_received(&scoped_a, 1, 512, now + 1).expect("dup part 1");
-        state.db.mark_transfer_part_received(&scoped_a, 0, 512, now + 2).expect("part 0");
+        state
+            .db
+            .mark_transfer_part_received(&scoped_a, 1, 512, now)
+            .expect("part 1");
+        state
+            .db
+            .mark_transfer_part_received(&scoped_a, 1, 512, now + 1)
+            .expect("dup part 1");
+        state
+            .db
+            .mark_transfer_part_received(&scoped_a, 0, 512, now + 2)
+            .expect("part 0");
 
-        let loaded_a = state.db.get_transfer_session(&scoped_a).expect("get a").expect("some a");
-        let loaded_b = state.db.get_transfer_session(&scoped_b).expect("get b").expect("some b");
+        let loaded_a = state
+            .db
+            .get_transfer_session(&scoped_a)
+            .expect("get a")
+            .expect("some a");
+        let loaded_b = state
+            .db
+            .get_transfer_session(&scoped_b)
+            .expect("get b")
+            .expect("some b");
         assert_eq!(loaded_a.received_parts, vec![0, 1]);
         assert!(loaded_b.received_parts.is_empty());
 
         // Atomic completion with history releases active budget
-        let (oc_before, ob_before, gc_before, gb_before) =
-            state.db.active_transfer_usage("lv-device-a").expect("usage before");
-        assert_eq!((oc_before, ob_before, gc_before, gb_before), (1, 1024, 2, 2048));
+        let (oc_before, ob_before, gc_before, gb_before) = state
+            .db
+            .active_transfer_usage("lv-device-a")
+            .expect("usage before");
+        assert_eq!(
+            (oc_before, ob_before, gc_before, gb_before),
+            (1, 1024, 2, 2048)
+        );
 
-        state.db.reserve_transfer_destination(&scoped_a, "/tmp/report.pdf").expect("reserve a");
-        assert!(state.db.reserve_transfer_destination(&scoped_b, "/tmp/report.pdf").is_err());
+        state
+            .db
+            .reserve_transfer_destination(&scoped_a, "/tmp/report.pdf")
+            .expect("reserve a");
+        assert!(state
+            .db
+            .reserve_transfer_destination(&scoped_b, "/tmp/report.pdf")
+            .is_err());
         state
             .db
             .complete_transfer_session_with_history(
@@ -4004,8 +4445,10 @@ mod batch_security_tests {
                 now + 5,
             )
             .expect("complete a");
-        let (oc_after, ob_after, gc_after, gb_after) =
-            state.db.active_transfer_usage("lv-device-a").expect("usage after");
+        let (oc_after, ob_after, gc_after, gb_after) = state
+            .db
+            .active_transfer_usage("lv-device-a")
+            .expect("usage after");
         assert_eq!((oc_after, ob_after, gc_after, gb_after), (0, 0, 1, 1024));
 
         // Expected part lengths reject short non-final parts and support zero-byte files
@@ -4043,36 +4486,61 @@ mod batch_security_tests {
             updated_at: now - 7200,
             expires_at: now - 3600,
         };
-        state.db.upsert_transfer_session(&record).expect("transfer session");
-        state.db.reserve_transfer_destination(&scoped_id, &dest.to_string_lossy()).expect("persist publication");
-        state.reclaim_expired_transfers(now).expect("cleanup preserves pending publication");
+        state
+            .db
+            .upsert_transfer_session(&record)
+            .expect("transfer session");
+        state
+            .db
+            .reserve_transfer_destination(&scoped_id, &dest.to_string_lossy())
+            .expect("persist publication");
+        state
+            .reclaim_expired_transfers(now)
+            .expect("cleanup preserves pending publication");
         for _ in 0..2 {
             let response = handle_transfer_commit(
                 State(Arc::clone(&state)),
-                Extension(SessionInfo { is_admin: true, device_id: None }),
+                Extension(SessionInfo {
+                    is_admin: true,
+                    device_id: None,
+                }),
                 Path(tid.to_string()),
-            ).await;
+            )
+            .await;
             assert_eq!(response.status(), StatusCode::OK);
         }
-        assert_eq!(state.db.list_transfer_records(10).expect("history").len(), 1);
-        assert_eq!(received_usage(&received).expect("retained usage"), (1, contents.len() as u64));
+        assert_eq!(
+            state.db.list_transfer_records(10).expect("history").len(),
+            1
+        );
+        assert_eq!(
+            received_usage(&received).expect("retained usage"),
+            (1, contents.len() as u64)
+        );
     }
 
     #[test]
     fn allocate_unique_received_path_avoids_overwriting_existing_files() {
-        let dir = std::env::temp_dir().join(format!(
-            "everyonenas-recv-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("everyonenas-recv-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create dir");
         let first = allocate_unique_received_path(&dir, "photo.jpg", &[]);
-        assert_eq!(first.file_name().and_then(|s| s.to_str()), Some("photo.jpg"));
+        assert_eq!(
+            first.file_name().and_then(|s| s.to_str()),
+            Some("photo.jpg")
+        );
         let reserved = [first.to_string_lossy().into_owned()];
-        assert_ne!(allocate_unique_received_path(&dir, "photo.jpg", &reserved), first);
+        assert_ne!(
+            allocate_unique_received_path(&dir, "photo.jpg", &reserved),
+            first
+        );
         std::fs::write(&first, b"1").expect("write first");
 
         let second = allocate_unique_received_path(&dir, "photo.jpg", &[]);
-        assert_eq!(second.file_name().and_then(|s| s.to_str()), Some("photo (1).jpg"));
+        assert_eq!(
+            second.file_name().and_then(|s| s.to_str()),
+            Some("photo (1).jpg")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4114,15 +4582,23 @@ mod batch_security_tests {
         let grant_path = (secondary.vault_id.clone(), "lv-peer-a".to_string());
         let denied = handle_grant_vault_access(
             State(Arc::clone(&state)),
-            Extension(SessionInfo { is_admin: false, device_id: Some("lv-peer-b".into()) }),
+            Extension(SessionInfo {
+                is_admin: false,
+                device_id: Some("lv-peer-b".into()),
+            }),
             Path(grant_path.clone()),
-        ).await;
+        )
+        .await;
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
         let granted = handle_grant_vault_access(
             State(Arc::clone(&state)),
-            Extension(SessionInfo { is_admin: true, device_id: None }),
+            Extension(SessionInfo {
+                is_admin: true,
+                device_id: None,
+            }),
             Path(grant_path),
-        ).await;
+        )
+        .await;
         assert_eq!(granted.status(), StatusCode::NO_CONTENT);
         assert!(state
             .db
@@ -4138,20 +4614,44 @@ mod batch_security_tests {
         let raw_hash = blake3_hash(raw_payload);
         assert!(state
             .vault_store
-            .put_chunk_with_compression(&default_vault_id, &raw_hash, raw_payload.len() as u64, raw_payload, "raw")
+            .put_chunk_with_compression(
+                &default_vault_id,
+                &raw_hash,
+                raw_payload.len() as u64,
+                raw_payload,
+                "raw"
+            )
             .expect("put raw"));
-        assert_eq!(state.db.get_chunk_compression(&default_vault_id, &raw_hash), "raw");
+        assert_eq!(
+            state.db.get_chunk_compression(&default_vault_id, &raw_hash),
+            "raw"
+        );
         // Same-tag dedup retry succeeds
         assert!(!state
             .vault_store
-            .put_chunk_with_compression(&default_vault_id, &raw_hash, raw_payload.len() as u64, raw_payload, "raw")
+            .put_chunk_with_compression(
+                &default_vault_id,
+                &raw_hash,
+                raw_payload.len() as u64,
+                raw_payload,
+                "raw"
+            )
             .expect("dedup raw"));
         // Conflicting tag is rejected and does NOT overwrite stored metadata
         assert!(state
             .vault_store
-            .put_chunk_with_compression(&default_vault_id, &raw_hash, raw_payload.len() as u64, raw_payload, "zstd")
+            .put_chunk_with_compression(
+                &default_vault_id,
+                &raw_hash,
+                raw_payload.len() as u64,
+                raw_payload,
+                "zstd"
+            )
             .is_err());
-        assert_eq!(state.db.get_chunk_compression(&default_vault_id, &raw_hash), "raw");
+        assert_eq!(
+            state.db.get_chunk_compression(&default_vault_id, &raw_hash),
+            "raw"
+        );
 
         // Chunk read isolation: only owning snapshot's device can read chunk
         let snap = SnapshotRecord {
@@ -4211,7 +4711,10 @@ mod batch_security_tests {
                 total_bytes: 0,
                 created_at,
             };
-            state.db.insert_snapshot_with_chunks(&snap, &[]).expect("insert snap");
+            state
+                .db
+                .insert_snapshot_with_chunks(&snap, &[])
+                .expect("insert snap");
         }
 
         // Peer A sees only its own snapshots in deterministic DESC order across pages
@@ -4243,4 +4746,3 @@ mod batch_security_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

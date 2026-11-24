@@ -324,6 +324,240 @@ class _FakeLanVaultFfi implements LanVaultRustFfi {
     serverRunning = enabled;
     return enabled;
   }
+
+  @override
+  Future<List<DeviceGroupViewModel>> listDeviceGroups() async =>
+      const <DeviceGroupViewModel>[];
+
+  @override
+  Future<DeviceGroupModel> createDeviceGroup(String name) async =>
+      DeviceGroupModel(
+        groupId: 'grp-1',
+        name: name,
+        coordinatorDeviceId: 'local',
+        revision: 1,
+        createdAt: 0,
+        updatedAt: 0,
+      );
+
+  @override
+  Future<DeviceGroupModel> renameDeviceGroup({
+    required String groupId,
+    required String name,
+  }) async =>
+      DeviceGroupModel(
+        groupId: groupId,
+        name: name,
+        coordinatorDeviceId: 'local',
+        revision: 2,
+        createdAt: 0,
+        updatedAt: 0,
+      );
+
+  @override
+  Future<void> deleteDeviceGroup(String groupId) async {}
+
+  @override
+  Future<void> addGroupMember({
+    required String groupId,
+    required String deviceId,
+    String? role,
+  }) async {}
+
+  @override
+  Future<void> removeGroupMember({
+    required String groupId,
+    required String deviceId,
+  }) async {}
+
+  @override
+  Future<List<GroupRuleViewModel>> listGroupRules({String? groupId}) async =>
+      const <GroupRuleViewModel>[];
+
+  @override
+  Future<GroupSyncRuleModel> upsertGroupRule({
+    String? ruleId,
+    required String groupId,
+    required String name,
+    required String mode,
+    String? sourceDeviceId,
+    required String sourceRoot,
+    String? sourceRootId,
+    int archiveRetentionDays = 30,
+    bool wifiOnly = true,
+    String? allowedSsids,
+    bool requireCharging = false,
+    int maxKbps = 0,
+    int scheduleIntervalSecs = 0,
+    bool enabled = true,
+  }) async =>
+      GroupSyncRuleModel(
+        ruleId: ruleId ?? 'grule-1',
+        groupId: groupId,
+        name: name,
+        mode: mode,
+        sourceDeviceId: sourceDeviceId ?? 'local',
+        sourceRoot: sourceRoot,
+        sourceRootId: sourceRootId,
+        archiveRetentionDays: archiveRetentionDays,
+        wifiOnly: wifiOnly,
+        allowedSsids: allowedSsids,
+        requireCharging: requireCharging,
+        maxKbps: maxKbps,
+        scheduleIntervalSecs: scheduleIntervalSecs,
+        enabled: enabled,
+        revision: 1,
+        groupRevision: 1,
+        needsBindingConfirm: false,
+        createdAt: 0,
+        updatedAt: 0,
+      );
+
+  @override
+  Future<void> deleteGroupRule(String ruleId) async {}
+
+  @override
+  Future<void> toggleGroupRule({
+    required String ruleId,
+    required bool enabled,
+  }) async {}
+
+  @override
+  Future<RuleTargetBindingModel> upsertRuleTargetBinding({
+    String? bindingId,
+    required String ruleId,
+    required String targetDeviceId,
+    String? targetVaultId,
+    String? mirrorRootId,
+    String? targetRoot,
+    bool enabled = true,
+  }) async =>
+      RuleTargetBindingModel(
+        bindingId: bindingId ?? 'bind-1',
+        ruleId: ruleId,
+        groupId: 'grp-1',
+        targetDeviceId: targetDeviceId,
+        targetVaultId: targetVaultId,
+        mirrorRootId: mirrorRootId,
+        targetRoot: targetRoot,
+        enabled: enabled,
+        appliedRevision: 0,
+        lastSourceGen: 0,
+        status: 'pending',
+        needsBindingConfirm: false,
+        createdAt: 0,
+        updatedAt: 0,
+      );
+
+  @override
+  Future<void> disableRuleTargetBinding(String bindingId) async {}
+
+  @override
+  Future<MirrorRootModel> registerMirrorRoot({
+    required String canonicalPath,
+    String displayName = '',
+  }) async =>
+      MirrorRootModel(
+        mirrorRootId: 'mroot-1',
+        deviceId: 'local',
+        canonicalRoot: canonicalPath,
+        label: displayName.isEmpty ? 'Mirror' : displayName,
+        createdAt: 0,
+      );
+
+  @override
+  Future<List<MirrorRootModel>> listMirrorRoots() async =>
+      const <MirrorRootModel>[];
+
+  @override
+  Future<void> revokeMirrorRoot(String rootId) async {}
+
+  @override
+  Future<List<MirrorPreviewModel>> previewGroupRule(String ruleId) async =>
+      const <MirrorPreviewModel>[];
+
+  @override
+  Future<GroupRuleSyncOutcomeModel> triggerGroupRuleSync(String ruleId) async =>
+      GroupRuleSyncOutcomeModel(
+        ruleId: ruleId,
+        sourceComplete: true,
+        scannedEntries: 0,
+        blockedReasons: const <String>[],
+        volatilePaths: const <String>[],
+        bindings: const <BindingSyncOutcomeModel>[],
+      );
+
+  @override
+  Future<List<CatalogEntryModel>> listBindingCatalog({
+    required String bindingId,
+    String? afterPathKey,
+    int? limit,
+    bool sourceDeletedOnly = false,
+  }) async =>
+      const <CatalogEntryModel>[];
+
+  @override
+  Future<List<CatalogVersionModel>> listBindingVersions({
+    required String bindingId,
+    String? pathKey,
+    int? afterArchivedAt,
+    String? afterVersionId,
+    int? limit,
+  }) async =>
+      const <CatalogVersionModel>[];
+
+  @override
+  Future<RestoreCatalogVersionResultModel> restoreCatalogVersion({
+    required String bindingId,
+    required String versionId,
+    required String targetDir,
+  }) =>
+      throw UnimplementedError();
+
+  @override
+  Future<OutboxMessageViewModel> enqueueMessageText({
+    required List<String> targetDeviceIds,
+    required String text,
+  }) async =>
+      OutboxMessageViewModel(
+        clientMsgId: 'msg-1',
+        localSeq: 1,
+        sessionKey: targetDeviceIds.join(','),
+        kind: 'text',
+        title: text,
+        content: text,
+        sizeBytes: text.length,
+        overallStatus: 'sending',
+        createdAt: 0,
+        updatedAt: 0,
+        targets: const <OutboxTargetStatusModel>[],
+      );
+
+  @override
+  Future<OutboxMessageViewModel> enqueueMessageFile({
+    required List<String> targetDeviceIds,
+    required String filePath,
+  }) async =>
+      OutboxMessageViewModel(
+        clientMsgId: 'msg-2',
+        localSeq: 2,
+        sessionKey: targetDeviceIds.join(','),
+        kind: 'file',
+        title: filePath,
+        filePath: filePath,
+        sizeBytes: 0,
+        overallStatus: 'sending',
+        createdAt: 0,
+        updatedAt: 0,
+        targets: const <OutboxTargetStatusModel>[],
+      );
+
+  @override
+  Future<int> retryOutboxMessage(String clientMsgId) async => 1;
+
+  @override
+  Future<List<OutboxMessageViewModel>> listOutboxMessages({int? limit}) async =>
+      const <OutboxMessageViewModel>[];
 }
 
 void main() {

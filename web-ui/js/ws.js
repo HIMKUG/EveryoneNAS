@@ -1,15 +1,14 @@
 /**
  * LanVault WebSocket Client (/ws)
  *
- * Reference basis:
- * - /working_dir/c_0c10370daccfa96e/lanvault/ARCHITECTURE_CONTRACTS.md (Section 3.1 #12)
- *
  * Handles automatic exponential-backoff reconnection and boundary validation
- * for all 4 contract events:
+ * for contract events:
  *   - telemetry
  *   - server_restarting
  *   - bit_rot_alert
  *   - clipboard_received
+ *   - clipboard_status
+ *   - group_sync_update
  */
 (function initLanVaultWs(global) {
   'use strict';
@@ -19,6 +18,8 @@
     'server_restarting',
     'bit_rot_alert',
     'clipboard_received',
+    'clipboard_status',
+    'group_sync_update',
   ]);
 
   const RECONNECT_DELAYS_MS = [1000, 2000, 4000, 8000, 15000];

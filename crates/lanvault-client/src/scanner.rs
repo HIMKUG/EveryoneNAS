@@ -1,20 +1,23 @@
-//! 本地目录遍历与 SQLite `local_file_state(size, mtime_ns, file_id)` 快速元数据 Diff 对账。
-//!
-//! 职责：在重连成功、定时巡检或 `watcher.rs` 捕获队列溢出时，100% 捕获离线期间的老文件修改、
-//! 新文件创建与已删除文件。所有持久化读写统一委托给 `lanvault_core::Database`。
+//! 本地目录遍历、SQLite `local_file_state(size, mtime_ns, file_id)` 快速元数据 Diff 对账（legacy），
+//! 以及 v2 确定性源代扫描 (`scan_source_generation`)：规范化路径、流式 BLAKE3 校验、
+//! 并发修改（volatile）检测、符号链接/重解析点拦截与跨平台路径碰撞检测。
 
 use std::collections::HashMap;
-use std::fs::{self, Metadata};
+use std::fs::{self, File, Metadata};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use lanvault_core::{Database, LocalFileStateRecord};
+use lanvault_core::{
+    blake3_hash_reader, detect_path_collisions, normalize_canonical_path, Database,
+    LocalFileStateRecord, PathCollision,
+};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::error::ClientError;
 
-/// 本地文件元数据快照。
+/// 本地文件元数据快照（legacy）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMetadataSnapshot {
     /// 相对于同步根目录的 POSIX 风格相对路径（统一使用 `/` 分隔符）。
@@ -29,7 +32,7 @@ pub struct FileMetadataSnapshot {
     pub file_id: Option<i64>,
 }
 
-/// 数据库中存储的本地文件状态记录。
+/// 数据库中存储的本地文件状态记录（legacy）。
 #[derive(Debug, Clone)]
 pub struct StoredFileState {
     pub target_vault_id: String,
@@ -39,7 +42,7 @@ pub struct StoredFileState {
     pub chunk_hashes: Vec<u8>,
 }
 
-/// 目录元数据快速 Diff 对账结果。
+/// 目录元数据快速 Diff 对账结果（legacy）。
 #[derive(Debug, Clone, Default)]
 pub struct DiffResult {
     /// 新增文件列表。
@@ -62,6 +65,358 @@ impl DiffResult {
         self.added.is_empty() && self.modified.is_empty() && self.deleted.is_empty()
     }
 }
+
+// -----------------------------------------------------------------------------
+// v2 Source Generation Scanner
+// -----------------------------------------------------------------------------
+
+/// v2 扫描条目类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScannedEntryKind {
+    File,
+    Dir,
+}
+
+impl ScannedEntryKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Dir => "dir",
+        }
+    }
+}
+
+/// v2 确定性源代扫描条目（按 `path_key` 严格字典序排列，文件必含真实流式 BLAKE3 摘要）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScannedEntry {
+    pub path_key: String,
+    pub display_path: String,
+    pub abs_path: PathBuf,
+    pub kind: ScannedEntryKind,
+    pub size: u64,
+    pub mtime_ns: i64,
+    pub file_id: Option<i64>,
+    pub content_hash: Option<[u8; 32]>,
+}
+
+/// v2 一次完整或受阻的源目录代际扫描结果。
+///
+/// 仅当 `complete == true` 时下游合并/镜像引擎才允许推导“源端已删除”操作。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceGeneration {
+    pub root_dir: PathBuf,
+    pub root_identity: Option<String>,
+    pub complete: bool,
+    pub blocked_reasons: Vec<String>,
+    pub volatile_paths: Vec<String>,
+    pub collisions: Vec<PathCollision>,
+    pub entries: Vec<ScannedEntry>,
+}
+
+/// 扫描源目录生成确定性 `SourceGeneration`：
+/// - 校验 `root_dir` 为真实目录且非符号链接/重解析点；
+/// - 迭代遍历目录树，拦截符号链接、Windows junction/reparse point 与特殊文件并记录至 `blocked_reasons`；
+/// - 通过 `lanvault_core::normalize_canonical_path` 规范化每条相对路径（非法路径标记 `complete = false`）；
+/// - 任何 `PermissionDenied` 或 I/O 错误均标记 `complete = false` 并记录原因，绝不触发误删；
+/// - 对每个常规文件计算流式 BLAKE3，读前/读后比对 `(file_id, size, mtime_ns)`，读取中途变更则记入 `volatile_paths` 并跳过；
+/// - 按 `path_key` 规范排序并运行 `lanvault_core::detect_path_collisions`。
+pub fn scan_source_generation(
+    root_dir: &Path,
+    exclude_patterns: &[String],
+) -> Result<SourceGeneration, ClientError> {
+    let _probe = lanvault_core::ProbeGuard::start(
+        "client.scanner",
+        "scanner.scan_source_generation",
+        Some(format!("root={}", root_dir.display())),
+    );
+
+    let root_meta = fs::symlink_metadata(root_dir).map_err(|err| ClientError::InvalidPath {
+        path: root_dir.to_path_buf(),
+        reason: format!("cannot stat scan root: {err}"),
+    })?;
+    if root_meta.file_type().is_symlink() || is_reparse_point(&root_meta) {
+        return Err(ClientError::InvalidPath {
+            path: root_dir.to_path_buf(),
+            reason: "scan root must not be a symlink or reparse point".to_string(),
+        });
+    }
+    if !root_meta.is_dir() {
+        return Err(ClientError::InvalidPath {
+            path: root_dir.to_path_buf(),
+            reason: "scan root must be an existing directory".to_string(),
+        });
+    }
+
+    let clean_root = strip_windows_verbatim(root_dir);
+    let root_identity = extract_root_identity(&root_meta);
+
+    let mut complete = true;
+    let mut blocked_reasons: Vec<String> = Vec::new();
+    let mut volatile_paths: Vec<String> = Vec::new();
+    let mut entries: Vec<ScannedEntry> = Vec::new();
+
+    let mut stack = vec![root_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let read_dir = match fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(err) => {
+                complete = false;
+                blocked_reasons.push(format!("cannot read directory `{}`: {err}", dir.display()));
+                warn!(path = %dir.display(), "incomplete scan: unreadable directory: {err}");
+                continue;
+            }
+        };
+
+        for entry_res in read_dir {
+            let entry = match entry_res {
+                Ok(e) => e,
+                Err(err) => {
+                    complete = false;
+                    blocked_reasons
+                        .push(format!("cannot read entry in `{}`: {err}", dir.display()));
+                    warn!(dir = %dir.display(), "incomplete scan: unreadable dir entry: {err}");
+                    continue;
+                }
+            };
+
+            let abs_path = entry.path();
+            let raw_rel = match extract_raw_rel_path(&clean_root, &abs_path) {
+                Ok(r) => r,
+                Err(err) => {
+                    complete = false;
+                    blocked_reasons.push(format!(
+                        "invalid relative path `{}`: {err}",
+                        abs_path.display()
+                    ));
+                    continue;
+                }
+            };
+
+            if is_excluded(&raw_rel, exclude_patterns) {
+                continue;
+            }
+
+            let meta = match fs::symlink_metadata(&abs_path) {
+                Ok(m) => m,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    complete = false;
+                    volatile_paths.push(raw_rel);
+                    continue;
+                }
+                Err(err) => {
+                    complete = false;
+                    blocked_reasons.push(format!("cannot stat `{}`: {err}", abs_path.display()));
+                    continue;
+                }
+            };
+
+            let ft = meta.file_type();
+            if ft.is_symlink() || is_reparse_point(&meta) {
+                blocked_reasons.push(format!(
+                    "unsupported symlink or reparse point skipped: `{raw_rel}`"
+                ));
+                continue;
+            }
+
+            if !ft.is_file() && !ft.is_dir() {
+                blocked_reasons.push(format!("unsupported special file skipped: `{raw_rel}`"));
+                continue;
+            }
+
+            let path_key = match normalize_canonical_path(&raw_rel) {
+                Ok(canonical) => canonical,
+                Err(err) => {
+                    complete = false;
+                    blocked_reasons.push(format!("invalid path `{raw_rel}`: {err}"));
+                    continue;
+                }
+            };
+
+            let mtime_ns = match extract_mtime_ns(&meta) {
+                Ok(ts) => ts,
+                Err(err) => {
+                    complete = false;
+                    blocked_reasons.push(format!("cannot read mtime for `{path_key}`: {err}"));
+                    continue;
+                }
+            };
+            let file_id = extract_file_id(&meta);
+
+            if ft.is_dir() {
+                entries.push(ScannedEntry {
+                    path_key: path_key.clone(),
+                    display_path: path_key,
+                    abs_path: abs_path.clone(),
+                    kind: ScannedEntryKind::Dir,
+                    size: 0,
+                    mtime_ns,
+                    file_id,
+                    content_hash: None,
+                });
+                stack.push(abs_path);
+                continue;
+            }
+
+            // Regular file: compute streaming BLAKE3 and verify (file_id, size, mtime_ns) before & after.
+            let pre_size = meta.len();
+            let pre_sig = (file_id, pre_size, mtime_ns);
+
+            let hash = match hash_regular_file(&abs_path) {
+                Ok(h) => h,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    complete = false;
+                    volatile_paths.push(path_key);
+                    continue;
+                }
+                Err(err) => {
+                    complete = false;
+                    blocked_reasons.push(format!("cannot hash `{path_key}`: {err}"));
+                    continue;
+                }
+            };
+
+            let post_meta = match fs::symlink_metadata(&abs_path) {
+                Ok(m) => m,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    complete = false;
+                    volatile_paths.push(path_key);
+                    continue;
+                }
+                Err(err) => {
+                    complete = false;
+                    blocked_reasons.push(format!("cannot re-stat `{path_key}`: {err}"));
+                    continue;
+                }
+            };
+            let post_mtime_ns = match extract_mtime_ns(&post_meta) {
+                Ok(ts) => ts,
+                Err(err) => {
+                    complete = false;
+                    blocked_reasons.push(format!("cannot re-read mtime for `{path_key}`: {err}"));
+                    continue;
+                }
+            };
+            let post_sig = (extract_file_id(&post_meta), post_meta.len(), post_mtime_ns);
+
+            if !post_meta.file_type().is_file() || post_sig != pre_sig {
+                complete = false;
+                volatile_paths.push(path_key);
+                continue;
+            }
+
+            entries.push(ScannedEntry {
+                path_key: path_key.clone(),
+                display_path: path_key,
+                abs_path,
+                kind: ScannedEntryKind::File,
+                size: pre_size,
+                mtime_ns,
+                file_id,
+                content_hash: Some(hash),
+            });
+        }
+    }
+
+    entries.sort_by(|a, b| a.path_key.cmp(&b.path_key));
+    volatile_paths.sort();
+    volatile_paths.dedup();
+
+    let all_paths: Vec<String> = entries.iter().map(|e| e.path_key.clone()).collect();
+    let collisions = detect_path_collisions(&all_paths);
+
+    Ok(SourceGeneration {
+        root_dir: root_dir.to_path_buf(),
+        root_identity,
+        complete,
+        blocked_reasons,
+        volatile_paths,
+        collisions,
+        entries,
+    })
+}
+
+fn hash_regular_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    blake3_hash_reader(&mut reader).map_err(|err| match err {
+        lanvault_core::LanVaultError::Io(io_err) => io_err,
+        other => std::io::Error::other(other.to_string()),
+    })
+}
+
+fn extract_raw_rel_path(clean_root: &Path, abs_path: &Path) -> Result<String, ClientError> {
+    let clean_abs = strip_windows_verbatim(abs_path);
+    let rel = clean_abs
+        .strip_prefix(clean_root)
+        .map_err(|_| ClientError::InvalidPath {
+            path: abs_path.to_path_buf(),
+            reason: format!("path is outside scan root {}", clean_root.display()),
+        })?;
+    normalize_rel_path(rel)
+}
+
+fn is_excluded(rel_path: &str, exclude_patterns: &[String]) -> bool {
+    for raw in exclude_patterns {
+        let pat = raw.trim().trim_matches('/');
+        if pat.is_empty() {
+            continue;
+        }
+        if let Some(suffix) = pat.strip_prefix('*') {
+            if rel_path.ends_with(suffix) || rel_path.split('/').any(|seg| seg.ends_with(suffix)) {
+                return true;
+            }
+        } else if rel_path == pat
+            || rel_path.starts_with(&format!("{pat}/"))
+            || rel_path.split('/').any(|seg| seg == pat)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_mtime_ns(meta: &Metadata) -> Result<i64, ClientError> {
+    let mtime = meta
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    Ok(mtime)
+}
+
+#[cfg(unix)]
+fn extract_root_identity(meta: &Metadata) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    Some(format!("unix:{}:{}", meta.dev(), meta.ino()))
+}
+
+#[cfg(windows)]
+fn extract_root_identity(meta: &Metadata) -> Option<String> {
+    use std::os::windows::fs::MetadataExt;
+    Some(format!("win:{}", meta.creation_time()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn extract_root_identity(_meta: &Metadata) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+fn is_reparse_point(meta: &Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_meta: &Metadata) -> bool {
+    false
+}
+
+// -----------------------------------------------------------------------------
+// Legacy Directory Reconciliation
+// -----------------------------------------------------------------------------
 
 /// 对 `root_dir` 执行全量目录遍历，并与 `lanvault_core::Database` 中的 `local_file_state`
 /// 进行 `(size, mtime_ns, file_id)` 快速 Diff 对账。
@@ -306,11 +661,7 @@ fn build_snapshot(
         })?;
 
     let rel_path = normalize_rel_path(rel)?;
-    let mtime_ns = meta
-        .modified()?
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0);
+    let mtime_ns = extract_mtime_ns(meta)?;
 
     Ok(FileMetadataSnapshot {
         rel_path,

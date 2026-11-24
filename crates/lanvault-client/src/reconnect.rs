@@ -43,8 +43,13 @@ impl ReconnectTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconnectState {
     Paused,
-    Connected { addr: SocketAddr },
-    Backoff { attempt: usize, next_delay: Duration },
+    Connected {
+        addr: SocketAddr,
+    },
+    Backoff {
+        attempt: usize,
+        next_delay: Duration,
+    },
 }
 
 /// 重连状态机对外广播的事件。

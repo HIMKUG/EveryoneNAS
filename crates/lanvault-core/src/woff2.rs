@@ -125,7 +125,9 @@ fn read_base128(buf: &[u8], pos: &mut usize) -> Result<usize> {
             return Ok(accum as usize);
         }
     }
-    Err(LanVaultError::InvalidInput("woff2 base128 exceeded 5 bytes".into()))
+    Err(LanVaultError::InvalidInput(
+        "woff2 base128 exceeded 5 bytes".into(),
+    ))
 }
 
 fn sfnt_checksum(data: &[u8]) -> u32 {
@@ -145,7 +147,9 @@ pub fn decode_woff2_to_sfnt(woff2: &[u8]) -> Result<Vec<u8>> {
         return Err(LanVaultError::InvalidInput("woff2 header too short".into()));
     }
     if read_be_u32(woff2, 0)? != WOFF2_SIGNATURE {
-        return Err(LanVaultError::InvalidInput("invalid woff2 signature".into()));
+        return Err(LanVaultError::InvalidInput(
+            "invalid woff2 signature".into(),
+        ));
     }
 
     let flavor = read_be_u32(woff2, 4)?;

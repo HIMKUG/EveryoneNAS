@@ -151,9 +151,8 @@ class SyncProgressEvent {
       ? 0.0
       : (chunksDeduplicated / totalChunks).clamp(0.0, 1.0);
 
-  double get progressRatio => totalBytes <= 0
-      ? 0.0
-      : (bytesProcessed / totalBytes).clamp(0.0, 1.0);
+  double get progressRatio =>
+      totalBytes <= 0 ? 0.0 : (bytesProcessed / totalBytes).clamp(0.0, 1.0);
 
   factory SyncProgressEvent.fromJson(Map<String, dynamic> json) {
     final rawBitRot = json['bit_rot_health'] as String?;
@@ -434,9 +433,8 @@ class VaultSummaryModel {
   final bool e2eeEnabled;
   final List<VaultVolumeModel> volumes;
 
-  double get usageRatio => quotaBytes <= 0
-      ? 0.0
-      : (usedBytes / quotaBytes).clamp(0.0, 1.0);
+  double get usageRatio =>
+      quotaBytes <= 0 ? 0.0 : (usedBytes / quotaBytes).clamp(0.0, 1.0);
 
   factory VaultSummaryModel.fromJson(Map<String, dynamic> json) {
     final rawVolumes = json['volumes'] as List<dynamic>;
@@ -656,7 +654,8 @@ class AndroidKeepAliveChannel {
 
   Future<bool> requestBatteryExemption() async {
     if (!Platform.isAndroid) return true;
-    final granted = await _channel.invokeMethod<bool>('requestBatteryExemption');
+    final granted =
+        await _channel.invokeMethod<bool>('requestBatteryExemption');
     if (granted == null) {
       throw StateError('requestBatteryExemption returned null.');
     }
@@ -665,7 +664,8 @@ class AndroidKeepAliveChannel {
 
   Future<bool> requestStoragePermission() async {
     if (!Platform.isAndroid) return true;
-    final granted = await _channel.invokeMethod<bool>('requestStoragePermission');
+    final granted =
+        await _channel.invokeMethod<bool>('requestStoragePermission');
     if (granted == null) {
       throw StateError('requestStoragePermission returned null.');
     }
@@ -926,6 +926,679 @@ class BackupStorageConfigModel {
   }
 }
 
+// =============================================================================
+// v2 Models: Device Groups, Group Sync Rules, Catalog & Non-Blocking Outbox
+// =============================================================================
+
+/// 设备组记录（对齐 Rust `DeviceGroupRecord`）。
+@immutable
+class DeviceGroupModel {
+  const DeviceGroupModel({
+    required this.groupId,
+    required this.name,
+    required this.coordinatorDeviceId,
+    required this.revision,
+    required this.createdAt,
+    required this.updatedAt,
+    this.deletedAt,
+  });
+
+  final String groupId;
+  final String name;
+  final String coordinatorDeviceId;
+  final int revision;
+  final int createdAt;
+  final int updatedAt;
+  final int? deletedAt;
+
+  factory DeviceGroupModel.fromJson(Map<String, dynamic> json) {
+    return DeviceGroupModel(
+      groupId: json['group_id'] as String,
+      name: json['name'] as String,
+      coordinatorDeviceId: json['coordinator_device_id'] as String,
+      revision: (json['revision'] as num).toInt(),
+      createdAt: (json['created_at'] as num).toInt(),
+      updatedAt: (json['updated_at'] as num).toInt(),
+      deletedAt: json['deleted_at'] == null
+          ? null
+          : (json['deleted_at'] as num).toInt(),
+    );
+  }
+}
+
+/// 设备组成员记录（对齐 Rust `DeviceGroupMemberRecord`）。
+@immutable
+class GroupMemberModel {
+  const GroupMemberModel({
+    required this.groupId,
+    required this.deviceId,
+    required this.role,
+    required this.addedAt,
+    this.removedAt,
+  });
+
+  final String groupId;
+  final String deviceId;
+  final String role;
+  final int addedAt;
+  final int? removedAt;
+
+  bool get isActive => removedAt == null;
+  bool get isCoordinator => role == 'coordinator';
+
+  factory GroupMemberModel.fromJson(Map<String, dynamic> json) {
+    return GroupMemberModel(
+      groupId: json['group_id'] as String,
+      deviceId: json['device_id'] as String,
+      role: json['role'] as String,
+      addedAt: (json['added_at'] as num).toInt(),
+      removedAt: json['removed_at'] == null
+          ? null
+          : (json['removed_at'] as num).toInt(),
+    );
+  }
+}
+
+/// 设备组聚合视图（对齐 Rust `DeviceGroupView`）。
+@immutable
+class DeviceGroupViewModel {
+  const DeviceGroupViewModel({
+    required this.group,
+    required this.members,
+  });
+
+  final DeviceGroupModel group;
+  final List<GroupMemberModel> members;
+
+  List<GroupMemberModel> get activeMembers =>
+      members.where((m) => m.isActive).toList(growable: false);
+
+  factory DeviceGroupViewModel.fromJson(Map<String, dynamic> json) {
+    final rawMembers = json['members'] as List<dynamic>;
+    return DeviceGroupViewModel(
+      group: DeviceGroupModel.fromJson(json['group'] as Map<String, dynamic>),
+      members: rawMembers
+          .map((e) => GroupMemberModel.fromJson(e as Map<String, dynamic>))
+          .toList(growable: false),
+    );
+  }
+}
+
+/// 设备组同步规则（对齐 Rust `GroupSyncRuleRecord`）。
+@immutable
+class GroupSyncRuleModel {
+  const GroupSyncRuleModel({
+    required this.ruleId,
+    required this.groupId,
+    required this.name,
+    required this.mode,
+    required this.sourceDeviceId,
+    required this.sourceRoot,
+    this.sourceRootId,
+    required this.archiveRetentionDays,
+    required this.wifiOnly,
+    this.allowedSsids,
+    required this.requireCharging,
+    required this.maxKbps,
+    required this.scheduleIntervalSecs,
+    required this.enabled,
+    required this.revision,
+    required this.groupRevision,
+    required this.needsBindingConfirm,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  final String ruleId;
+  final String groupId;
+  final String name;
+  final String mode;
+  final String sourceDeviceId;
+  final String sourceRoot;
+  final String? sourceRootId;
+  final int archiveRetentionDays;
+  final bool wifiOnly;
+  final String? allowedSsids;
+  final bool requireCharging;
+  final int maxKbps;
+  final int scheduleIntervalSecs;
+  final bool enabled;
+  final int revision;
+  final int groupRevision;
+  final bool needsBindingConfirm;
+  final int createdAt;
+  final int updatedAt;
+
+  bool get isMirrorSync => mode == 'mirror_sync';
+  String get modeLabel => isMirrorSync ? '镜像同步' : '差异备份';
+
+  factory GroupSyncRuleModel.fromJson(Map<String, dynamic> json) {
+    return GroupSyncRuleModel(
+      ruleId: json['rule_id'] as String,
+      groupId: json['group_id'] as String,
+      name: json['name'] as String,
+      mode: json['mode'] as String,
+      sourceDeviceId: json['source_device_id'] as String,
+      sourceRoot: json['source_root'] as String,
+      sourceRootId: json['source_root_id'] as String?,
+      archiveRetentionDays: (json['archive_retention_days'] as num).toInt(),
+      wifiOnly: json['wifi_only'] as bool,
+      allowedSsids: json['allowed_ssids'] as String?,
+      requireCharging: json['require_charging'] as bool,
+      maxKbps: (json['max_kbps'] as num).toInt(),
+      scheduleIntervalSecs: (json['schedule_interval_secs'] as num).toInt(),
+      enabled: json['enabled'] as bool,
+      revision: (json['revision'] as num).toInt(),
+      groupRevision: (json['group_revision'] as num).toInt(),
+      needsBindingConfirm: json['needs_binding_confirm'] as bool,
+      createdAt: (json['created_at'] as num).toInt(),
+      updatedAt: (json['updated_at'] as num).toInt(),
+    );
+  }
+}
+
+/// 规则目标绑定记录（对齐 Rust `RuleTargetBindingRecord`）。
+@immutable
+class RuleTargetBindingModel {
+  const RuleTargetBindingModel({
+    required this.bindingId,
+    required this.ruleId,
+    required this.groupId,
+    required this.targetDeviceId,
+    this.targetVaultId,
+    this.mirrorRootId,
+    this.targetRoot,
+    required this.enabled,
+    this.revokedAt,
+    required this.appliedRevision,
+    required this.lastSourceGen,
+    required this.status,
+    this.lastError,
+    required this.needsBindingConfirm,
+    required this.createdAt,
+    required this.updatedAt,
+  });
+
+  final String bindingId;
+  final String ruleId;
+  final String groupId;
+  final String targetDeviceId;
+  final String? targetVaultId;
+  final String? mirrorRootId;
+  final String? targetRoot;
+  final bool enabled;
+  final int? revokedAt;
+  final int appliedRevision;
+  final int lastSourceGen;
+  final String status;
+  final String? lastError;
+  final bool needsBindingConfirm;
+  final int createdAt;
+  final int updatedAt;
+
+  bool get isRevoked => revokedAt != null;
+
+  factory RuleTargetBindingModel.fromJson(Map<String, dynamic> json) {
+    return RuleTargetBindingModel(
+      bindingId: json['binding_id'] as String,
+      ruleId: json['rule_id'] as String,
+      groupId: json['group_id'] as String,
+      targetDeviceId: json['target_device_id'] as String,
+      targetVaultId: json['target_vault_id'] as String?,
+      mirrorRootId: json['mirror_root_id'] as String?,
+      targetRoot: json['target_root'] as String?,
+      enabled: json['enabled'] as bool,
+      revokedAt: json['revoked_at'] == null
+          ? null
+          : (json['revoked_at'] as num).toInt(),
+      appliedRevision: (json['applied_revision'] as num).toInt(),
+      lastSourceGen: (json['last_source_gen'] as num).toInt(),
+      status: json['status'] as String,
+      lastError: json['last_error'] as String?,
+      needsBindingConfirm: json['needs_binding_confirm'] as bool,
+      createdAt: (json['created_at'] as num).toInt(),
+      updatedAt: (json['updated_at'] as num).toInt(),
+    );
+  }
+}
+
+/// 组规则及其目标绑定聚合视图（对齐 Rust `GroupRuleView`）。
+@immutable
+class GroupRuleViewModel {
+  const GroupRuleViewModel({
+    required this.rule,
+    required this.bindings,
+  });
+
+  final GroupSyncRuleModel rule;
+  final List<RuleTargetBindingModel> bindings;
+
+  factory GroupRuleViewModel.fromJson(Map<String, dynamic> json) {
+    final rawBindings = json['bindings'] as List<dynamic>;
+    return GroupRuleViewModel(
+      rule: GroupSyncRuleModel.fromJson(json['rule'] as Map<String, dynamic>),
+      bindings: rawBindings
+          .map(
+              (e) => RuleTargetBindingModel.fromJson(e as Map<String, dynamic>))
+          .toList(growable: false),
+    );
+  }
+}
+
+/// 已登记的本机镜像根目录（对齐 Rust `MirrorRootRegistration`）。
+@immutable
+class MirrorRootModel {
+  const MirrorRootModel({
+    required this.mirrorRootId,
+    required this.deviceId,
+    required this.canonicalRoot,
+    this.rootIdentity,
+    required this.label,
+    required this.createdAt,
+    this.revokedAt,
+  });
+
+  final String mirrorRootId;
+  final String deviceId;
+  final String canonicalRoot;
+  final String? rootIdentity;
+  final String label;
+  final int createdAt;
+  final int? revokedAt;
+
+  bool get isActive => revokedAt == null;
+
+  factory MirrorRootModel.fromJson(Map<String, dynamic> json) {
+    return MirrorRootModel(
+      mirrorRootId: json['mirror_root_id'] as String,
+      deviceId: json['device_id'] as String,
+      canonicalRoot: json['canonical_root'] as String,
+      rootIdentity: json['root_identity'] as String?,
+      label: json['label'] as String,
+      createdAt: (json['created_at'] as num).toInt(),
+      revokedAt: json['revoked_at'] == null
+          ? null
+          : (json['revoked_at'] as num).toInt(),
+    );
+  }
+}
+
+/// 镜像/规则同步执行前变更预览（对齐 Rust `MirrorPreviewReport`）。
+@immutable
+class MirrorPreviewModel {
+  const MirrorPreviewModel({
+    required this.ruleId,
+    required this.bindingId,
+    required this.targetDeviceId,
+    required this.addCount,
+    required this.overwriteCount,
+    required this.removeCount,
+    required this.unchangedCount,
+    required this.blockedCount,
+    required this.conflicts,
+  });
+
+  final String ruleId;
+  final String bindingId;
+  final String targetDeviceId;
+  final int addCount;
+  final int overwriteCount;
+  final int removeCount;
+  final int unchangedCount;
+  final int blockedCount;
+  final List<String> conflicts;
+
+  factory MirrorPreviewModel.fromJson(Map<String, dynamic> json) {
+    final rawConflicts = json['conflicts'] as List<dynamic>;
+    return MirrorPreviewModel(
+      ruleId: json['rule_id'] as String,
+      bindingId: json['binding_id'] as String,
+      targetDeviceId: json['target_device_id'] as String,
+      addCount: (json['add_count'] as num).toInt(),
+      overwriteCount: (json['overwrite_count'] as num).toInt(),
+      removeCount: (json['remove_count'] as num).toInt(),
+      unchangedCount: (json['unchanged_count'] as num).toInt(),
+      blockedCount: (json['blocked_count'] as num).toInt(),
+      conflicts: rawConflicts.map((e) => e as String).toList(growable: false),
+    );
+  }
+}
+
+/// 单目标绑定同步执行结果（对齐 Rust `BindingSyncOutcome`）。
+@immutable
+class BindingSyncOutcomeModel {
+  const BindingSyncOutcomeModel({
+    required this.bindingId,
+    required this.targetDeviceId,
+    required this.status,
+    this.error,
+    this.diffReport,
+    this.mirrorReport,
+  });
+
+  final String bindingId;
+  final String targetDeviceId;
+  final String status;
+  final String? error;
+  final Map<String, dynamic>? diffReport;
+  final Map<String, dynamic>? mirrorReport;
+
+  factory BindingSyncOutcomeModel.fromJson(Map<String, dynamic> json) {
+    return BindingSyncOutcomeModel(
+      bindingId: json['binding_id'] as String,
+      targetDeviceId: json['target_device_id'] as String,
+      status: json['status'] as String,
+      error: json['error'] as String?,
+      diffReport: json['diff_report'] as Map<String, dynamic>?,
+      mirrorReport: json['mirror_report'] as Map<String, dynamic>?,
+    );
+  }
+}
+
+/// 组规则同步汇总结果（对齐 Rust `GroupRuleSyncOutcome`）。
+@immutable
+class GroupRuleSyncOutcomeModel {
+  const GroupRuleSyncOutcomeModel({
+    required this.ruleId,
+    required this.sourceComplete,
+    required this.scannedEntries,
+    required this.blockedReasons,
+    required this.volatilePaths,
+    required this.bindings,
+  });
+
+  final String ruleId;
+  final bool sourceComplete;
+  final int scannedEntries;
+  final List<String> blockedReasons;
+  final List<String> volatilePaths;
+  final List<BindingSyncOutcomeModel> bindings;
+
+  factory GroupRuleSyncOutcomeModel.fromJson(Map<String, dynamic> json) {
+    final rawBlocked = json['blocked_reasons'] as List<dynamic>;
+    final rawVolatile = json['volatile_paths'] as List<dynamic>;
+    final rawBindings = json['bindings'] as List<dynamic>;
+    return GroupRuleSyncOutcomeModel(
+      ruleId: json['rule_id'] as String,
+      sourceComplete: json['source_complete'] as bool,
+      scannedEntries: (json['scanned_entries'] as num).toInt(),
+      blockedReasons:
+          rawBlocked.map((e) => e as String).toList(growable: false),
+      volatilePaths:
+          rawVolatile.map((e) => e as String).toList(growable: false),
+      bindings: rawBindings
+          .map((e) =>
+              BindingSyncOutcomeModel.fromJson(e as Map<String, dynamic>))
+          .toList(growable: false),
+    );
+  }
+}
+
+/// 增量目录归档条目（对齐 Rust `CatalogEntryRecord`）。
+@immutable
+class CatalogEntryModel {
+  const CatalogEntryModel({
+    required this.bindingId,
+    required this.pathKey,
+    required this.displayPath,
+    required this.entryKind,
+    required this.versionId,
+    required this.size,
+    required this.mtimeNs,
+    this.contentHash,
+    required this.chunkHashesJson,
+    required this.sourceDeleted,
+    this.sourceDeletedAt,
+    required this.updatedRevision,
+    required this.updatedAt,
+  });
+
+  final String bindingId;
+  final String pathKey;
+  final String displayPath;
+  final String entryKind;
+  final String versionId;
+  final int size;
+  final int mtimeNs;
+  final List<int>? contentHash;
+  final String chunkHashesJson;
+  final bool sourceDeleted;
+  final int? sourceDeletedAt;
+  final int updatedRevision;
+  final int updatedAt;
+
+  bool get isDir => entryKind == 'dir';
+
+  factory CatalogEntryModel.fromJson(Map<String, dynamic> json) {
+    final rawHash = json['content_hash'] as List<dynamic>?;
+    return CatalogEntryModel(
+      bindingId: json['binding_id'] as String,
+      pathKey: json['path_key'] as String,
+      displayPath: json['display_path'] as String,
+      entryKind: json['entry_kind'] as String,
+      versionId: json['version_id'] as String,
+      size: (json['size'] as num).toInt(),
+      mtimeNs: (json['mtime_ns'] as num).toInt(),
+      contentHash:
+          rawHash?.map((e) => (e as num).toInt()).toList(growable: false),
+      chunkHashesJson: json['chunk_hashes_json'] as String,
+      sourceDeleted: json['source_deleted'] as bool,
+      sourceDeletedAt: json['source_deleted_at'] == null
+          ? null
+          : (json['source_deleted_at'] as num).toInt(),
+      updatedRevision: (json['updated_revision'] as num).toInt(),
+      updatedAt: (json['updated_at'] as num).toInt(),
+    );
+  }
+}
+
+/// 文件历史归档版本（对齐 Rust `CatalogVersionRecord`）。
+@immutable
+class CatalogVersionModel {
+  const CatalogVersionModel({
+    required this.versionId,
+    required this.bindingId,
+    required this.vaultId,
+    required this.pathKey,
+    required this.displayPath,
+    required this.entryKind,
+    required this.size,
+    required this.mtimeNs,
+    this.contentHash,
+    required this.chunkHashesJson,
+    required this.archiveReason,
+    required this.prevState,
+    required this.operationId,
+    required this.archivedAt,
+    this.expiresAt,
+    this.recycledAt,
+  });
+
+  final String versionId;
+  final String bindingId;
+  final String vaultId;
+  final String pathKey;
+  final String displayPath;
+  final String entryKind;
+  final int size;
+  final int mtimeNs;
+  final List<int>? contentHash;
+  final String chunkHashesJson;
+  final String archiveReason;
+  final String prevState;
+  final String operationId;
+  final int archivedAt;
+  final int? expiresAt;
+  final int? recycledAt;
+
+  bool get isRecycled => recycledAt != null;
+
+  factory CatalogVersionModel.fromJson(Map<String, dynamic> json) {
+    final rawHash = json['content_hash'] as List<dynamic>?;
+    return CatalogVersionModel(
+      versionId: json['version_id'] as String,
+      bindingId: json['binding_id'] as String,
+      vaultId: json['vault_id'] as String,
+      pathKey: json['path_key'] as String,
+      displayPath: json['display_path'] as String,
+      entryKind: json['entry_kind'] as String,
+      size: (json['size'] as num).toInt(),
+      mtimeNs: (json['mtime_ns'] as num).toInt(),
+      contentHash:
+          rawHash?.map((e) => (e as num).toInt()).toList(growable: false),
+      chunkHashesJson: json['chunk_hashes_json'] as String,
+      archiveReason: json['archive_reason'] as String,
+      prevState: json['prev_state'] as String,
+      operationId: json['operation_id'] as String,
+      archivedAt: (json['archived_at'] as num).toInt(),
+      expiresAt: json['expires_at'] == null
+          ? null
+          : (json['expires_at'] as num).toInt(),
+      recycledAt: json['recycled_at'] == null
+          ? null
+          : (json['recycled_at'] as num).toInt(),
+    );
+  }
+}
+
+/// 归档版本恢复结果（对齐 Rust `RestoreCatalogVersionResult`）。
+@immutable
+class RestoreCatalogVersionResultModel {
+  const RestoreCatalogVersionResultModel({
+    required this.bindingId,
+    required this.versionId,
+    required this.pathKey,
+    required this.restoredBytes,
+    required this.outputPath,
+  });
+
+  final String bindingId;
+  final String versionId;
+  final String pathKey;
+  final int restoredBytes;
+  final String outputPath;
+
+  factory RestoreCatalogVersionResultModel.fromJson(Map<String, dynamic> json) {
+    return RestoreCatalogVersionResultModel(
+      bindingId: json['binding_id'] as String,
+      versionId: json['version_id'] as String,
+      pathKey: json['path_key'] as String,
+      restoredBytes: (json['restored_bytes'] as num).toInt(),
+      outputPath: json['output_path'] as String,
+    );
+  }
+}
+
+/// 非阻塞发件箱单目标投递状态（对齐 Rust `MessageOutboxTargetRecord`）。
+@immutable
+class OutboxTargetStatusModel {
+  const OutboxTargetStatusModel({
+    required this.clientMsgId,
+    required this.targetDeviceId,
+    required this.channel,
+    required this.status,
+    this.errorCode,
+    this.errorMessage,
+    required this.attemptCount,
+    this.nextRetryAt,
+    required this.updatedAt,
+  });
+
+  final String clientMsgId;
+  final String targetDeviceId;
+  final String channel;
+  final String status;
+  final String? errorCode;
+  final String? errorMessage;
+  final int attemptCount;
+  final int? nextRetryAt;
+  final int updatedAt;
+
+  factory OutboxTargetStatusModel.fromJson(Map<String, dynamic> json) {
+    return OutboxTargetStatusModel(
+      clientMsgId: json['client_msg_id'] as String,
+      targetDeviceId: json['target_device_id'] as String,
+      channel: json['channel'] as String,
+      status: json['status'] as String,
+      errorCode: json['error_code'] as String?,
+      errorMessage: json['error_message'] as String?,
+      attemptCount: (json['attempt_count'] as num).toInt(),
+      nextRetryAt: json['next_retry_at'] == null
+          ? null
+          : (json['next_retry_at'] as num).toInt(),
+      updatedAt: (json['updated_at'] as num).toInt(),
+    );
+  }
+}
+
+/// 非阻塞发件箱消息视图（对齐 Rust `MessageOutboxView`）。
+@immutable
+class OutboxMessageViewModel {
+  const OutboxMessageViewModel({
+    required this.clientMsgId,
+    required this.localSeq,
+    required this.sessionKey,
+    required this.kind,
+    required this.title,
+    this.content,
+    this.filePath,
+    this.fileHashHex,
+    required this.sizeBytes,
+    required this.overallStatus,
+    required this.createdAt,
+    required this.updatedAt,
+    required this.targets,
+  });
+
+  final String clientMsgId;
+  final int localSeq;
+  final String sessionKey;
+  final String kind;
+  final String title;
+  final String? content;
+  final String? filePath;
+  final String? fileHashHex;
+  final int sizeBytes;
+  final String overallStatus;
+  final int createdAt;
+  final int updatedAt;
+  final List<OutboxTargetStatusModel> targets;
+
+  bool get isFile => kind == 'file';
+
+  bool get canRetry =>
+      overallStatus == 'failed' || overallStatus == 'partial_failed';
+
+  String get formattedTime {
+    final dt = DateTime.fromMillisecondsSinceEpoch(createdAt * 1000);
+    return '${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} '
+        '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+  }
+
+  factory OutboxMessageViewModel.fromJson(Map<String, dynamic> json) {
+    final msg = json['message'] as Map<String, dynamic>;
+    final rawTargets = json['targets'] as List<dynamic>;
+    return OutboxMessageViewModel(
+      clientMsgId: msg['client_msg_id'] as String,
+      localSeq: (msg['local_seq'] as num).toInt(),
+      sessionKey: msg['session_key'] as String,
+      kind: msg['kind'] as String,
+      title: msg['title'] as String,
+      content: msg['content'] as String?,
+      filePath: msg['file_path'] as String?,
+      fileHashHex: msg['file_hash_hex'] as String?,
+      sizeBytes: (msg['size_bytes'] as num).toInt(),
+      overallStatus: msg['overall_status'] as String,
+      createdAt: (msg['created_at'] as num).toInt(),
+      updatedAt: (msg['updated_at'] as num).toInt(),
+      targets: rawTargets
+          .map((e) =>
+              OutboxTargetStatusModel.fromJson(e as Map<String, dynamic>))
+          .toList(growable: false),
+    );
+  }
+}
+
 /// 严格对齐 `crates/lanvault-ffi/src/api.rs` 导出函数的抽象契约。
 abstract class LanVaultRustFfi {
   Stream<DiscoveredPeer> startMdnsScan();
@@ -1056,6 +1729,92 @@ abstract class LanVaultRustFfi {
   Future<bool> getAutostartServer();
 
   Future<bool> setAutostartServer(bool enabled);
+
+  // --- v2 Device Groups, Group Sync Rules, Catalog & Non-Blocking Outbox ---
+  Future<List<DeviceGroupViewModel>> listDeviceGroups();
+  Future<DeviceGroupModel> createDeviceGroup(String name);
+  Future<DeviceGroupModel> renameDeviceGroup({
+    required String groupId,
+    required String name,
+  });
+  Future<void> deleteDeviceGroup(String groupId);
+  Future<void> addGroupMember({
+    required String groupId,
+    required String deviceId,
+    String? role,
+  });
+  Future<void> removeGroupMember({
+    required String groupId,
+    required String deviceId,
+  });
+  Future<List<GroupRuleViewModel>> listGroupRules({String? groupId});
+  Future<GroupSyncRuleModel> upsertGroupRule({
+    String? ruleId,
+    required String groupId,
+    required String name,
+    required String mode,
+    String? sourceDeviceId,
+    required String sourceRoot,
+    String? sourceRootId,
+    int archiveRetentionDays = 30,
+    bool wifiOnly = true,
+    String? allowedSsids,
+    bool requireCharging = false,
+    int maxKbps = 0,
+    int scheduleIntervalSecs = 0,
+    bool enabled = true,
+  });
+  Future<void> deleteGroupRule(String ruleId);
+  Future<void> toggleGroupRule({
+    required String ruleId,
+    required bool enabled,
+  });
+  Future<RuleTargetBindingModel> upsertRuleTargetBinding({
+    String? bindingId,
+    required String ruleId,
+    required String targetDeviceId,
+    String? targetVaultId,
+    String? mirrorRootId,
+    String? targetRoot,
+    bool enabled = true,
+  });
+  Future<void> disableRuleTargetBinding(String bindingId);
+  Future<MirrorRootModel> registerMirrorRoot({
+    required String canonicalPath,
+    String displayName = '',
+  });
+  Future<List<MirrorRootModel>> listMirrorRoots();
+  Future<void> revokeMirrorRoot(String rootId);
+  Future<List<MirrorPreviewModel>> previewGroupRule(String ruleId);
+  Future<GroupRuleSyncOutcomeModel> triggerGroupRuleSync(String ruleId);
+  Future<List<CatalogEntryModel>> listBindingCatalog({
+    required String bindingId,
+    String? afterPathKey,
+    int? limit,
+    bool sourceDeletedOnly = false,
+  });
+  Future<List<CatalogVersionModel>> listBindingVersions({
+    required String bindingId,
+    String? pathKey,
+    int? afterArchivedAt,
+    String? afterVersionId,
+    int? limit,
+  });
+  Future<RestoreCatalogVersionResultModel> restoreCatalogVersion({
+    required String bindingId,
+    required String versionId,
+    required String targetDir,
+  });
+  Future<OutboxMessageViewModel> enqueueMessageText({
+    required List<String> targetDeviceIds,
+    required String text,
+  });
+  Future<OutboxMessageViewModel> enqueueMessageFile({
+    required List<String> targetDeviceIds,
+    required String filePath,
+  });
+  Future<int> retryOutboxMessage(String clientMsgId);
+  Future<List<OutboxMessageViewModel>> listOutboxMessages({int? limit});
 }
 
 // --- Native C-ABI 符号签名，与 lanvault_ffi 共享库对齐 ---
@@ -1396,7 +2155,8 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
   ) async {
     final encoded = jsonEncode(payload);
     try {
-      final worker = await _FfiWorker.acquire(heavy: _FfiWorker._heavyFfiOps.contains(fnName));
+      final worker = await _FfiWorker.acquire(
+          heavy: _FfiWorker._heavyFfiOps.contains(fnName));
       return await worker.call(fnName, encoded);
     } catch (error) {
       // 只有"worker 起不来"才回退；Rust 侧返回的业务错误必须原样抛给调用方，
@@ -1514,9 +2274,10 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
       'scan_windows_networks',
       const <String, Object?>{},
     );
-    final ssids = (resp['available_ssids'] as List<dynamic>? ?? const <dynamic>[])
-        .map((e) => e.toString())
-        .toList(growable: false);
+    final ssids =
+        (resp['available_ssids'] as List<dynamic>? ?? const <dynamic>[])
+            .map((e) => e.toString())
+            .toList(growable: false);
     return NetworkScanSnapshot(
       hasWifiAdapter: resp['has_wifi_adapter'] as bool? ?? false,
       isWiredEthernet: resp['is_wired_ethernet'] as bool? ?? false,
@@ -1677,8 +2438,7 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
 
   @override
   Future<List<SyncRuleModel>> listSyncRules() async {
-    final resp =
-        await _callAsync('list_sync_rules', const <String, Object?>{});
+    final resp = await _callAsync('list_sync_rules', const <String, Object?>{});
     final list = resp['rules'] as List<dynamic>;
     return list
         .map((e) => SyncRuleModel.fromJson(e as Map<String, dynamic>))
@@ -1711,8 +2471,7 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
 
   @override
   Future<String> exportVaultKeyBackup(String passphrase) async {
-    final resp =
-        await _callAsync('export_vault_key_backup', <String, Object?>{
+    final resp = await _callAsync('export_vault_key_backup', <String, Object?>{
       'passphrase': passphrase,
     });
     return resp['backup'] as String;
@@ -1970,7 +2729,8 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
   }
 
   @override
-  Future<List<TransferHistoryModel>> listTransferHistory({int limit = 50}) async {
+  Future<List<TransferHistoryModel>> listTransferHistory(
+      {int limit = 50}) async {
     final resp = await _callAsync('list_transfer_history', <String, Object?>{
       'limit': limit,
     });
@@ -2012,7 +2772,8 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
 
   @override
   Future<bool> getBitRotAutoScrub() async {
-    final resp = await _callAsync('get_bit_rot_auto_scrub', const <String, Object?>{});
+    final resp =
+        await _callAsync('get_bit_rot_auto_scrub', const <String, Object?>{});
     return resp['enabled'] as bool? ?? true;
   }
 
@@ -2052,6 +2813,321 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
     );
     return resp['enabled'] as bool? ?? enabled;
   }
+
+  // --- v2 Device Groups, Group Sync Rules, Catalog & Non-Blocking Outbox ---
+
+  @override
+  Future<List<DeviceGroupViewModel>> listDeviceGroups() async {
+    final resp =
+        await _callAsync('list_device_groups', const <String, Object?>{});
+    final list = resp['groups'] as List<dynamic>;
+    return list
+        .map((e) => DeviceGroupViewModel.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<DeviceGroupModel> createDeviceGroup(String name) async {
+    final resp = await _callAsync('create_device_group', <String, Object?>{
+      'name': name,
+    });
+    return DeviceGroupModel.fromJson(resp['group'] as Map<String, dynamic>);
+  }
+
+  @override
+  Future<DeviceGroupModel> renameDeviceGroup({
+    required String groupId,
+    required String name,
+  }) async {
+    final resp = await _callAsync('rename_device_group', <String, Object?>{
+      'group_id': groupId,
+      'name': name,
+    });
+    return DeviceGroupModel.fromJson(resp['group'] as Map<String, dynamic>);
+  }
+
+  @override
+  Future<void> deleteDeviceGroup(String groupId) async {
+    await _callAsync('delete_device_group', <String, Object?>{
+      'group_id': groupId,
+    });
+  }
+
+  @override
+  Future<void> addGroupMember({
+    required String groupId,
+    required String deviceId,
+    String? role,
+  }) async {
+    await _callAsync('add_group_member', <String, Object?>{
+      'group_id': groupId,
+      'device_id': deviceId,
+      'role': role,
+    });
+  }
+
+  @override
+  Future<void> removeGroupMember({
+    required String groupId,
+    required String deviceId,
+  }) async {
+    await _callAsync('remove_group_member', <String, Object?>{
+      'group_id': groupId,
+      'device_id': deviceId,
+    });
+  }
+
+  @override
+  Future<List<GroupRuleViewModel>> listGroupRules({String? groupId}) async {
+    final resp = await _callAsync('list_group_rules', <String, Object?>{
+      'group_id': groupId,
+    });
+    final list = resp['rules'] as List<dynamic>;
+    return list
+        .map((e) => GroupRuleViewModel.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<GroupSyncRuleModel> upsertGroupRule({
+    String? ruleId,
+    required String groupId,
+    required String name,
+    required String mode,
+    String? sourceDeviceId,
+    required String sourceRoot,
+    String? sourceRootId,
+    int archiveRetentionDays = 30,
+    bool wifiOnly = true,
+    String? allowedSsids,
+    bool requireCharging = false,
+    int maxKbps = 0,
+    int scheduleIntervalSecs = 0,
+    bool enabled = true,
+  }) async {
+    final resp = await _callAsync('upsert_group_rule', <String, Object?>{
+      'rule_id': ruleId,
+      'group_id': groupId,
+      'name': name,
+      'mode': mode,
+      'source_device_id': sourceDeviceId,
+      'source_root': sourceRoot,
+      'source_root_id': sourceRootId,
+      'archive_retention_days': archiveRetentionDays,
+      'wifi_only': wifiOnly,
+      'allowed_ssids': allowedSsids,
+      'require_charging': requireCharging,
+      'max_kbps': maxKbps,
+      'schedule_interval_secs': scheduleIntervalSecs,
+      'enabled': enabled,
+    });
+    return GroupSyncRuleModel.fromJson(resp['rule'] as Map<String, dynamic>);
+  }
+
+  @override
+  Future<void> deleteGroupRule(String ruleId) async {
+    await _callAsync('delete_group_rule', <String, Object?>{
+      'rule_id': ruleId,
+    });
+  }
+
+  @override
+  Future<void> toggleGroupRule({
+    required String ruleId,
+    required bool enabled,
+  }) async {
+    await _callAsync('toggle_group_rule', <String, Object?>{
+      'rule_id': ruleId,
+      'enabled': enabled,
+    });
+  }
+
+  @override
+  Future<RuleTargetBindingModel> upsertRuleTargetBinding({
+    String? bindingId,
+    required String ruleId,
+    required String targetDeviceId,
+    String? targetVaultId,
+    String? mirrorRootId,
+    String? targetRoot,
+    bool enabled = true,
+  }) async {
+    final resp =
+        await _callAsync('upsert_rule_target_binding', <String, Object?>{
+      'binding_id': bindingId,
+      'rule_id': ruleId,
+      'target_device_id': targetDeviceId,
+      'target_vault_id': targetVaultId,
+      'mirror_root_id': mirrorRootId,
+      'target_root': targetRoot,
+      'enabled': enabled,
+    });
+    return RuleTargetBindingModel.fromJson(
+      resp['binding'] as Map<String, dynamic>,
+    );
+  }
+
+  @override
+  Future<void> disableRuleTargetBinding(String bindingId) async {
+    await _callAsync('disable_rule_target_binding', <String, Object?>{
+      'binding_id': bindingId,
+    });
+  }
+
+  @override
+  Future<MirrorRootModel> registerMirrorRoot({
+    required String canonicalPath,
+    String displayName = '',
+  }) async {
+    final resp = await _callAsync('register_mirror_root', <String, Object?>{
+      'canonical_path': canonicalPath,
+      'display_name': displayName,
+    });
+    return MirrorRootModel.fromJson(
+      resp['mirror_root'] as Map<String, dynamic>,
+    );
+  }
+
+  @override
+  Future<List<MirrorRootModel>> listMirrorRoots() async {
+    final resp =
+        await _callAsync('list_mirror_roots', const <String, Object?>{});
+    final list = resp['mirror_roots'] as List<dynamic>;
+    return list
+        .map((e) => MirrorRootModel.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<void> revokeMirrorRoot(String rootId) async {
+    await _callAsync('revoke_mirror_root', <String, Object?>{
+      'root_id': rootId,
+    });
+  }
+
+  @override
+  Future<List<MirrorPreviewModel>> previewGroupRule(String ruleId) async {
+    final resp = await _callAsync('preview_group_rule', <String, Object?>{
+      'rule_id': ruleId,
+    });
+    final list = resp['previews'] as List<dynamic>;
+    return list
+        .map((e) => MirrorPreviewModel.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<GroupRuleSyncOutcomeModel> triggerGroupRuleSync(String ruleId) async {
+    final resp = await _callAsync('trigger_group_rule_sync', <String, Object?>{
+      'rule_id': ruleId,
+    });
+    return GroupRuleSyncOutcomeModel.fromJson(
+      resp['outcome'] as Map<String, dynamic>,
+    );
+  }
+
+  @override
+  Future<List<CatalogEntryModel>> listBindingCatalog({
+    required String bindingId,
+    String? afterPathKey,
+    int? limit,
+    bool sourceDeletedOnly = false,
+  }) async {
+    final resp = await _callAsync('list_binding_catalog', <String, Object?>{
+      'binding_id': bindingId,
+      'after_path_key': afterPathKey,
+      'limit': limit,
+      'source_deleted_only': sourceDeletedOnly,
+    });
+    final list = resp['entries'] as List<dynamic>;
+    return list
+        .map((e) => CatalogEntryModel.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<List<CatalogVersionModel>> listBindingVersions({
+    required String bindingId,
+    String? pathKey,
+    int? afterArchivedAt,
+    String? afterVersionId,
+    int? limit,
+  }) async {
+    final resp = await _callAsync('list_binding_versions', <String, Object?>{
+      'binding_id': bindingId,
+      'path_key': pathKey,
+      'after_archived_at': afterArchivedAt,
+      'after_version_id': afterVersionId,
+      'limit': limit,
+    });
+    final list = resp['versions'] as List<dynamic>;
+    return list
+        .map((e) => CatalogVersionModel.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<RestoreCatalogVersionResultModel> restoreCatalogVersion({
+    required String bindingId,
+    required String versionId,
+    required String targetDir,
+  }) async {
+    final resp = await _callAsync('restore_catalog_version', <String, Object?>{
+      'binding_id': bindingId,
+      'version_id': versionId,
+      'target_dir': targetDir,
+    });
+    return RestoreCatalogVersionResultModel.fromJson(
+      resp['result'] as Map<String, dynamic>,
+    );
+  }
+
+  @override
+  Future<OutboxMessageViewModel> enqueueMessageText({
+    required List<String> targetDeviceIds,
+    required String text,
+  }) async {
+    final resp = await _callAsync('enqueue_message_text', <String, Object?>{
+      'target_device_ids': targetDeviceIds,
+      'text': text,
+    });
+    return OutboxMessageViewModel.fromJson(
+      resp['outbox'] as Map<String, dynamic>,
+    );
+  }
+
+  @override
+  Future<OutboxMessageViewModel> enqueueMessageFile({
+    required List<String> targetDeviceIds,
+    required String filePath,
+  }) async {
+    final resp = await _callAsync('enqueue_message_file', <String, Object?>{
+      'target_device_ids': targetDeviceIds,
+      'file_path': filePath,
+    });
+    return OutboxMessageViewModel.fromJson(
+      resp['outbox'] as Map<String, dynamic>,
+    );
+  }
+
+  @override
+  Future<int> retryOutboxMessage(String clientMsgId) async {
+    final resp = await _callAsync('retry_outbox_message', <String, Object?>{
+      'client_msg_id': clientMsgId,
+    });
+    return (resp['reset_targets'] as num).toInt();
+  }
+
+  @override
+  Future<List<OutboxMessageViewModel>> listOutboxMessages({int? limit}) async {
+    final resp = await _callAsync('list_outbox_messages', <String, Object?>{
+      'limit': limit,
+    });
+    final list = resp['messages'] as List<dynamic>;
+    return list
+        .map((e) => OutboxMessageViewModel.fromJson(e as Map<String, dynamic>))
+        .toList(growable: false);
+  }
 }
 
 /// 统一桥接门面：协调 Rust FFI 与 Android MethodChannel，
@@ -2087,8 +3163,13 @@ class LanVaultBridge {
   bool _envRefreshInFlight = false;
   bool _pairPollInFlight = false;
   bool _disposed = false;
-  ({String vaultPath, int quotaGb, String webPassword, int port, bool elevated})?
-      _lastServerConfig;
+  ({
+    String vaultPath,
+    int quotaGb,
+    String webPassword,
+    int port,
+    bool elevated
+  })? _lastServerConfig;
 
   /// 运行模式单一真相源，供 Shell 导航栏、Dashboard 与 Settings 实时联动。
   final ValueNotifier<RoleMode> roleModeNotifier;
@@ -2110,7 +3191,8 @@ class LanVaultBridge {
   /// 断线自动重连开关状态源。
   final ValueNotifier<bool> autoReconnectNotifier = ValueNotifier<bool>(true);
   final ValueNotifier<int> serverStateVersion = ValueNotifier<int>(0);
-  final ValueNotifier<String?> selectedPeerIdNotifier = ValueNotifier<String?>(null);
+  final ValueNotifier<String?> selectedPeerIdNotifier =
+      ValueNotifier<String?>(null);
   final ValueNotifier<bool> fastBackupModeNotifier = ValueNotifier<bool>(false);
 
   PairedPeerModel? get selectedPeer {
@@ -2167,8 +3249,11 @@ class LanVaultBridge {
     if (lower.contains('ssid')) return '已暂停 · 未连接到允许的家庭网络';
     if (lower.contains('paused')) return '已暂停自动备份';
     if (lower.contains('blocked')) return '已暂停 · 等待网络或电源条件满足';
-    if (lower.contains('error') || lower.contains('fail')) return '同步遇到异常，正在等待重试';
-    if (lower.contains('running') || lower.contains('uploading') || lower.contains('syncing')) {
+    if (lower.contains('error') || lower.contains('fail'))
+      return '同步遇到异常，正在等待重试';
+    if (lower.contains('running') ||
+        lower.contains('uploading') ||
+        lower.contains('syncing')) {
       return '正在备份中';
     }
     if (lower.contains('completed') || lower.contains('done')) return '备份已完成';
@@ -2431,7 +3516,8 @@ class LanVaultBridge {
       throw RangeError.range(port, 1, 65535, 'port');
     }
     final pairedId = await _ffi.pairWithPin(ip: ip, port: port, pin: pin);
-    unawaited(refreshPairedPeers().catchError((Object _) => const <PairedPeerModel>[]));
+    unawaited(refreshPairedPeers()
+        .catchError((Object _) => const <PairedPeerModel>[]));
     return pairedId;
   }
 
@@ -2446,7 +3532,8 @@ class LanVaultBridge {
       throw RangeError.range(port, 1, 65535, 'port');
     }
     final pairedId = await _ffi.requestPairing(ip: ip.trim(), port: port);
-    unawaited(refreshPairedPeers().catchError((Object _) => const <PairedPeerModel>[]));
+    unawaited(refreshPairedPeers()
+        .catchError((Object _) => const <PairedPeerModel>[]));
     _notifyStateChanged();
     return pairedId;
   }
@@ -2472,7 +3559,8 @@ class LanVaultBridge {
           .where((item) => item.requestId != requestId)
           .toList(growable: false);
       if (accepted) {
-        unawaited(refreshPairedPeers().catchError((Object _) => const <PairedPeerModel>[]));
+        unawaited(refreshPairedPeers()
+            .catchError((Object _) => const <PairedPeerModel>[]));
         _notifyStateChanged();
       }
     }
@@ -2499,7 +3587,8 @@ class LanVaultBridge {
     if (!_disposed) {
       pairedPeersNotifier.value = peers;
       final currentId = selectedPeerIdNotifier.value;
-      final exists = currentId != null && peers.any((p) => p.deviceId == currentId);
+      final exists =
+          currentId != null && peers.any((p) => p.deviceId == currentId);
       if (!exists) {
         PairedPeerModel? fallback;
         for (final p in peers) {
@@ -2778,10 +3867,9 @@ class LanVaultBridge {
       poolMode: poolMode.trim(),
       quotaGb: quotaGb,
       e2eeEnabled: e2eeEnabled,
-      extraMountPath:
-          extraMountPath != null && extraMountPath.trim().isNotEmpty
-              ? extraMountPath.trim()
-              : null,
+      extraMountPath: extraMountPath != null && extraMountPath.trim().isNotEmpty
+          ? extraMountPath.trim()
+          : null,
     );
     return created;
   }
@@ -2798,7 +3886,8 @@ class LanVaultBridge {
     }
     final revoked = await _ffi.revokePairedPeer(deviceId.trim());
     if (revoked) {
-      unawaited(refreshPairedPeers().catchError((Object _) => const <PairedPeerModel>[]));
+      unawaited(refreshPairedPeers()
+          .catchError((Object _) => const <PairedPeerModel>[]));
       _notifyStateChanged();
     }
     return revoked;
@@ -3005,4 +4094,310 @@ class LanVaultBridge {
 
   Future<Map<String, dynamic>> runSelfDiagnostics() =>
       _ffi.runSelfDiagnostics();
+
+  // --- v2 设备组、组规则、目录归档与非阻塞发件箱 ---
+
+  Future<List<DeviceGroupViewModel>> listDeviceGroups() =>
+      _ffi.listDeviceGroups();
+
+  Future<DeviceGroupModel> createDeviceGroup(String name) async {
+    final trimmed = name.trim();
+    if (trimmed.isEmpty) {
+      throw ArgumentError.value(name, 'name', '设备组名称不能为空');
+    }
+    final created = await _ffi.createDeviceGroup(trimmed);
+    _notifyStateChanged();
+    return created;
+  }
+
+  Future<DeviceGroupModel> renameDeviceGroup({
+    required String groupId,
+    required String name,
+  }) async {
+    final gid = groupId.trim();
+    final trimmed = name.trim();
+    if (gid.isEmpty || trimmed.isEmpty) {
+      throw ArgumentError('设备组 ID 与新名称不能为空');
+    }
+    final renamed = await _ffi.renameDeviceGroup(groupId: gid, name: trimmed);
+    _notifyStateChanged();
+    return renamed;
+  }
+
+  Future<void> deleteDeviceGroup(String groupId) async {
+    final gid = groupId.trim();
+    if (gid.isEmpty) {
+      throw ArgumentError.value(groupId, 'groupId', '设备组 ID 不能为空');
+    }
+    await _ffi.deleteDeviceGroup(gid);
+    _notifyStateChanged();
+  }
+
+  Future<void> addGroupMember({
+    required String groupId,
+    required String deviceId,
+    String? role,
+  }) async {
+    final gid = groupId.trim();
+    final did = deviceId.trim();
+    if (gid.isEmpty || did.isEmpty) {
+      throw ArgumentError('设备组 ID 与设备 ID 不能为空');
+    }
+    await _ffi.addGroupMember(groupId: gid, deviceId: did, role: role);
+    _notifyStateChanged();
+  }
+
+  Future<void> removeGroupMember({
+    required String groupId,
+    required String deviceId,
+  }) async {
+    final gid = groupId.trim();
+    final did = deviceId.trim();
+    if (gid.isEmpty || did.isEmpty) {
+      throw ArgumentError('设备组 ID 与设备 ID 不能为空');
+    }
+    await _ffi.removeGroupMember(groupId: gid, deviceId: did);
+    _notifyStateChanged();
+  }
+
+  Future<List<GroupRuleViewModel>> listGroupRules({String? groupId}) =>
+      _ffi.listGroupRules(groupId: groupId);
+
+  Future<GroupSyncRuleModel> upsertGroupRule({
+    String? ruleId,
+    required String groupId,
+    required String name,
+    required String mode,
+    String? sourceDeviceId,
+    required String sourceRoot,
+    String? sourceRootId,
+    int archiveRetentionDays = 30,
+    bool wifiOnly = true,
+    String? allowedSsids,
+    bool requireCharging = false,
+    int maxKbps = 0,
+    int scheduleIntervalSecs = 0,
+    bool enabled = true,
+  }) async {
+    if (groupId.trim().isEmpty || sourceRoot.trim().isEmpty) {
+      throw ArgumentError('设备组与源目录均不能为空');
+    }
+    final saved = await _ffi.upsertGroupRule(
+      ruleId: ruleId?.trim(),
+      groupId: groupId.trim(),
+      name: name.trim(),
+      mode: mode.trim(),
+      sourceDeviceId: sourceDeviceId?.trim(),
+      sourceRoot: sourceRoot.trim(),
+      sourceRootId: sourceRootId?.trim(),
+      archiveRetentionDays: archiveRetentionDays,
+      wifiOnly: wifiOnly,
+      allowedSsids: allowedSsids,
+      requireCharging: requireCharging,
+      maxKbps: maxKbps,
+      scheduleIntervalSecs: scheduleIntervalSecs,
+      enabled: enabled,
+    );
+    _notifyStateChanged();
+    return saved;
+  }
+
+  Future<void> deleteGroupRule(String ruleId) async {
+    final rid = ruleId.trim();
+    if (rid.isEmpty) {
+      throw ArgumentError.value(ruleId, 'ruleId', '规则 ID 不能为空');
+    }
+    await _ffi.deleteGroupRule(rid);
+    _notifyStateChanged();
+  }
+
+  Future<void> toggleGroupRule({
+    required String ruleId,
+    required bool enabled,
+  }) async {
+    final rid = ruleId.trim();
+    if (rid.isEmpty) {
+      throw ArgumentError.value(ruleId, 'ruleId', '规则 ID 不能为空');
+    }
+    await _ffi.toggleGroupRule(ruleId: rid, enabled: enabled);
+    _notifyStateChanged();
+  }
+
+  Future<RuleTargetBindingModel> upsertRuleTargetBinding({
+    String? bindingId,
+    required String ruleId,
+    required String targetDeviceId,
+    String? targetVaultId,
+    String? mirrorRootId,
+    String? targetRoot,
+    bool enabled = true,
+  }) async {
+    if (ruleId.trim().isEmpty || targetDeviceId.trim().isEmpty) {
+      throw ArgumentError('规则 ID 与目标设备不能为空');
+    }
+    final binding = await _ffi.upsertRuleTargetBinding(
+      bindingId: bindingId?.trim(),
+      ruleId: ruleId.trim(),
+      targetDeviceId: targetDeviceId.trim(),
+      targetVaultId: targetVaultId?.trim(),
+      mirrorRootId: mirrorRootId?.trim(),
+      targetRoot: targetRoot?.trim(),
+      enabled: enabled,
+    );
+    _notifyStateChanged();
+    return binding;
+  }
+
+  Future<void> disableRuleTargetBinding(String bindingId) async {
+    final bid = bindingId.trim();
+    if (bid.isEmpty) {
+      throw ArgumentError.value(bindingId, 'bindingId', '绑定 ID 不能为空');
+    }
+    await _ffi.disableRuleTargetBinding(bid);
+    _notifyStateChanged();
+  }
+
+  Future<MirrorRootModel> registerMirrorRoot({
+    required String canonicalPath,
+    String displayName = '',
+  }) async {
+    final path = canonicalPath.trim();
+    if (path.isEmpty) {
+      throw ArgumentError.value(canonicalPath, 'canonicalPath', '镜像目录路径不能为空');
+    }
+    final root = await _ffi.registerMirrorRoot(
+      canonicalPath: path,
+      displayName: displayName.trim(),
+    );
+    _notifyStateChanged();
+    return root;
+  }
+
+  Future<List<MirrorRootModel>> listMirrorRoots() => _ffi.listMirrorRoots();
+
+  Future<void> revokeMirrorRoot(String rootId) async {
+    final rid = rootId.trim();
+    if (rid.isEmpty) {
+      throw ArgumentError.value(rootId, 'rootId', '镜像根目录 ID 不能为空');
+    }
+    await _ffi.revokeMirrorRoot(rid);
+    _notifyStateChanged();
+  }
+
+  Future<List<MirrorPreviewModel>> previewGroupRule(String ruleId) {
+    final rid = ruleId.trim();
+    if (rid.isEmpty) {
+      throw ArgumentError.value(ruleId, 'ruleId', '规则 ID 不能为空');
+    }
+    return _ffi.previewGroupRule(rid);
+  }
+
+  Future<GroupRuleSyncOutcomeModel> triggerGroupRuleSync(String ruleId) {
+    final rid = ruleId.trim();
+    if (rid.isEmpty) {
+      throw ArgumentError.value(ruleId, 'ruleId', '规则 ID 不能为空');
+    }
+    return _ffi.triggerGroupRuleSync(rid);
+  }
+
+  Future<List<CatalogEntryModel>> listBindingCatalog({
+    required String bindingId,
+    String? afterPathKey,
+    int? limit,
+    bool sourceDeletedOnly = false,
+  }) {
+    final bid = bindingId.trim();
+    if (bid.isEmpty) {
+      throw ArgumentError.value(bindingId, 'bindingId', '绑定 ID 不能为空');
+    }
+    return _ffi.listBindingCatalog(
+      bindingId: bid,
+      afterPathKey: afterPathKey,
+      limit: limit,
+      sourceDeletedOnly: sourceDeletedOnly,
+    );
+  }
+
+  Future<List<CatalogVersionModel>> listBindingVersions({
+    required String bindingId,
+    String? pathKey,
+    int? afterArchivedAt,
+    String? afterVersionId,
+    int? limit,
+  }) {
+    final bid = bindingId.trim();
+    if (bid.isEmpty) {
+      throw ArgumentError.value(bindingId, 'bindingId', '绑定 ID 不能为空');
+    }
+    return _ffi.listBindingVersions(
+      bindingId: bid,
+      pathKey: pathKey,
+      afterArchivedAt: afterArchivedAt,
+      afterVersionId: afterVersionId,
+      limit: limit,
+    );
+  }
+
+  Future<RestoreCatalogVersionResultModel> restoreCatalogVersion({
+    required String bindingId,
+    required String versionId,
+    required String targetDir,
+  }) {
+    if (bindingId.trim().isEmpty ||
+        versionId.trim().isEmpty ||
+        targetDir.trim().isEmpty) {
+      throw ArgumentError('绑定 ID、版本 ID 与恢复目标目录均不能为空');
+    }
+    return _ffi.restoreCatalogVersion(
+      bindingId: bindingId.trim(),
+      versionId: versionId.trim(),
+      targetDir: targetDir.trim(),
+    );
+  }
+
+  Future<OutboxMessageViewModel> enqueueMessageText({
+    required List<String> targetDeviceIds,
+    required String text,
+  }) {
+    if (targetDeviceIds.isEmpty) {
+      throw ArgumentError.value(
+          targetDeviceIds, 'targetDeviceIds', '至少选择一个目标设备');
+    }
+    if (text.isEmpty) {
+      throw ArgumentError.value(text, 'text', '发送内容不能为空');
+    }
+    return _ffi.enqueueMessageText(
+      targetDeviceIds: targetDeviceIds,
+      text: text,
+    );
+  }
+
+  Future<OutboxMessageViewModel> enqueueMessageFile({
+    required List<String> targetDeviceIds,
+    required String filePath,
+  }) {
+    if (targetDeviceIds.isEmpty) {
+      throw ArgumentError.value(
+          targetDeviceIds, 'targetDeviceIds', '至少选择一个目标设备');
+    }
+    final trimmed = filePath.trim();
+    if (trimmed.isEmpty) {
+      throw ArgumentError.value(filePath, 'filePath', '文件路径不能为空');
+    }
+    return _ffi.enqueueMessageFile(
+      targetDeviceIds: targetDeviceIds,
+      filePath: trimmed,
+    );
+  }
+
+  Future<int> retryOutboxMessage(String clientMsgId) {
+    final id = clientMsgId.trim();
+    if (id.isEmpty) {
+      throw ArgumentError.value(clientMsgId, 'clientMsgId', '消息 ID 不能为空');
+    }
+    return _ffi.retryOutboxMessage(id);
+  }
+
+  Future<List<OutboxMessageViewModel>> listOutboxMessages({int? limit}) =>
+      _ffi.listOutboxMessages(limit: limit);
 }

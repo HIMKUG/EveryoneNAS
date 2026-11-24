@@ -1,8 +1,5 @@
 /**
- * LanVault REST API Client (11 Contract Endpoints)
- *
- * Reference basis:
- * - /working_dir/c_0c10370daccfa96e/lanvault/ARCHITECTURE_CONTRACTS.md (Section 3.1)
+ * LanVault REST API Client (v1 + v2 Contract Endpoints)
  *
  * Boundary-only validation: HTTP status & JSON parsing occur strictly here.
  * Persists 429 Retry-After lockout deadline in localStorage so page refreshes
@@ -207,6 +204,109 @@
     return request('POST', '/api/debug/logs/client', { level, source, message, detail });
   }
 
+  /* 13. v2 Protocol Capabilities */
+  function getCapabilities() {
+    return request('GET', '/api/capabilities');
+  }
+
+  /* 14. v2 Device Groups & Membership */
+  function listGroups() {
+    return request('GET', '/api/groups');
+  }
+
+  function createGroup(name) {
+    return request('POST', '/api/groups', { name });
+  }
+
+  function renameGroup(groupId, name) {
+    return request('PATCH', `/api/groups/${encodeURIComponent(groupId)}`, { name });
+  }
+
+  function deleteGroup(groupId) {
+    return request('DELETE', `/api/groups/${encodeURIComponent(groupId)}`);
+  }
+
+  function listGroupMembers(groupId) {
+    return request('GET', `/api/groups/${encodeURIComponent(groupId)}/members`);
+  }
+
+  function addGroupMember(groupId, deviceId, role = 'member') {
+    return request('POST', `/api/groups/${encodeURIComponent(groupId)}/members`, {
+      device_id: deviceId,
+      role,
+    });
+  }
+
+  function removeGroupMember(groupId, deviceId) {
+    return request(
+      'DELETE',
+      `/api/groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(deviceId)}`,
+    );
+  }
+
+  /* 15. v2 Group Sync Rules & Target Bindings */
+  function listGroupRules(groupId) {
+    return request('GET', `/api/groups/${encodeURIComponent(groupId)}/rules`);
+  }
+
+  function listRuleBindings(ruleId) {
+    return request('GET', `/api/rules/${encodeURIComponent(ruleId)}/bindings`);
+  }
+
+  /* 16. v2 Incremental Catalog & Version History */
+  function listBindingCatalog(bindingId, afterPathKey = null, limit = 200, sourceDeletedOnly = false) {
+    const query = new URLSearchParams();
+    if (afterPathKey) {
+      query.set('after_path_key', afterPathKey);
+    }
+    if (limit !== undefined && limit !== null) {
+      query.set('limit', String(limit));
+    }
+    if (sourceDeletedOnly) {
+      query.set('source_deleted_only', 'true');
+    }
+    const qs = query.toString();
+    return request('GET', `/api/bindings/${encodeURIComponent(bindingId)}/catalog${qs ? `?${qs}` : ''}`);
+  }
+
+  function listBindingVersions(
+    bindingId,
+    pathKey = null,
+    afterArchivedAt = null,
+    afterVersionId = null,
+    limit = 200,
+  ) {
+    const query = new URLSearchParams();
+    if (pathKey) {
+      query.set('path_key', pathKey);
+    }
+    if (afterArchivedAt !== undefined && afterArchivedAt !== null) {
+      query.set('after_archived_at', String(afterArchivedAt));
+    }
+    if (afterVersionId) {
+      query.set('after_version_id', afterVersionId);
+    }
+    if (limit !== undefined && limit !== null) {
+      query.set('limit', String(limit));
+    }
+    const qs = query.toString();
+    return request('GET', `/api/bindings/${encodeURIComponent(bindingId)}/versions${qs ? `?${qs}` : ''}`);
+  }
+
+  function buildVersionDownloadUrl(bindingId, versionId) {
+    return `/api/bindings/${encodeURIComponent(bindingId)}/versions/${encodeURIComponent(versionId)}/download`;
+  }
+
+  /* 17. v2 Idempotent Multi-Target Clipboard & History */
+  function sendClipboardV2(payload) {
+    return request('POST', '/api/clipboard', payload);
+  }
+
+  function getClipboardHistory(limit = 50) {
+    const query = new URLSearchParams({ limit: String(limit) });
+    return request('GET', `/api/clipboard/history?${query.toString()}`);
+  }
+
   global.LanVault = global.LanVault || {};
   global.LanVault.api = {
     ApiError,
@@ -231,5 +331,20 @@
     getDebugLogs,
     clearDebugLogs,
     reportClientLog,
+    getCapabilities,
+    listGroups,
+    createGroup,
+    renameGroup,
+    deleteGroup,
+    listGroupMembers,
+    addGroupMember,
+    removeGroupMember,
+    listGroupRules,
+    listRuleBindings,
+    listBindingCatalog,
+    listBindingVersions,
+    buildVersionDownloadUrl,
+    sendClipboardV2,
+    getClipboardHistory,
   };
 })(window);

@@ -14,7 +14,9 @@ use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, Error, Signa
 use crate::ClientError;
 
 // RFC 8410 Ed25519 SubjectPublicKeyInfo with an absent parameters field and a 32-byte key.
-const ED25519_SPKI_PREFIX: &[u8] = &[0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+const ED25519_SPKI_PREFIX: &[u8] = &[
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerFingerprint([u8; 16]);
@@ -30,8 +32,9 @@ impl FromStr for PeerFingerprint {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let mut pin = [0; 16];
-        hex::decode_to_slice(value.trim(), &mut pin)
-            .map_err(|_| ClientError::InvalidInput("peer fingerprint must be 32 hexadecimal characters".into()))?;
+        hex::decode_to_slice(value.trim(), &mut pin).map_err(|_| {
+            ClientError::InvalidInput("peer fingerprint must be 32 hexadecimal characters".into())
+        })?;
         Ok(Self(pin))
     }
 }
@@ -73,12 +76,15 @@ impl ServerCertVerifier for DeviceCertificateVerifier {
     ) -> Result<ServerCertVerified, Error> {
         let parsed = ParsedCertificate::try_from(certificate)?;
         let spki = parsed.subject_public_key_info();
-        let key: &[u8; 32] = spki.as_ref()
+        let key: &[u8; 32] = spki
+            .as_ref()
             .strip_prefix(ED25519_SPKI_PREFIX)
             .and_then(|bytes| bytes.try_into().ok())
             .ok_or(Error::InvalidCertificate(CertificateError::BadEncoding))?;
         if PeerFingerprint::from_public_key(key) != self.pin {
-            return Err(Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure));
+            return Err(Error::InvalidCertificate(
+                CertificateError::ApplicationVerificationFailure,
+            ));
         }
         // Connection addresses can change; the pinned device key is the trust anchor.
         // rustls still verifies possession of the private key in CertificateVerify below.

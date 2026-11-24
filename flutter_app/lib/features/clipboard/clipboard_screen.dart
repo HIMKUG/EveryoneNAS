@@ -31,7 +31,9 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
   final ScrollController _scrollController = ScrollController();
   List<TransferHistoryModel> _history = const <TransferHistoryModel>[];
   Timer? _pollTimer;
-  bool _sending = false;
+  final _outbox = <String, OutboxMessageViewModel>{};
+  final _pending = <int, _PendingChatMessage>{};
+  int _nextPendingId = -1;
   bool _loading = true;
   bool _refreshing = false;
 
@@ -40,7 +42,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
     super.initState();
     unawaited(_refreshHistory(silent: false));
     _pollTimer = Timer.periodic(
-      const Duration(seconds: 4),
+      const Duration(seconds: 2),
       (_) => unawaited(_refreshHistory(silent: true)),
     );
   }
@@ -59,9 +61,12 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
     if (!silent && mounted) setState(() => _loading = true);
     try {
       final list = await widget.bridge.listTransferHistory(limit: 100);
+      final outgoing = await widget.bridge.listOutboxMessages(limit: 100);
       if (!mounted) return;
       setState(() {
         _history = list.reversed.toList(growable: false);
+        _outbox.addEntries(
+            outgoing.map((item) => MapEntry(item.clientMsgId, item)));
         _loading = false;
       });
     } catch (err) {
@@ -77,59 +82,88 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
 
   Future<void> _sendText() async {
     final text = _inputController.text.trim();
-    if (text.isEmpty || _sending) return;
     final peer = widget.bridge.selectedPeer;
-    if (peer == null) {
-      NeuToast.warning(context, '请先配对并选择一台目标设备');
-      return;
-    }
-
-    setState(() => _sending = true);
-    try {
-      await widget.bridge.pushClipboardText(
-        targetDeviceId: peer.deviceId,
+    if (text.isEmpty || peer == null) return;
+    _inputController.clear();
+    await _enqueue(
+      peer.deviceId,
+      title: text,
+      kind: 'clipboard',
+      submit: () => widget.bridge.enqueueMessageText(
+        targetDeviceIds: [peer.deviceId],
         text: text,
-      );
-      if (!mounted) return;
-      _inputController.clear();
-      await _refreshHistory(silent: true);
-      _scrollToBottom();
-    } catch (err) {
-      if (!mounted) return;
-      NeuToast.error(context, LanVaultBridge.formatUserError(err));
-    } finally {
-      if (mounted) setState(() => _sending = false);
-    }
+      ),
+    );
   }
 
   Future<void> _pickAndSendFile() async {
-    if (_sending) return;
     final peer = widget.bridge.selectedPeer;
-    if (peer == null) {
-      NeuToast.warning(context, '请先配对并选择一台目标设备');
-      return;
-    }
+    if (peer == null) return;
     final path = await widget.bridge.pickFile(title: '选择要发送的文件');
-    if (path == null || path.isEmpty || !mounted) return;
-
-    setState(() => _sending = true);
-    try {
-      await widget.bridge.pushClipboardFile(
-        targetDeviceId: peer.deviceId,
+    if (!mounted || path == null || path.isEmpty) return;
+    await _enqueue(
+      peer.deviceId,
+      title: SystemEnvHelper.folderDisplayName(path),
+      kind: 'file',
+      submit: () => widget.bridge.enqueueMessageFile(
+        targetDeviceIds: [peer.deviceId],
         filePath: path,
-      );
-      if (!mounted) return;
-      NeuToast.success(
-        context,
-        '已发送 ${SystemEnvHelper.folderDisplayName(path)}',
-      );
+      ),
+    );
+  }
+
+  Future<void> _enqueue(
+    String deviceId, {
+    required String title,
+    required String kind,
+    required Future<OutboxMessageViewModel> Function() submit,
+  }) async {
+    final id = _nextPendingId--;
+    final item = TransferHistoryModel(
+      id: id,
+      direction: 'sent',
+      kind: kind,
+      title: title,
+      subtitle: '',
+      peerName: deviceId,
+      sizeBytes: 0,
+      createdAtSecs: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+    );
+    setState(() => _pending[id] = (item: item, error: null, retry: null));
+    _scrollToBottom();
+
+    Future<void> deliver() async {
+      try {
+        final queued = await submit();
+        if (!mounted) return;
+        setState(() {
+          _pending.remove(id);
+          _outbox[queued.clientMsgId] = queued;
+        });
+      } catch (err) {
+        if (!mounted) return;
+        final error = LanVaultBridge.formatUserError(err);
+        setState(() => _pending[id] = (
+              item: item,
+              error: error,
+              retry: () async {
+                setState(() =>
+                    _pending[id] = (item: item, error: null, retry: null));
+                await deliver();
+              },
+            ));
+      }
+    }
+
+    await deliver();
+  }
+
+  Future<void> _retryOutbox(String id) async {
+    try {
+      await widget.bridge.retryOutboxMessage(id);
       await _refreshHistory(silent: true);
-      _scrollToBottom();
     } catch (err) {
-      if (!mounted) return;
-      NeuToast.error(context, LanVaultBridge.formatUserError(err));
-    } finally {
-      if (mounted) setState(() => _sending = false);
+      if (mounted) NeuToast.error(context, LanVaultBridge.formatUserError(err));
     }
   }
 
@@ -161,8 +195,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final isWide =
-        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
+    final isWide = MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
 
     return ValueListenableBuilder<List<PairedPeerModel>>(
       valueListenable: widget.bridge.pairedPeersNotifier,
@@ -184,10 +217,54 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                         (dIp.isNotEmpty && raw.contains(dIp));
                   }).toList(growable: false);
 
+            final messages = <_ChatMessage>[
+              for (final item in filtered)
+                (item: item, status: null, error: null, retry: null),
+              for (final pending in _pending.values)
+                if (pending.item.peerName == activePeer?.deviceId)
+                  (
+                    item: pending.item,
+                    status: pending.error == null ? '发送中' : '发送失败',
+                    error: pending.error,
+                    retry: pending.retry,
+                  ),
+              for (final outgoing in _outbox.values)
+                if (outgoing.targets.any(
+                    (target) => target.targetDeviceId == activePeer?.deviceId))
+                  (
+                    item: TransferHistoryModel(
+                      id: outgoing.localSeq,
+                      direction: 'sent',
+                      kind: outgoing.kind,
+                      title: outgoing.title,
+                      content: outgoing.content,
+                      subtitle: '',
+                      peerName: activePeer!.deviceId,
+                      sizeBytes: outgoing.sizeBytes,
+                      createdAtSecs: outgoing.createdAt,
+                    ),
+                    status: switch (outgoing.overallStatus) {
+                      'sent' => '已发送',
+                      'failed' => '发送失败',
+                      'partial_failed' => '部分发送失败',
+                      'unknown' || 'unknown_legacy' => '结果未确认',
+                      _ => '发送中',
+                    },
+                    error: outgoing.targets
+                        .where((target) =>
+                            target.targetDeviceId == activePeer.deviceId)
+                        .first
+                        .errorMessage,
+                    retry: outgoing.canRetry
+                        ? () => _retryOutbox(outgoing.clientMsgId)
+                        : null,
+                  ),
+            ]..sort(
+                (a, b) => a.item.createdAtSecs.compareTo(b.item.createdAtSecs));
             final chatPane = _buildChatPane(
               context,
               activePeer: activePeer,
-              items: filtered,
+              items: messages,
               isWide: isWide,
             );
 
@@ -344,7 +421,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
   Widget _buildChatPane(
     BuildContext context, {
     required PairedPeerModel? activePeer,
-    required List<TransferHistoryModel> items,
+    required List<_ChatMessage> items,
     required bool isWide,
   }) {
     return Column(
@@ -413,20 +490,24 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                       padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
                       itemCount: items.length,
                       itemBuilder: (context, index) {
-                        final item = items[index];
+                        final message = items[index];
+                        final item = message.item;
                         final showTime = index == 0 ||
                             (item.createdAtSecs -
-                                        items[index - 1].createdAtSecs)
+                                        items[index - 1].item.createdAtSecs)
                                     .abs() >
                                 180;
                         return _MessageBubbleRow(
                           item: item,
                           showTimeHeader: showTime,
+                          status: message.status,
+                          error: message.error,
+                          onRetry: message.retry,
                         );
                       },
                     ),
         ),
-        _buildInputBar(context, enabled: activePeer != null && !_sending),
+        _buildInputBar(context, enabled: activePeer != null),
       ],
     );
   }
@@ -482,9 +563,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
           ),
           const SizedBox(width: 8),
           _RoundActionButton(
-            icon: _sending
-                ? Icons.hourglass_top_rounded
-                : Icons.arrow_upward_rounded,
+            icon: Icons.arrow_upward_rounded,
             tooltip: '发送',
             primary: true,
             onPressed: enabled ? _sendText : null,
@@ -495,14 +574,33 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
   }
 }
 
+typedef _PendingChatMessage = ({
+  TransferHistoryModel item,
+  String? error,
+  Future<void> Function()? retry,
+});
+
+typedef _ChatMessage = ({
+  TransferHistoryModel item,
+  String? status,
+  String? error,
+  Future<void> Function()? retry,
+});
+
 class _MessageBubbleRow extends StatelessWidget {
   const _MessageBubbleRow({
     required this.item,
     required this.showTimeHeader,
+    this.status,
+    this.error,
+    this.onRetry,
   });
 
   final TransferHistoryModel item;
   final bool showTimeHeader;
+  final String? status;
+  final String? error;
+  final VoidCallback? onRetry;
 
   @override
   Widget build(BuildContext context) {
@@ -535,6 +633,17 @@ class _MessageBubbleRow extends StatelessWidget {
                 ? _buildFileBubble(context, incoming)
                 : _buildTextBubble(context, incoming),
           ),
+          if (status != null)
+            Wrap(
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 6,
+              children: [
+                Text(status!,
+                    semanticsLabel: error == null ? status : '$status：$error'),
+                if (onRetry != null)
+                  TextButton(onPressed: onRetry, child: const Text('重试')),
+              ],
+            ),
         ],
       ),
     );
@@ -605,9 +714,7 @@ class _MessageBubbleRow extends StatelessWidget {
         decoration: BoxDecoration(
           color: incoming ? NeuTokens.surface : NeuTokens.accent,
           borderRadius: const BorderRadius.all(Radius.circular(18)),
-          border: incoming
-              ? Border.all(color: NeuTokens.hairlineBorder)
-              : null,
+          border: incoming ? Border.all(color: NeuTokens.hairlineBorder) : null,
           boxShadow: NeuTokens.controlShadows,
         ),
         child: Text(
@@ -653,9 +760,8 @@ class _RoundActionButton extends StatelessWidget {
                     ? NeuTokens.accent
                     : NeuTokens.accent.withValues(alpha: 0.35))
                 : NeuTokens.surface,
-            border: primary
-                ? null
-                : Border.all(color: NeuTokens.hairlineBorder),
+            border:
+                primary ? null : Border.all(color: NeuTokens.hairlineBorder),
             boxShadow: NeuTokens.controlShadows,
           ),
           child: Icon(

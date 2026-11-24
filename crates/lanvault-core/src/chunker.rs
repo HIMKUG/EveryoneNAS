@@ -194,11 +194,8 @@ pub fn pack_chunk_with_context(
     seal_ctx: Option<&ChunkSealContext>,
     zstd_level: i32,
 ) -> Result<PackedChunk> {
-    let mut probe = crate::debug_telemetry::ProbeGuard::start(
-        "core.chunker",
-        "chunker.pack_chunk",
-        None,
-    );
+    let mut probe =
+        crate::debug_telemetry::ProbeGuard::start("core.chunker", "chunker.pack_chunk", None);
     probe.add_bytes(plaintext.len() as u64);
     let compressed = compress_zstd(plaintext, zstd_level)?;
     let stored_bytes = match seal_ctx {
@@ -253,10 +250,34 @@ pub fn is_incompressible_extension(path: &std::path::Path) -> bool {
     };
     matches!(
         ext.to_ascii_lowercase().as_str(),
-        "jpg" | "jpeg" | "heic" | "heif" | "png" | "webp" | "avif" | "gif"
-            | "mp4" | "mov" | "mkv" | "avi" | "webm" | "m4v"
-            | "mp3" | "aac" | "flac" | "ogg" | "m4a"
-            | "zip" | "7z" | "rar" | "gz" | "xz" | "zst" | "bz2" | "apk" | "ipa"
+        "jpg"
+            | "jpeg"
+            | "heic"
+            | "heif"
+            | "png"
+            | "webp"
+            | "avif"
+            | "gif"
+            | "mp4"
+            | "mov"
+            | "mkv"
+            | "avi"
+            | "webm"
+            | "m4v"
+            | "mp3"
+            | "aac"
+            | "flac"
+            | "ogg"
+            | "m4a"
+            | "zip"
+            | "7z"
+            | "rar"
+            | "gz"
+            | "xz"
+            | "zst"
+            | "bz2"
+            | "apk"
+            | "ipa"
     )
 }
 
@@ -278,7 +299,10 @@ pub fn pack_chunk_adaptive_with_context(
     let (payload, compression) = if use_raw {
         (plaintext.to_vec(), ChunkCompression::Raw)
     } else {
-        (compress_zstd(plaintext, zstd_level)?, ChunkCompression::Zstd)
+        (
+            compress_zstd(plaintext, zstd_level)?,
+            ChunkCompression::Zstd,
+        )
     };
     let stored_bytes = match seal_ctx {
         Some(ctx) => ctx.encrypt_deterministic(&payload)?,
@@ -358,10 +382,20 @@ mod tests {
         let vault_key = master.derive_vault_chunk_key(vault_id);
         let payload = b"repeatable content-defined chunk payload for dedup";
 
-        let p1 = pack_chunk(payload, Some(&vault_key), vault_id.as_bytes(), DEFAULT_ZSTD_LEVEL)
-            .unwrap();
-        let p2 = pack_chunk(payload, Some(&vault_key), vault_id.as_bytes(), DEFAULT_ZSTD_LEVEL)
-            .unwrap();
+        let p1 = pack_chunk(
+            payload,
+            Some(&vault_key),
+            vault_id.as_bytes(),
+            DEFAULT_ZSTD_LEVEL,
+        )
+        .unwrap();
+        let p2 = pack_chunk(
+            payload,
+            Some(&vault_key),
+            vault_id.as_bytes(),
+            DEFAULT_ZSTD_LEVEL,
+        )
+        .unwrap();
         assert_eq!(p1.stored_hash, p2.stored_hash);
         assert_eq!(p1.stored_bytes, p2.stored_bytes);
 

@@ -5,12 +5,13 @@
 //! - Keep 1 snapshot per day for the last 7 days
 //! - Keep 1 snapshot per week for the last 4 weeks
 //! - Keep 1 snapshot per month for the last 6 months
+//! - Recycle expired mirror archive catalog versions (`expires_at <= now_ts AND recycled_at IS NULL`)
 //! - Delete expired snapshots and reclaim chunks with `ref_count == 0`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use lanvault_core::{ProbeGuard, Database, Result, RetentionTier, SnapshotRecord};
+use lanvault_core::{Database, ProbeGuard, Result, RetentionTier, SnapshotRecord};
 use serde::{Deserialize, Serialize};
 
 use crate::vault::VaultStore;
@@ -93,8 +94,7 @@ impl GarbageCollector {
                 };
                 let cutoff = now_unix_secs.saturating_sub(window_secs);
                 let bucket = snap.created_at.div_euclid(bucket_secs);
-                if snap.created_at < cutoff
-                    || !seen.insert((snap.retention_tier.as_str(), bucket))
+                if snap.created_at < cutoff || !seen.insert((snap.retention_tier.as_str(), bucket))
                 {
                     expired.push(snap.snapshot_id.clone());
                 }
@@ -104,7 +104,8 @@ impl GarbageCollector {
         expired
     }
 
-    /// Applies GFS retention to `vault_id` and reclaims all orphan chunks (`ref_count == 0`).
+    /// Applies GFS retention to `vault_id`, recycles expired mirror archive catalog versions,
+    /// and reclaims all orphan chunks (`ref_count == 0`).
     pub fn run_gc(
         &self,
         vault_id: &str,
@@ -118,16 +119,16 @@ impl GarbageCollector {
         let _probe = ProbeGuard::start(
             "server.gc",
             "server.gc_run",
-            Some(format!("vault_id={vault_id}, snapshots={evaluated_snapshots}")),
+            Some(format!(
+                "vault_id={vault_id}, snapshots={evaluated_snapshots}"
+            )),
         );
         let expired_count = self.db.delete_snapshots_batch(&expired_ids)? as u64;
         if !expired_ids.is_empty() {
             if let Ok(roots) = self.vault_store.manifest_backup_roots(vault_id) {
                 for root in roots {
                     for snapshot_id in &expired_ids {
-                        let path = root
-                            .join("manifests")
-                            .join(format!("{snapshot_id}.json"));
+                        let path = root.join("manifests").join(format!("{snapshot_id}.json"));
                         if let Err(err) = std::fs::remove_file(&path) {
                             if err.kind() != std::io::ErrorKind::NotFound {
                                 tracing::warn!(
@@ -139,6 +140,21 @@ impl GarbageCollector {
                     }
                 }
             }
+        }
+
+        // Recycle expired mirror archive catalog versions (`expires_at <= now_ts AND recycled_at IS NULL`)
+        // before orphan chunk reclamation; diff_backup versions (`expires_at IS NULL`) and
+        // `source_deleted = 1` current entries remain untouched.
+        let recycled_versions = self
+            .db
+            .recycle_expired_catalog_versions(now_unix_secs, 500)?;
+        if !recycled_versions.is_empty() {
+            let total_recycled: usize = recycled_versions.iter().map(|(_, count)| *count).sum();
+            tracing::info!(
+                vault_id = %vault_id,
+                total_recycled,
+                "recycled expired mirror archive catalog versions"
+            );
         }
 
         let (deleted_chunks, reclaimed_bytes) = self.vault_store.with_write_lock(|| {

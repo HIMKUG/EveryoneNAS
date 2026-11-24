@@ -154,55 +154,60 @@ impl DiscoveryBrowser {
             Some(format!("local_id={local_device_id}")),
         );
         let daemon = ServiceDaemon::new().ok();
-        let receiver = daemon.as_ref().and_then(|daemon| {
-            daemon.browse(MDNS_SERVICE_TYPE).ok()
-        });
+        let receiver = daemon
+            .as_ref()
+            .and_then(|daemon| daemon.browse(MDNS_SERVICE_TYPE).ok());
         let mut tasks = Vec::new();
         if let Some(receiver) = receiver {
             let mdns_tx = tx.clone();
             let mdns_local_id = local_device_id.clone();
             tasks.push(tokio::spawn(async move {
-            while let Ok(event) = receiver.recv_async().await {
-                if let ServiceEvent::ServiceResolved(info) = event {
-                    let Some(id) = info.get_property_val_str("id") else {
-                        continue;
-                    };
-                    if id == mdns_local_id {
-                        continue;
-                    }
-                    let Some(os) = info.get_property_val_str("os") else {
-                        continue;
-                    };
-                    let Some(name) = info.get_property_val_str("name") else {
-                        continue;
-                    };
-                    let Some(fp) = info.get_property_val_str("fp") else {
-                        continue;
-                    };
-                    let Some(ipv4) = info.get_addresses_v4().into_iter().next() else {
-                        continue;
-                    };
-                    let peer = DiscoveredPeerInfo {
-                        device_id: id.to_string(),
-                        device_name: name.to_string(),
-                        os_type: os.to_string(),
-                        fingerprint: fp.to_string(),
-                        ip: IpAddr::V4(ipv4),
-                        port: info.get_port(),
-                        via_mdns: true,
-                    };
-                    crate::debug_telemetry::record_debug(
-                        "core.discovery",
-                        Some("discovery.peer_found"),
-                        None,
-                        || format!("mDNS resolved peer {} ({}:{})", peer.device_id, peer.ip, peer.port),
-                        Some(format!("os={} name={}", peer.os_type, peer.device_name)),
-                    );
-                    if mdns_tx.send(peer).await.is_err() {
-                        break;
+                while let Ok(event) = receiver.recv_async().await {
+                    if let ServiceEvent::ServiceResolved(info) = event {
+                        let Some(id) = info.get_property_val_str("id") else {
+                            continue;
+                        };
+                        if id == mdns_local_id {
+                            continue;
+                        }
+                        let Some(os) = info.get_property_val_str("os") else {
+                            continue;
+                        };
+                        let Some(name) = info.get_property_val_str("name") else {
+                            continue;
+                        };
+                        let Some(fp) = info.get_property_val_str("fp") else {
+                            continue;
+                        };
+                        let Some(ipv4) = info.get_addresses_v4().into_iter().next() else {
+                            continue;
+                        };
+                        let peer = DiscoveredPeerInfo {
+                            device_id: id.to_string(),
+                            device_name: name.to_string(),
+                            os_type: os.to_string(),
+                            fingerprint: fp.to_string(),
+                            ip: IpAddr::V4(ipv4),
+                            port: info.get_port(),
+                            via_mdns: true,
+                        };
+                        crate::debug_telemetry::record_debug(
+                            "core.discovery",
+                            Some("discovery.peer_found"),
+                            None,
+                            || {
+                                format!(
+                                    "mDNS resolved peer {} ({}:{})",
+                                    peer.device_id, peer.ip, peer.port
+                                )
+                            },
+                            Some(format!("os={} name={}", peer.os_type, peer.device_name)),
+                        );
+                        if mdns_tx.send(peer).await.is_err() {
+                            break;
+                        }
                     }
                 }
-            }
             }));
         } else {
             tracing::warn!("mDNS discovery unavailable; continuing with UDP fallback");
@@ -211,10 +216,7 @@ impl DiscoveryBrowser {
         let udp_task = spawn_udp_beacon_listener(local_device_id, tx);
         tasks.push(udp_task);
 
-        Ok(Self {
-            daemon,
-            tasks,
-        })
+        Ok(Self { daemon, tasks })
     }
 
     /// Stops browsing and shuts down background listeners.
@@ -223,9 +225,9 @@ impl DiscoveryBrowser {
             task.abort();
         }
         if let Some(daemon) = self.daemon.take() {
-            daemon
-                .shutdown()
-                .map_err(|e| LanVaultError::Discovery(format!("mDNS browser shutdown failed: {e}")))?;
+            daemon.shutdown().map_err(|e| {
+                LanVaultError::Discovery(format!("mDNS browser shutdown failed: {e}"))
+            })?;
         }
         Ok(())
     }
@@ -300,7 +302,12 @@ fn spawn_udp_beacon_listener(
                 "core.discovery",
                 Some("discovery.peer_found"),
                 None,
-                || format!("UDP beacon discovered peer {} ({}:{})", peer.device_id, peer.ip, peer.port),
+                || {
+                    format!(
+                        "UDP beacon discovered peer {} ({}:{})",
+                        peer.device_id, peer.ip, peer.port
+                    )
+                },
                 Some(format!("os={} name={}", peer.os_type, peer.device_name)),
             );
             if tx.send(peer).await.is_err() {
