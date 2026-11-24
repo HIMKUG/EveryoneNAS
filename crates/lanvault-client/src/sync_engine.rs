@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::error::ClientError;
 use crate::scanner::{
-    delete_file_states, DiffResult, FileMetadataSnapshot, ScannedEntry, ScannedEntryKind,
+    checkpoint_key, DiffResult, FileMetadataSnapshot, ScannedEntry, ScannedEntryKind,
     SourceGeneration,
 };
 
@@ -566,6 +566,16 @@ impl SyncEngine {
 
     pub fn subscribe_progress(&self) -> broadcast::Receiver<SyncProgress> {
         self.progress_tx.subscribe()
+    }
+
+    pub fn has_pending_checkpoint(
+        db: &Database,
+        rule_id: &str,
+        vault_id: &str,
+    ) -> Result<bool, ClientError> {
+        Ok(db
+            .get_setting(&checkpoint_key(vault_id, rule_id))?
+            .is_some_and(|value| value.starts_with("inflight:") || value.starts_with("rebuild:")))
     }
 
     pub async fn update_policy(&self, policy: PowerNetworkPolicy) {
@@ -1194,11 +1204,37 @@ impl SyncEngine {
         let total_bytes: u64 = changed.iter().map(|f| f.size).sum();
         let mut summary = SyncSummary::default();
         let file_count = changed.len();
+        let checkpoint_storage_key = checkpoint_key(vault_id, rule_id);
+        let checkpoint = db
+            .get_setting(&checkpoint_storage_key)?
+            .unwrap_or_default();
+        let pending_previous = checkpoint
+            .strip_prefix("inflight:")
+            .or_else(|| checkpoint.strip_prefix("rebuild:"));
+
+        if diff.is_empty() && pending_previous.is_none() {
+            return Ok(summary);
+        }
+        let previous_snapshot = pending_previous.unwrap_or(&checkpoint);
+        if pending_previous.is_none() {
+            db.set_setting(
+                &checkpoint_storage_key,
+                &format!("inflight:{previous_snapshot}"),
+            )?;
+        }
 
         if file_count == 0 {
-            if !diff.deleted.is_empty() {
-                self.commit_deletions(db, rule_id, vault_id, diff).await?;
-            }
+            self.finalize_pass(
+                db,
+                rule_id,
+                vault_id,
+                &mut summary,
+                Vec::new(),
+                diff,
+                previous_snapshot,
+                &checkpoint_storage_key,
+            )
+            .await?;
             return Ok(summary);
         }
 
@@ -1285,6 +1321,8 @@ impl SyncEngine {
                         &mut summary,
                         pending_db_states,
                         &partial_diff,
+                        previous_snapshot,
+                        &checkpoint_storage_key,
                     )
                     .await
                 {
@@ -1294,8 +1332,17 @@ impl SyncEngine {
             return Err(err);
         }
 
-        self.finalize_pass(db, rule_id, vault_id, &mut summary, pending_db_states, diff)
-            .await?;
+        self.finalize_pass(
+            db,
+            rule_id,
+            vault_id,
+            &mut summary,
+            pending_db_states,
+            diff,
+            previous_snapshot,
+            &checkpoint_storage_key,
+        )
+        .await?;
 
         let elapsed = started.elapsed().as_secs_f64().max(0.001);
         info!(
@@ -1321,8 +1368,15 @@ impl SyncEngine {
         summary: &mut SyncSummary,
         pending_db_states: Vec<LocalFileStateRecord>,
         diff: &DiffResult,
+        previous_snapshot: &str,
+        checkpoint_storage_key: &str,
     ) -> Result<(), ClientError> {
         if diff.is_empty() && pending_db_states.is_empty() {
+            if db.get_setting(checkpoint_storage_key)?.as_deref()
+                != Some(previous_snapshot)
+            {
+                db.set_setting(checkpoint_storage_key, previous_snapshot)?;
+            }
             return Ok(());
         }
         let deleted: HashSet<&str> = diff.deleted.iter().map(String::as_str).collect();
@@ -1337,29 +1391,23 @@ impl SyncEngine {
         }
         let mut projected_states: Vec<LocalFileStateRecord> = projected_map.into_values().collect();
         let snapshot_id = self
-            .commit_snapshot(rule_id, vault_id, &mut projected_states)
+            .commit_snapshot(
+                rule_id,
+                vault_id,
+                previous_snapshot,
+                &mut projected_states,
+            )
             .await?;
         summary.snapshot_id = Some(snapshot_id);
 
-        if !pending_db_states.is_empty() {
-            db.upsert_local_file_states_batch(&pending_db_states)?;
-        }
-        if !diff.deleted.is_empty() {
-            delete_file_states(db, rule_id, &diff.deleted)?;
-        }
+        db.commit_local_snapshot(
+            rule_id,
+            &pending_db_states,
+            &diff.deleted,
+            checkpoint_storage_key,
+            summary.snapshot_id.as_deref().unwrap_or_default(),
+        )?;
         Ok(())
-    }
-
-    async fn commit_deletions(
-        &self,
-        db: &Database,
-        rule_id: &str,
-        vault_id: &str,
-        diff: &DiffResult,
-    ) -> Result<(), ClientError> {
-        let mut noop_summary = SyncSummary::default();
-        self.finalize_pass(db, rule_id, vault_id, &mut noop_summary, Vec::new(), diff)
-            .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1849,6 +1897,7 @@ impl SyncEngine {
         &self,
         rule_id: &str,
         vault_id: &str,
+        previous_snapshot: &str,
         states: &mut [LocalFileStateRecord],
     ) -> Result<String, ClientError> {
         states.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -1880,11 +1929,18 @@ impl SyncEngine {
         }
 
         let root_tree_hash = blake3_hash(&tree_input);
-        // 基于 (rule_id, vault_id, root_tree_hash) 派生确定性 snapshot_id，确保网络重试精准命中服务端幂等逻辑。
+        // 基于上一检查点、规则、设备、存储池和目录树派生确定 ID。网络中断后重试会命中
+        // 服务端幂等逻辑，不会因为回包丢失而重复创建同一份历史。
         let mut id_seed = Vec::new();
+        id_seed.extend_from_slice(b"EveryoneNAS snapshot commit v1");
+        id_seed.push(0);
         id_seed.extend_from_slice(rule_id.as_bytes());
         id_seed.push(0);
         id_seed.extend_from_slice(vault_id.as_bytes());
+        id_seed.push(0);
+        id_seed.extend_from_slice(self.device_id.as_bytes());
+        id_seed.push(0);
+        id_seed.extend_from_slice(previous_snapshot.as_bytes());
         id_seed.push(0);
         id_seed.extend_from_slice(&root_tree_hash);
         let id_hash = blake3_hash(&id_seed);
@@ -1949,6 +2005,22 @@ fn unix_now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pending_checkpoint_requires_retry_until_committed() {
+        let db = Database::open_in_memory().unwrap();
+        assert!(!SyncEngine::has_pending_checkpoint(&db, "rule", "vault").unwrap());
+        let key = checkpoint_key("vault", "rule");
+        db.set_setting(&key, "inflight:previous").unwrap();
+        assert!(SyncEngine::has_pending_checkpoint(&db, "rule", "vault").unwrap());
+        db.set_setting(&key, "snapshot-committed").unwrap();
+        assert!(!SyncEngine::has_pending_checkpoint(&db, "rule", "vault").unwrap());
+    }
 }
 
 /// 单次同步汇总统计（legacy）。

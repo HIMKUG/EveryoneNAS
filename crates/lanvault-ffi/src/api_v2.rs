@@ -32,10 +32,10 @@ use lanvault_core::{
     SyncRuleMode, CHUNK_MAX_SIZE,
 };
 use lanvault_server::vault::VaultStore;
+use lanvault_server::web::validate_relative_snapshot_path;
 
 use crate::api::{
     client_data_dir, fetch_remote_default_vault_id, resolve_local_server_db_path, runtime_state,
-    sanitize_restore_rel_path,
 };
 
 fn default_true() -> bool {
@@ -1245,7 +1245,7 @@ pub async fn restore_catalog_version(
         if out_base.exists() && fs::symlink_metadata(&out_base)?.file_type().is_symlink() {
             bail!("restore target_dir `{target_trim}` must not be a symlink");
         }
-        let rel_path = sanitize_restore_rel_path(&version.display_path)?;
+        let rel_path = validate_relative_snapshot_path(&version.display_path)?;
         let restore_root = out_base.join(format!("restore_{}", version.version_id));
         let dest_path = restore_root.join(rel_path);
         if let Some(parent) = dest_path.parent() {

@@ -1159,6 +1159,20 @@ PRAGMA mmap_size = 268435456;";
         Ok(())
     }
 
+    pub fn renew_orphan_chunk(&self, vault_id: &str, hash_blake3: &[u8; 32]) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute(
+            "UPDATE chunks SET created_at = ?1
+             WHERE vault_id = ?2 AND hash_blake3 = ?3 AND ref_count <= 0",
+            params![
+                unix_timestamp_secs(),
+                vault_id,
+                hash_blake3.as_slice()
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn list_orphan_chunks(&self, vault_id: &str) -> Result<Vec<ChunkRecord>> {
         let conn = self.lock_conn();
         let mut stmt = conn.prepare(
@@ -1345,7 +1359,7 @@ PRAGMA mmap_size = 268435456;";
                            retention_tier, file_count, total_bytes, created_at
                     FROM snapshots
                     WHERE vault_id = ?1
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, rowid DESC
                     "#,
                 )?;
                 let rows = stmt
@@ -1359,7 +1373,7 @@ PRAGMA mmap_size = 268435456;";
                     SELECT snapshot_id, vault_id, rule_id, device_id, root_tree_hash,
                            retention_tier, file_count, total_bytes, created_at
                     FROM snapshots
-                    ORDER BY created_at DESC
+                    ORDER BY created_at DESC, rowid DESC
                     "#,
                 )?;
                 let rows = stmt
@@ -1711,15 +1725,22 @@ PRAGMA mmap_size = 268435456;";
         }
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
-        let mut total_deleted = 0usize;
-        {
-            let mut stmt =
-                tx.prepare("DELETE FROM local_file_state WHERE rule_id = ?1 AND rel_path = ?2")?;
-            for rel_path in rel_paths {
-                total_deleted += stmt.execute(params![rule_id, rel_path])?;
-            }
-        }
+        let total_deleted = Self::delete_file_states(&tx, rule_id, rel_paths)?;
         tx.commit()?;
+        Ok(total_deleted)
+    }
+
+    fn delete_file_states(
+        conn: &Connection,
+        rule_id: &str,
+        rel_paths: &[String],
+    ) -> Result<usize> {
+        let mut total_deleted = 0usize;
+        let mut stmt =
+            conn.prepare_cached("DELETE FROM local_file_state WHERE rule_id = ?1 AND rel_path = ?2")?;
+        for rel_path in rel_paths {
+            total_deleted += stmt.execute(params![rule_id, rel_path])?;
+        }
         Ok(total_deleted)
     }
 
@@ -1810,10 +1831,14 @@ PRAGMA mmap_size = 268435456;";
         Ok(total)
     }
 
-    /// Batch-deletes orphan chunks in a single transaction (eliminates N+1 commits in GC).
-    pub fn delete_chunks_batch(&self, vault_id: &str, hashes: &[[u8; 32]]) -> Result<usize> {
+    /// Batch-deletes orphan records and decrements quota usage in one transaction.
+    pub fn delete_chunks_batch(
+        &self,
+        vault_id: &str,
+        hashes: &[[u8; 32]],
+    ) -> Result<(usize, u64)> {
         if hashes.is_empty() {
-            return Ok(0);
+            return Ok((0, 0));
         }
         let _probe = crate::debug_telemetry::ProbeGuard::start(
             "core.db",
@@ -1823,6 +1848,7 @@ PRAGMA mmap_size = 268435456;";
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
         let mut total = 0usize;
+        let mut reclaimed_bytes = 0u64;
         {
             let mut stmt = tx.prepare_cached(
                 "DELETE FROM chunks
@@ -1834,14 +1860,28 @@ PRAGMA mmap_size = 268435456;";
                    AND NOT EXISTS (
                        SELECT 1 FROM catalog_chunk_refs cc
                        WHERE cc.vault_id = chunks.vault_id AND cc.chunk_hash = chunks.hash_blake3
-                   )",
+                   )
+                 RETURNING stored_size",
             )?;
             for h in hashes {
-                total += stmt.execute(params![vault_id, h.as_slice()])?;
+                if let Some(stored_size) = stmt
+                    .query_row(params![vault_id, h.as_slice()], |row| row.get::<_, i64>(0))
+                    .optional()?
+                {
+                    total += 1;
+                    reclaimed_bytes =
+                        reclaimed_bytes.saturating_add(stored_size.max(0) as u64);
+                }
             }
         }
+        if reclaimed_bytes > 0 {
+            tx.execute(
+                "UPDATE vaults SET used_bytes = MAX(0, used_bytes - ?1) WHERE vault_id = ?2",
+                params![reclaimed_bytes as i64, vault_id],
+            )?;
+        }
         tx.commit()?;
-        Ok(total)
+        Ok((total, reclaimed_bytes))
     }
 
     /// Batch-upserts local file states in a single transaction after sync_diff.
@@ -1856,34 +1896,57 @@ PRAGMA mmap_size = 268435456;";
         );
         let mut conn = self.lock_conn();
         let tx = conn.transaction()?;
-        let mut total = 0usize;
-        {
-            let mut stmt = tx.prepare_cached(
-                r#"
-                INSERT INTO local_file_state
-                    (rule_id, target_vault_id, rel_path, size, mtime_ns, file_id, chunk_hashes)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                ON CONFLICT(rule_id, rel_path) DO UPDATE SET
-                    target_vault_id = excluded.target_vault_id,
-                    size = excluded.size,
-                    mtime_ns = excluded.mtime_ns,
-                    file_id = excluded.file_id,
-                    chunk_hashes = excluded.chunk_hashes
-                "#,
-            )?;
-            for s in states {
-                total += stmt.execute(params![
-                    s.rule_id,
-                    s.target_vault_id,
-                    s.rel_path,
-                    s.size as i64,
-                    s.mtime_ns,
-                    s.file_id,
-                    s.chunk_hashes,
-                ])?;
-            }
-        }
+        let total = Self::write_file_states(&tx, states)?;
         tx.commit()?;
+        Ok(total)
+    }
+
+    pub fn commit_local_snapshot(
+        &self,
+        rule_id: &str,
+        states: &[LocalFileStateRecord],
+        deleted_paths: &[String],
+        checkpoint_key: &str,
+        snapshot_id: &str,
+    ) -> Result<()> {
+        let mut conn = self.lock_conn();
+        let tx = conn.transaction()?;
+        Self::write_file_states(&tx, states)?;
+        Self::delete_file_states(&tx, rule_id, deleted_paths)?;
+        Self::write_setting(&tx, checkpoint_key, snapshot_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn write_file_states(
+        conn: &Connection,
+        states: &[LocalFileStateRecord],
+    ) -> Result<usize> {
+        let mut total = 0usize;
+        let mut stmt = conn.prepare_cached(
+            r#"
+            INSERT INTO local_file_state
+                (rule_id, target_vault_id, rel_path, size, mtime_ns, file_id, chunk_hashes)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(rule_id, rel_path) DO UPDATE SET
+                target_vault_id = excluded.target_vault_id,
+                size = excluded.size,
+                mtime_ns = excluded.mtime_ns,
+                file_id = excluded.file_id,
+                chunk_hashes = excluded.chunk_hashes
+            "#,
+        )?;
+        for s in states {
+            total += stmt.execute(params![
+                s.rule_id,
+                s.target_vault_id,
+                s.rel_path,
+                s.size as i64,
+                s.mtime_ns,
+                s.file_id,
+                s.chunk_hashes,
+            ])?;
+        }
         Ok(total)
     }
 
@@ -1901,6 +1964,10 @@ PRAGMA mmap_size = 268435456;";
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<()> {
         let conn = self.lock_conn();
+        Self::write_setting(&conn, key, value)
+    }
+
+    fn write_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
         conn.execute(
             r#"
             INSERT INTO app_settings (key, value)
@@ -2620,6 +2687,89 @@ mod tests {
     }
 
     #[test]
+    fn local_snapshot_commit_updates_states_deletions_and_checkpoint_atomically() {
+        let db = Database::open_in_memory().unwrap();
+        db.upsert_sync_rule(&SyncRuleRecord {
+            rule_id: "rule-1".to_string(),
+            local_dir: "/tmp/docs".to_string(),
+            target_vault_id: "vault-1".to_string(),
+            wifi_only: true,
+            allowed_ssids: None,
+            require_charging: false,
+            max_kbps: 0,
+            enabled: true,
+        })
+        .unwrap();
+        for name in ["a.txt", "b.txt"] {
+            db.upsert_local_file_state(&LocalFileStateRecord {
+                rule_id: "rule-1".to_string(),
+                target_vault_id: "vault-1".to_string(),
+                rel_path: name.to_string(),
+                size: 1,
+                mtime_ns: 1,
+                file_id: None,
+                chunk_hashes: vec![1; 32],
+            })
+            .unwrap();
+        }
+
+        let good = LocalFileStateRecord {
+            rule_id: "rule-1".to_string(),
+            target_vault_id: "vault-1".to_string(),
+            rel_path: "c.txt".to_string(),
+            size: 2,
+            mtime_ns: 2,
+            file_id: None,
+            chunk_hashes: vec![2; 32],
+        };
+        let forced_failure = LocalFileStateRecord {
+            rel_path: "abort.txt".to_string(),
+            ..good.clone()
+        };
+        db.lock_conn()
+            .execute_batch(
+                "CREATE TRIGGER abort_local_state_insert
+                 BEFORE INSERT ON local_file_state
+                 WHEN NEW.rel_path = 'abort.txt'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced local state failure');
+                 END;",
+            )
+            .unwrap();
+        let failed = db.commit_local_snapshot(
+            "rule-1",
+            &[good.clone(), forced_failure],
+            &["b.txt".to_string()],
+            "checkpoint",
+            "snapshot-failed",
+        );
+        assert!(failed.is_err());
+        assert_eq!(db.list_local_file_states("rule-1").unwrap().len(), 2);
+        assert_eq!(db.get_setting("checkpoint").unwrap(), None);
+
+        db.commit_local_snapshot(
+            "rule-1",
+            &[good],
+            &["b.txt".to_string()],
+            "checkpoint",
+            "snapshot-ok",
+        )
+        .unwrap();
+        let states = db.list_local_file_states("rule-1").unwrap();
+        assert_eq!(
+            states
+                .into_iter()
+                .map(|state| state.rel_path)
+                .collect::<Vec<_>>(),
+            vec!["a.txt".to_string(), "c.txt".to_string()]
+        );
+        assert_eq!(
+            db.get_setting("checkpoint").unwrap().as_deref(),
+            Some("snapshot-ok")
+        );
+    }
+
+    #[test]
     fn snapshot_references_are_counted_once_and_released_transactionally() {
         let db = Database::open_in_memory().unwrap();
         db.insert_vault(
@@ -2671,6 +2821,37 @@ mod tests {
             db.get_chunk("vault-1", &hash).unwrap().unwrap().ref_count,
             0
         );
+    }
+
+    #[test]
+    fn orphan_chunk_deletion_reclaims_quota_in_the_same_transaction() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_vault(
+            &VaultRecord {
+                vault_id: "vault-1".to_string(),
+                name: "Vault".to_string(),
+                pool_mode: PoolMode::Single,
+                quota_bytes: 1024,
+                used_bytes: 0,
+                e2ee_enabled: true,
+                created_at: 1,
+            },
+            &[],
+        )
+        .unwrap();
+        let hash = [7u8; 32];
+        assert!(db
+            .upsert_chunk_with_quota("vault-1", &hash, 100, 64)
+            .unwrap());
+        assert_eq!(
+            db.get_vault("vault-1").unwrap().unwrap().used_bytes,
+            64
+        );
+
+        let (deleted, reclaimed) = db.delete_chunks_batch("vault-1", &[hash]).unwrap();
+        assert_eq!((deleted, reclaimed), (1, 64));
+        assert!(db.get_chunk("vault-1", &hash).unwrap().is_none());
+        assert_eq!(db.get_vault("vault-1").unwrap().unwrap().used_bytes, 0);
     }
 
     #[test]

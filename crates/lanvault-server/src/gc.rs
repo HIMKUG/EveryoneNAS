@@ -162,29 +162,25 @@ impl GarbageCollector {
             const ORPHAN_GRACE_SECS: i64 = 300;
             let cutoff = now_unix_secs.saturating_sub(ORPHAN_GRACE_SECS);
             let orphans = self.db.list_orphan_chunks_before(vault_id, cutoff)?;
-            let orphan_hashes: Vec<[u8; 32]> = orphans.iter().map(|o| o.hash_blake3).collect();
-            let batch_deleted = self.db.delete_chunks_batch(vault_id, &orphan_hashes)? as u64;
-
-            let mut reclaimed = 0u64;
-            let mut deleted = 0u64;
-            if batch_deleted > 0 {
-                let all_deleted = batch_deleted == orphans.len() as u64;
-                for orphan in &orphans {
-                    if all_deleted || self.db.get_chunk(vault_id, &orphan.hash_blake3)?.is_none() {
-                        self.vault_store
-                            .delete_chunk_files(vault_id, &orphan.hash_blake3)?;
-                        deleted += 1;
-                        reclaimed = reclaimed.saturating_add(orphan.stored_size);
+            let mut removed = Vec::with_capacity(orphans.len());
+            for orphan in orphans {
+                match self
+                    .vault_store
+                    .delete_chunk_files(vault_id, &orphan.hash_blake3)
+                {
+                    Ok(()) => removed.push(orphan.hash_blake3),
+                    Err(err) => {
+                        tracing::warn!(
+                            vault_id = %vault_id,
+                            hash = %hex::encode(orphan.hash_blake3),
+                            %err,
+                            "orphan chunk file deletion failed; index retained for retry"
+                        );
                     }
                 }
             }
-
-            if reclaimed > 0 {
-                self.db
-                    .update_vault_used_bytes(vault_id, -(reclaimed as i64))?;
-            }
-
-            Ok((deleted, reclaimed))
+            let (deleted, reclaimed) = self.db.delete_chunks_batch(vault_id, &removed)?;
+            Ok((deleted as u64, reclaimed))
         })?;
 
         self.db.prune_revoked_sessions(now_unix_secs)?;

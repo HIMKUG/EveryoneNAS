@@ -455,52 +455,17 @@ pub fn reconcile_directory(
         })
         .collect();
 
+    let rebuild = db
+        .get_setting(&checkpoint_key(target_vault_id, rule_id))?
+        .is_some_and(|checkpoint| checkpoint.starts_with("rebuild:"));
     let mut diff = DiffResult::default();
     let mut stack = vec![root_dir.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(err)
-                if dir != root_dir
-                    && matches!(
-                        err.kind(),
-                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-                    ) =>
-            {
-                warn!(path = %dir.display(), "skipping unreadable subdirectory: {err}");
-                continue;
-            }
-            Err(err) => return Err(ClientError::Io(err)),
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-                    ) =>
-                {
-                    warn!(dir = %dir.display(), "skipping unreadable directory entry: {err}");
-                    continue;
-                }
-                Err(err) => return Err(ClientError::Io(err)),
-            };
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
             let path = entry.path();
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-                    ) =>
-                {
-                    warn!(path = %path.display(), "skipping entry with unreadable file type: {err}");
-                    continue;
-                }
-                Err(err) => return Err(ClientError::Io(err)),
-            };
+            let file_type = entry.file_type()?;
 
             // 跳过符号链接，防止目录环路。
             if file_type.is_symlink() {
@@ -514,19 +479,7 @@ pub fn reconcile_directory(
                 continue;
             }
 
-            let meta = match entry.metadata() {
-                Ok(meta) => meta,
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
-                    ) =>
-                {
-                    warn!(path = %path.display(), "skipping entry with unreadable metadata: {err}");
-                    continue;
-                }
-                Err(err) => return Err(ClientError::Io(err)),
-            };
+            let meta = entry.metadata()?;
             let snapshot = match build_snapshot(root_dir, &path, &meta) {
                 Ok(snapshot) => snapshot,
                 Err(ClientError::InvalidPath { path, reason }) => {
@@ -546,7 +499,8 @@ pub fn reconcile_directory(
             match stored_map.remove(&snapshot.rel_path) {
                 None => diff.added.push(snapshot),
                 Some(prev) => {
-                    if prev.target_vault_id != target_vault_id
+                    if rebuild
+                        || prev.target_vault_id != target_vault_id
                         || prev.size != snapshot.size
                         || prev.mtime_ns != snapshot.mtime_ns
                         || prev.file_id != snapshot.file_id
@@ -588,6 +542,10 @@ pub fn reconcile_directory(
         None,
     );
     Ok(diff)
+}
+
+pub(crate) fn checkpoint_key(vault_id: &str, rule_id: &str) -> String {
+    format!("sync_checkpoint:{}:{vault_id}:{rule_id}", vault_id.len())
 }
 
 /// 针对实时监听上报的局部路径构建元数据快照。

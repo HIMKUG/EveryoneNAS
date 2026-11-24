@@ -38,7 +38,10 @@ use lanvault_core::{
 };
 use lanvault_server::scrub::{BitRotAlertEvent, BitRotScrubber};
 use lanvault_server::vault::{ExtraVolumeSpec, VaultStore};
-use lanvault_server::web::PendingPairRequestDto;
+use lanvault_server::web::{
+    load_snapshot_manifest, validate_relative_snapshot_path, PendingPairRequestDto,
+    SnapshotManifest,
+};
 use lanvault_server::{ServerConfig, ServerExitReason};
 
 use crate::frb_generated::StreamSink;
@@ -2502,6 +2505,12 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
     })
     .await
     .context("reconcile_directory worker panicked")??;
+    let up_to_date = diff.is_empty()
+        && !SyncEngine::has_pending_checkpoint(
+            &state.client_db,
+            &rule_id,
+            &resolved_vault_id,
+        )?;
     let total_bytes: u64 = diff.changed_files().map(|f| f.size).sum();
 
     emit_progress(
@@ -2514,7 +2523,7 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
             chunks_uploaded: 0,
             chunks_deduplicated: 0,
             throughput_bps: 0,
-            status: if diff.is_empty() {
+            status: if up_to_date {
                 "up_to_date".to_string()
             } else {
                 "scanning".to_string()
@@ -2523,7 +2532,7 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
         },
     );
 
-    if diff.is_empty() {
+    if up_to_date {
         return Ok(());
     }
 
@@ -4746,37 +4755,6 @@ pub struct RestoreSnapshotResultDto {
     pub output_path: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct RestoreManifestFile {
-    rel_path: String,
-    chunk_hashes_hex: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RestoreSnapshotManifest {
-    files: Vec<RestoreManifestFile>,
-}
-
-pub(crate) fn sanitize_restore_rel_path(raw: &str) -> Result<PathBuf> {
-    use std::path::Component;
-    let p = Path::new(raw);
-    if raw.trim().is_empty() || raw.contains('\0') || p.is_absolute() {
-        bail!("invalid snapshot manifest path `{raw}`");
-    }
-    let mut clean = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::Normal(seg) => clean.push(seg),
-            Component::CurDir => {}
-            _ => bail!("unsafe snapshot manifest path `{raw}`"),
-        }
-    }
-    if clean.as_os_str().is_empty() {
-        bail!("empty snapshot manifest path");
-    }
-    Ok(clean)
-}
-
 /// 37. 从本地存储池解密、校验并还原指定快照数据块至目标目录（优先按 manifest 重建原始目录树）。
 pub async fn restore_snapshot(
     snapshot_id: String,
@@ -4828,39 +4806,45 @@ pub async fn restore_snapshot(
                 format!("failed to create restore directory {}", out_dir.display())
             })?;
 
-            let mut loaded_manifest: Option<RestoreSnapshotManifest> = None;
-            if let Ok(roots) = vault_store.manifest_backup_roots(&snap.vault_id) {
-                for root in roots {
-                    let candidate = root
-                        .join("manifests")
-                        .join(format!("{}.json", snap.snapshot_id));
-                    if candidate.is_file() {
-                        let bytes = std::fs::read(&candidate)?;
-                        loaded_manifest =
-                            Some(serde_json::from_slice::<RestoreSnapshotManifest>(&bytes)?);
-                        break;
-                    }
-                }
+            let loaded_manifest = load_snapshot_manifest(&vault_store, &snap)?;
+            if loaded_manifest.is_none() && !snap.rule_id.is_empty() {
+                bail!("snapshot manifest is missing or failed verification");
             }
 
             let mut restored_chunks = 0u64;
             let mut restored_bytes = 0u64;
-            let output_path_str: String;
+            let restore_name = format!(
+                "restore_{}_{:016x}",
+                snap.snapshot_id,
+                rand::random::<u64>()
+            );
+            let restore_root = out_dir.join(&restore_name);
+            let staging_root = out_dir.join(format!(".{restore_name}.partial"));
+            std::fs::create_dir(&staging_root)?;
 
-            if let Some(manifest) = loaded_manifest {
-                let restore_root = out_dir.join(format!("restore_{}", snap.snapshot_id));
-                std::fs::create_dir_all(&restore_root)?;
-                for file in &manifest.files {
-                    let rel = sanitize_restore_rel_path(&file.rel_path)?;
-                    let dest_path = restore_root.join(rel);
-                    if let Some(parent) = dest_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let part_path = PathBuf::from(format!("{}.lanvault.part", dest_path.display()));
-                    {
-                        let mut dest_file = std::fs::File::create(&part_path)?;
+            let staged = (|| -> Result<PathBuf> {
+                let output_path = if let Some(manifest) = loaded_manifest {
+                    for file in &manifest.files {
+                        let rel = validate_relative_snapshot_path(&file.rel_path)?;
+                        #[cfg(windows)]
+                        if file.rel_path.contains(':') {
+                            bail!("snapshot file path contains a Windows stream separator");
+                        }
+                        let dest_path = staging_root.join(rel);
+                        if let Some(parent) = dest_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        let mut dest_file =
+                            std::fs::File::create_new(&dest_path).with_context(|| {
+                                format!(
+                                    "failed to create restored file {}",
+                                    dest_path.display()
+                                )
+                            })?;
+                        let file_start = restored_bytes;
                         for hash_hex in &file.chunk_hashes_hex {
-                            let hash_bytes = hex::decode(hash_hex)?;
+                            let hash_bytes = hex::decode(hash_hex)
+                                .with_context(|| format!("invalid chunk hash hex `{hash_hex}`"))?;
                             let hash: [u8; 32] = hash_bytes
                                 .try_into()
                                 .map_err(|_| anyhow!("invalid chunk hash length"))?;
@@ -4880,17 +4864,23 @@ pub async fn restore_snapshot(
                             restored_chunks += 1;
                             restored_bytes += plain.len() as u64;
                         }
+                        if restored_bytes - file_start != file.size {
+                            bail!("restored file size does not match the snapshot manifest");
+                        }
                         dest_file.sync_all()?;
                     }
-                    std::fs::rename(&part_path, &dest_path)?;
-                }
-                output_path_str = restore_root.to_string_lossy().into_owned();
-            } else {
-                let hashes = db.list_snapshot_chunks(&snap.snapshot_id)?;
-                let out_file_path = out_dir.join(format!("restore_{}.bin", snap.snapshot_id));
-                let part_path = PathBuf::from(format!("{}.lanvault.part", out_file_path.display()));
-                {
-                    let mut out_file = std::fs::File::create(&part_path)?;
+                    staging_root.clone()
+                } else {
+                    let hashes = db.list_snapshot_chunks(&snap.snapshot_id)?;
+                    let filename = format!("restore_{}.bin", snap.snapshot_id);
+                    let out_file_path = staging_root.join(&filename);
+                    let mut out_file = std::fs::File::create_new(&out_file_path)
+                        .with_context(|| {
+                            format!(
+                                "failed to create restore output {}",
+                                out_file_path.display()
+                            )
+                        })?;
                     for hash in &hashes {
                         let stored_bytes = vault_store.get_chunk(&snap.vault_id, hash)?;
                         let comp = lanvault_core::ChunkCompression::from_db_tag(
@@ -4909,16 +4899,33 @@ pub async fn restore_snapshot(
                         restored_bytes += plain.len() as u64;
                     }
                     out_file.sync_all()?;
+                    out_file_path
+                };
+                std::fs::rename(&staging_root, &restore_root)?;
+                if output_path == staging_root {
+                    Ok(restore_root)
+                } else {
+                    Ok(restore_root.join(
+                        output_path
+                            .file_name()
+                            .ok_or_else(|| anyhow!("restore output has no filename"))?,
+                    ))
                 }
-                std::fs::rename(&part_path, &out_file_path)?;
-                output_path_str = out_file_path.to_string_lossy().into_owned();
+            })();
+            if staged.is_err() {
+                if let Err(err) = std::fs::remove_dir_all(&staging_root) {
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        warn!(%err, "failed to clean up interrupted restore");
+                    }
+                }
             }
+            let output_path = staged?;
 
             Ok(RestoreSnapshotResultDto {
                 snapshot_id: snap.snapshot_id,
                 restored_chunks,
                 restored_bytes,
-                output_path: output_path_str,
+                output_path: output_path.to_string_lossy().into_owned(),
             })
         })
         .await
@@ -4950,7 +4957,7 @@ pub async fn restore_snapshot(
         struct RemoteManifestResp {
             vault_id: String,
             snapshot_id: String,
-            manifest: RestoreSnapshotManifest,
+            manifest: SnapshotManifest,
         }
         let remote: RemoteManifestResp = resp.json().await?;
         let chunk_key = vault_key.derive_vault_chunk_key(&remote.vault_id);
@@ -4963,93 +4970,122 @@ pub async fn restore_snapshot(
         {
             bail!("invalid remote snapshot_id");
         }
-        let restore_root =
-            PathBuf::from(&target_trim).join(format!("restore_{}", remote.snapshot_id));
-        tokio::fs::create_dir_all(&restore_root).await?;
-
-        let mut restored_chunks = 0u64;
-        let mut restored_bytes = 0u64;
-        for file in &remote.manifest.files {
-            let rel = sanitize_restore_rel_path(&file.rel_path)?;
-            let dest_path = restore_root.join(rel);
-            if let Some(parent) = dest_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let part_path = PathBuf::from(format!("{}.lanvault.part", dest_path.display()));
-            let mut out_file = std::fs::File::create(&part_path)?;
-            for hash_hex in &file.chunk_hashes_hex {
-                let hash_bytes = hex::decode(hash_hex)?;
-                let hash: [u8; 32] = hash_bytes
-                    .try_into()
-                    .map_err(|_| anyhow!("invalid chunk hash length"))?;
-                let chunk_url = format!(
-                    "{}/api/vaults/{}/chunks/{}",
-                    peer.endpoint_base_url, remote.vault_id, hash_hex
-                );
-                let mut cresp_opt = None;
-                for attempt in 1..=4u32 {
-                    let mut creq = http.get(&chunk_url);
-                    if let Some(ref c) = peer.session_cookie {
-                        creq = creq.header("Cookie", format!("lv_session={c}"));
-                    }
-                    match creq.send().await {
-                        Ok(r) if r.status().is_success() => {
-                            cresp_opt = Some(r);
-                            break;
-                        }
-                        Ok(r)
-                            if matches!(r.status().as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
-                                && attempt < 4 =>
-                        {
-                            tokio::time::sleep(Duration::from_millis(400u64 << (attempt - 1)))
-                                .await;
-                        }
-                        Ok(r) => {
-                            bail!("failed to download chunk {}: HTTP {}", hash_hex, r.status())
-                        }
-                        Err(_) if attempt < 4 => {
-                            tokio::time::sleep(Duration::from_millis(400u64 << (attempt - 1)))
-                                .await;
-                        }
-                        Err(err) => return Err(err.into()),
-                    }
+        let restore_name = format!(
+            "restore_{}_{:016x}",
+            remote.snapshot_id,
+            rand::random::<u64>()
+        );
+        let restore_root = PathBuf::from(&target_trim).join(&restore_name);
+        let staging_root = PathBuf::from(&target_trim).join(format!(".{restore_name}.partial"));
+        let staged = async {
+            tokio::fs::create_dir(&staging_root).await?;
+            let mut restored_chunks = 0u64;
+            let mut restored_bytes = 0u64;
+            for file in &remote.manifest.files {
+                let rel = validate_relative_snapshot_path(&file.rel_path)?;
+                #[cfg(windows)]
+                if file.rel_path.contains(':') {
+                    bail!("snapshot file path contains a Windows stream separator");
                 }
-                let cresp = cresp_opt
-                    .ok_or_else(|| anyhow!("failed to download chunk {hash_hex} after retries"))?;
-                let enc_hdr = cresp
-                    .headers()
-                    .get("x-lanvault-encoding")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("xchacha20poly1305+zstd")
-                    .to_string();
-                let comp = if enc_hdr.ends_with("+raw") {
-                    lanvault_core::ChunkCompression::Raw
-                } else {
-                    lanvault_core::ChunkCompression::Zstd
-                };
-                let stored = cresp.bytes().await?;
-                let plain = lanvault_core::unpack_chunk_with_compression(
-                    &stored,
-                    &hash,
-                    Some(&chunk_key),
-                    remote.vault_id.as_bytes(),
-                    CHUNK_MAX_SIZE as usize,
-                    comp,
-                )?;
-                std::io::Write::write_all(&mut out_file, &plain)?;
-                restored_chunks += 1;
-                restored_bytes += plain.len() as u64;
+                let dest_path = staging_root.join(rel);
+                if let Some(parent) = dest_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let mut out_file = std::fs::File::create_new(&dest_path)?;
+                let file_start = restored_bytes;
+                for hash_hex in &file.chunk_hashes_hex {
+                    let hash_bytes = hex::decode(hash_hex)?;
+                    let hash: [u8; 32] = hash_bytes
+                        .try_into()
+                        .map_err(|_| anyhow!("invalid chunk hash length"))?;
+                    let chunk_url = format!(
+                        "{}/api/vaults/{}/chunks/{}",
+                        peer.endpoint_base_url, remote.vault_id, hash_hex
+                    );
+                    let mut cresp_opt = None;
+                    for attempt in 1..=4u32 {
+                        let mut creq = http.get(&chunk_url);
+                        if let Some(ref cookie) = peer.session_cookie {
+                            creq = creq.header("Cookie", format!("lv_session={cookie}"));
+                        }
+                        match creq.send().await {
+                            Ok(response) if response.status().is_success() => {
+                                cresp_opt = Some(response);
+                                break;
+                            }
+                            Ok(response)
+                                if matches!(
+                                    response.status().as_u16(),
+                                    408 | 429 | 500 | 502 | 503 | 504
+                                ) && attempt < 4 =>
+                            {
+                                tokio::time::sleep(Duration::from_millis(
+                                    400u64 << (attempt - 1),
+                                ))
+                                .await;
+                            }
+                            Ok(response) => bail!(
+                                "failed to download chunk {}: HTTP {}",
+                                hash_hex,
+                                response.status()
+                            ),
+                            Err(_) if attempt < 4 => {
+                                tokio::time::sleep(Duration::from_millis(
+                                    400u64 << (attempt - 1),
+                                ))
+                                .await;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+                    let response = cresp_opt.ok_or_else(|| {
+                        anyhow!("failed to download chunk {hash_hex} after retries")
+                    })?;
+                    let enc_hdr = response
+                        .headers()
+                        .get("x-lanvault-encoding")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("xchacha20poly1305+zstd");
+                    let comp = if enc_hdr.ends_with("+raw") {
+                        lanvault_core::ChunkCompression::Raw
+                    } else {
+                        lanvault_core::ChunkCompression::Zstd
+                    };
+                    let stored = response.bytes().await?;
+                    let plain = lanvault_core::unpack_chunk_with_compression(
+                        &stored,
+                        &hash,
+                        Some(&chunk_key),
+                        remote.vault_id.as_bytes(),
+                        CHUNK_MAX_SIZE as usize,
+                        comp,
+                    )?;
+                    std::io::Write::write_all(&mut out_file, &plain)?;
+                    restored_chunks += 1;
+                    restored_bytes += plain.len() as u64;
+                }
+                if restored_bytes - file_start != file.size {
+                    bail!("restored file size does not match the snapshot manifest");
+                }
+                out_file.sync_all()?;
             }
-            out_file.sync_all()?;
-            drop(out_file);
-            std::fs::rename(&part_path, &dest_path)?;
+            tokio::fs::rename(&staging_root, &restore_root).await?;
+            Ok::<_, anyhow::Error>(RestoreSnapshotResultDto {
+                snapshot_id: remote.snapshot_id,
+                restored_chunks,
+                restored_bytes,
+                output_path: restore_root.to_string_lossy().into_owned(),
+            })
         }
-        RestoreSnapshotResultDto {
-            snapshot_id: remote.snapshot_id,
-            restored_chunks,
-            restored_bytes,
-            output_path: restore_root.to_string_lossy().into_owned(),
+        .await;
+        if staged.is_err() {
+            if let Err(err) = tokio::fs::remove_dir_all(&staging_root).await {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    warn!(%err, "failed to clean up interrupted remote restore");
+                }
+            }
         }
+        staged?
     };
 
     lanvault_core::record_event_always(
