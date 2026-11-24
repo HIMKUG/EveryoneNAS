@@ -56,10 +56,12 @@ impl SymmetricKey {
     /// Parses a key from an untrusted byte slice at a system boundary.
     pub fn from_slice(slice: &[u8]) -> Result<Self> {
         let arr: [u8; SYMMETRIC_KEY_LEN] =
-            slice.try_into().map_err(|_| LanVaultError::InvalidKeyLength {
-                expected: SYMMETRIC_KEY_LEN,
-                actual: slice.len(),
-            })?;
+            slice
+                .try_into()
+                .map_err(|_| LanVaultError::InvalidKeyLength {
+                    expected: SYMMETRIC_KEY_LEN,
+                    actual: slice.len(),
+                })?;
         Ok(Self(arr))
     }
 
@@ -124,10 +126,11 @@ impl DeviceIdentity {
     /// Restores a device identity from a 32-byte secret seed.
     pub fn from_seed(seed: &[u8]) -> Result<Self> {
         let arr: [u8; ED25519_KEY_LEN] =
-            seed.try_into().map_err(|_| LanVaultError::InvalidKeyLength {
-                expected: ED25519_KEY_LEN,
-                actual: seed.len(),
-            })?;
+            seed.try_into()
+                .map_err(|_| LanVaultError::InvalidKeyLength {
+                    expected: ED25519_KEY_LEN,
+                    actual: seed.len(),
+                })?;
         Ok(Self {
             signing_key: SigningKey::from_bytes(&arr),
         })
@@ -141,6 +144,17 @@ impl DeviceIdentity {
     /// Returns the 32-byte Ed25519 public key.
     pub fn public_key_bytes(&self) -> [u8; ED25519_KEY_LEN] {
         self.signing_key.verifying_key().to_bytes()
+    }
+
+    /// Encodes this device's signing key for the local TLS listener.
+    pub fn tls_key_pkcs8(&self) -> Result<Zeroizing<Vec<u8>>> {
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+
+        let encoded = self
+            .signing_key
+            .to_pkcs8_der()
+            .map_err(|e| LanVaultError::Crypto(format!("cannot encode device TLS key: {e}")))?;
+        Ok(Zeroizing::new(encoded.as_bytes().to_vec()))
     }
 
     /// Computes a short deterministic hex fingerprint of the public key (first 16 bytes of BLAKE3).
@@ -191,8 +205,13 @@ fn write_secret_file(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Computes the 32-char hex fingerprint (16 bytes of BLAKE3) for an Ed25519 public key.
 pub fn public_key_fingerprint(pubkey: &[u8; ED25519_KEY_LEN]) -> String {
-    let hash = blake3::hash(pubkey);
-    hex::encode(&hash.as_bytes()[..16])
+    hex::encode(public_key_fingerprint_bytes(pubkey))
+}
+
+pub fn public_key_fingerprint_bytes(pubkey: &[u8; ED25519_KEY_LEN]) -> [u8; 16] {
+    let mut fingerprint = [0; 16];
+    fingerprint.copy_from_slice(&blake3::hash(pubkey).as_bytes()[..16]);
+    fingerprint
 }
 
 /// Constant-time byte slice equality comparison.
@@ -271,8 +290,9 @@ impl SessionKeyExchange {
             ));
         }
 
-        let mut ikm =
-            Zeroizing::new(Vec::with_capacity(SYMMETRIC_KEY_LEN + transcript_context.len()));
+        let mut ikm = Zeroizing::new(Vec::with_capacity(
+            SYMMETRIC_KEY_LEN + transcript_context.len(),
+        ));
         ikm.extend_from_slice(shared.as_bytes());
         ikm.extend_from_slice(transcript_context);
         let derived = blake3::derive_key(SESSION_KDF_CONTEXT, &ikm);
@@ -329,7 +349,13 @@ fn encrypt_aead_with_nonce(
     let nonce = XNonce::from_slice(nonce_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad })
+        .encrypt(
+            nonce,
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
         .map_err(|e| LanVaultError::Crypto(format!("AEAD encryption failed: {e}")))?;
 
     let mut out = Vec::with_capacity(XCHACHA_NONCE_LEN + ciphertext.len());
@@ -381,8 +407,6 @@ pub fn verify_pin_mac(pin: &str, nonce: &[u8], device_id: &str, expected_mac: &[
     constant_time_eq(&actual, expected_mac)
 }
 
-
-
 /// Reusable per-vault deterministic AEAD cipher context.
 /// Hoists BLAKE3 nonce subkey derivation, XChaCha20-Poly1305 key schedule expansion,
 /// and AAD prefix hashing once per vault instead of repeating per chunk.
@@ -399,7 +423,8 @@ impl ChunkSealContext {
             "crypto.seal_context_init",
             None,
         );
-        let nonce_subkey = blake3::derive_key("lanvault.chunk.nonce.v1", vault_chunk_key.as_bytes());
+        let nonce_subkey =
+            blake3::derive_key("lanvault.chunk.nonce.v1", vault_chunk_key.as_bytes());
         let mut aad_hasher_prefix = blake3::Hasher::new_keyed(&nonce_subkey);
         aad_hasher_prefix.update(&(aad.len() as u64).to_le_bytes());
         aad_hasher_prefix.update(aad);
@@ -432,7 +457,9 @@ impl ChunkSealContext {
                     aad: &self.aad,
                 },
             )
-            .map_err(|_| LanVaultError::Crypto("XChaCha20-Poly1305 deterministic encrypt failed".to_string()))?;
+            .map_err(|_| {
+                LanVaultError::Crypto("XChaCha20-Poly1305 deterministic encrypt failed".to_string())
+            })?;
         let mut out = Vec::with_capacity(24 + ciphertext.len());
         out.extend_from_slice(&nonce_bytes);
         out.extend_from_slice(&ciphertext);

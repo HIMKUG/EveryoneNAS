@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 pub mod chunker;
 pub mod crypto;
 pub mod db;
+pub mod db_v2;
 pub mod debug_telemetry;
 pub mod discovery;
 pub mod error;
+pub mod path_norm;
 pub mod protocol;
 pub mod woff2;
 
@@ -20,29 +22,40 @@ pub use chunker::{
     DEFAULT_ZSTD_LEVEL,
 };
 pub use crypto::{
-    compute_pin_mac, constant_time_eq, decrypt_aead, encrypt_aead, encrypt_aead_deterministic, ChunkSealContext,
-    public_key_fingerprint, verify_ed25519, verify_pin_mac, DeviceIdentity, SessionKeyExchange,
-    SymmetricKey,
+    compute_pin_mac, constant_time_eq, decrypt_aead, encrypt_aead, encrypt_aead_deterministic,
+    public_key_fingerprint, verify_ed25519, verify_pin_mac, ChunkSealContext, DeviceIdentity,
+    SessionKeyExchange, SymmetricKey,
 };
 pub use db::{
     ChunkRecord, Database, LocalFileStateRecord, PoolMode, RetentionTier, ScrubStatus,
     SnapshotRecord, SyncRuleRecord, TransferHistoryRecord, TransferSessionRecord, TrustedPeer,
     VaultRecord, VaultVolumeRecord, VolumeRole, WalCheckpointReport,
 };
+pub use db_v2::{
+    CatalogEntryRecord, CatalogVersionRecord, DeviceGroupMemberRecord, DeviceGroupRecord,
+    GroupSyncRuleRecord, MessageOutboxRecord, MessageOutboxTargetRecord, MirrorJournalRecord,
+    MirrorRootRegistration, RuleTargetBindingRecord, SyncLeaseRecord, SyncOperationRecord,
+};
+pub use debug_telemetry::{
+    clear_debug_logs, configure_debug_log_file, get_debug_log_path, get_debug_logs,
+    install_rust_panic_hook, is_debug_enabled, record_debug, record_event_always,
+    record_frontend_log, set_debug_mode, DebugLogEntry, ProbeGuard,
+};
 pub use discovery::{
     DiscoveredPeerInfo, DiscoveryAnnouncement, DiscoveryBrowser, MdnsRegistrar, MDNS_SERVICE_TYPE,
     UDP_FALLBACK_PORT,
 };
-pub use protocol::{
-    pairing_identity_message, pairing_response_message, session_renew_message, CLIPBOARD_AAD,
-};
-pub use debug_telemetry::{
-    clear_debug_logs, configure_debug_log_file, get_debug_log_path, get_debug_logs, install_rust_panic_hook,
-    is_debug_enabled, record_debug, record_event_always, record_frontend_log, set_debug_mode,
-    DebugLogEntry, ProbeGuard,
-};
 pub use error::{LanVaultError, Result};
-pub use protocol::ClipboardKind;
+pub use path_norm::{
+    case_fold_key, detect_path_collisions, detect_rule_topology_conflicts,
+    normalize_canonical_path, PathCollision, PathCollisionKind, RuleTopologySpec,
+};
+pub use protocol::{
+    pairing_identity_message, pairing_response_message, session_renew_message,
+    CatalogCommitRequest, CatalogCommitResponse, CatalogDeltaKind, CatalogDeltaOp,
+    ChunkBatchCheckRequest, ChunkBatchCheckResponse, ClipboardKind, MessageSendResponseV2,
+    MessageTargetAck, MirrorPreviewReport, ProtocolCapabilities, SyncRuleMode, CLIPBOARD_AAD,
+};
 pub use woff2::decode_woff2_to_sfnt;
 
 /// Strips Windows `\\?\` or `\\?\UNC\` extended-length path prefixes consistently across crates.
@@ -118,8 +131,14 @@ mod tests {
 
     #[test]
     fn parse_role_mode_accepts_valid_snake_case_values() {
-        assert_eq!(parse_role_mode("client_only").unwrap(), RoleMode::ClientOnly);
-        assert_eq!(parse_role_mode("server_only").unwrap(), RoleMode::ServerOnly);
+        assert_eq!(
+            parse_role_mode("client_only").unwrap(),
+            RoleMode::ClientOnly
+        );
+        assert_eq!(
+            parse_role_mode("server_only").unwrap(),
+            RoleMode::ServerOnly
+        );
         assert_eq!(parse_role_mode("dual").unwrap(), RoleMode::Dual);
         assert_eq!(parse_role_mode("  dual  ").unwrap(), RoleMode::Dual);
     }

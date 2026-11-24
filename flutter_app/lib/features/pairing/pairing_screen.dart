@@ -13,6 +13,7 @@ enum _DeviceTab { paired, discovered }
 /// - 右上角蓝色 `+ 配对新设备` 按钮，弹窗整合本机 6 位配对 PIN 信息（get_pairing_info）与输入配对表单
 /// - Segmented 标签切换“我的设备 (N)”与“局域网发现 (N)”
 /// - 完整支持已配对设备解绑（revoke_paired_peer）与局域网 mDNS 设备发现一键配对
+/// - 设备组管理（创建/重命名/删除设备组、查看与增删成员）
 class PairingScreen extends StatefulWidget {
   const PairingScreen({super.key, required this.bridge});
 
@@ -24,6 +25,7 @@ class PairingScreen extends StatefulWidget {
 
 class _PairingScreenState extends State<PairingScreen> {
   final Map<String, DiscoveredPeer> _discovered = <String, DiscoveredPeer>{};
+  List<DeviceGroupViewModel> _deviceGroups = const <DeviceGroupViewModel>[];
   StreamSubscription<DiscoveredPeer>? _scanSub;
   Timer? _refreshTimer;
   Timer? _scanTimeoutTimer;
@@ -31,21 +33,26 @@ class _PairingScreenState extends State<PairingScreen> {
   _DeviceTab _activeTab = _DeviceTab.paired;
   bool _scanning = false;
   bool _loadingPaired = false;
+  bool _loadingGroups = false;
 
   @override
   void initState() {
     super.initState();
     _refreshPairedPeers();
+    _refreshDeviceGroups();
   }
 
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    // 定期刷新已配对列表，让"在线/离线"随握手租约（45s）及时收敛，
+    // 定期刷新已配对列表与设备组，让"在线/离线"随握手租约（45s）及时收敛，
     // 用户不需要切页或重启就能看到两端状态一致。
     _refreshTimer ??= Timer.periodic(
       const Duration(seconds: 5),
-      (_) => unawaited(_refreshPairedPeers(silent: true)),
+      (_) {
+        unawaited(_refreshPairedPeers(silent: true));
+        unawaited(_refreshDeviceGroups(silent: true));
+      },
     );
   }
 
@@ -86,7 +93,32 @@ class _PairingScreenState extends State<PairingScreen> {
       if (!mounted) return;
       setState(() => _loadingPaired = false);
       if (!silent) {
-        NeuToast.error(context, '读取已配对设备失败：${LanVaultBridge.formatUserError(err)}');
+        NeuToast.error(
+          context,
+          '读取已配对设备失败：${LanVaultBridge.formatUserError(err)}',
+        );
+      }
+    }
+  }
+
+  Future<void> _refreshDeviceGroups({bool silent = false}) async {
+    if (_loadingGroups) return;
+    if (!silent) setState(() => _loadingGroups = true);
+    try {
+      final groups = await widget.bridge.listDeviceGroups();
+      if (!mounted) return;
+      setState(() {
+        _deviceGroups = groups;
+        _loadingGroups = false;
+      });
+    } catch (err) {
+      if (!mounted) return;
+      setState(() => _loadingGroups = false);
+      if (!silent) {
+        NeuToast.error(
+          context,
+          '读取设备组失败：${LanVaultBridge.formatUserError(err)}',
+        );
       }
     }
   }
@@ -118,7 +150,8 @@ class _PairingScreenState extends State<PairingScreen> {
         onError: (Object err) {
           _stopScan(silent: true);
           if (!mounted) return;
-          NeuToast.error(context, '扫描失败：${LanVaultBridge.formatUserError(err)}');
+          NeuToast.error(
+              context, '扫描失败：${LanVaultBridge.formatUserError(err)}');
         },
         onDone: () {
           _stopScan(silent: true);
@@ -128,7 +161,8 @@ class _PairingScreenState extends State<PairingScreen> {
     } catch (err) {
       _stopScan(silent: true);
       if (mounted) {
-        NeuToast.error(context, '启动扫描失败：${LanVaultBridge.formatUserError(err)}');
+        NeuToast.error(
+            context, '启动扫描失败：${LanVaultBridge.formatUserError(err)}');
       }
     }
   }
@@ -148,85 +182,6 @@ class _PairingScreenState extends State<PairingScreen> {
     }
   }
 
-  Future<void> _initiateInteractivePairing(DiscoveredPeer peer) async {
-    var cancelled = false;
-    var dialogClosed = false;
-
-    unawaited(() async {
-      try {
-        await widget.bridge.requestPairing(ip: peer.ip, port: peer.port);
-        if (!mounted || cancelled) return;
-        if (!dialogClosed && Navigator.of(context, rootNavigator: true).canPop()) {
-          dialogClosed = true;
-          Navigator.of(context, rootNavigator: true).pop();
-        }
-        _stopScan(silent: true);
-        NeuToast.success(context, '已与 ${peer.deviceName} 完成配对');
-        setState(() => _activeTab = _DeviceTab.paired);
-        await _refreshPairedPeers();
-      } catch (err) {
-        if (!mounted || cancelled) return;
-        if (!dialogClosed && Navigator.of(context, rootNavigator: true).canPop()) {
-          dialogClosed = true;
-          Navigator.of(context, rootNavigator: true).pop();
-        }
-        NeuToast.error(context, LanVaultBridge.formatUserError(err));
-      }
-    }());
-
-    await showNeuDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (dialogContext) {
-        return NeuDialog(
-          title: '正在等待对方确认配对',
-          subtitle: '请在 ${peer.deviceName} (${peer.ip}) 的弹窗中点击“同意配对”',
-          actions: <Widget>[
-            NeuButton(
-              label: '使用 PIN 配对',
-              onPressed: () {
-                cancelled = true;
-                dialogClosed = true;
-                Navigator.of(dialogContext).pop();
-                _openPairDialog(initialIp: peer.ip, initialPort: peer.port);
-              },
-            ),
-            NeuButton(
-              label: '取消',
-              tone: NeuButtonTone.danger,
-              onPressed: () {
-                cancelled = true;
-                dialogClosed = true;
-                Navigator.of(dialogContext).pop();
-              },
-            ),
-          ],
-          child: NeuCard(
-            inset: true,
-            padding: const EdgeInsets.all(16),
-            child: Row(
-              children: <Widget>[
-                const SizedBox(
-                  width: 24,
-                  height: 24,
-                  child: CircularProgressIndicator(strokeWidth: 2.5),
-                ),
-                const SizedBox(width: 14),
-                Expanded(
-                  child: Text(
-                    '已向 ${peer.deviceName} 发送配对邀请，无需手动输入配对码…',
-                    style: Theme.of(dialogContext).textTheme.bodyMedium,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-    dialogClosed = true;
-  }
-
   Future<void> _openPairDialog({String? initialIp, int? initialPort}) async {
     final paired = await showNeuDialog<bool>(
       context: context,
@@ -241,6 +196,300 @@ class _PairingScreenState extends State<PairingScreen> {
       setState(() => _activeTab = _DeviceTab.paired);
       await _refreshPairedPeers();
     }
+  }
+
+  Future<void> _openCreateGroupDialog() async {
+    final controller = TextEditingController();
+    final createdName = await showNeuDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return NeuDialog(
+          title: '新建设备组',
+          subtitle: '将多台已配对设备编入同一组，用于统一配置差异备份与镜像同步规则。',
+          maxWidth: 440,
+          actions: <Widget>[
+            NeuButton(
+              label: '取消',
+              semanticLabel: '取消新建设备组',
+              onPressed: () => Navigator.of(dialogContext).pop(),
+            ),
+            NeuButton(
+              label: '创建设备组',
+              icon: Icons.check_rounded,
+              tone: NeuButtonTone.primary,
+              semanticLabel: '确认创建设备组',
+              onPressed: () {
+                final name = controller.text.trim();
+                if (name.isEmpty) {
+                  NeuToast.warning(dialogContext, '请输入设备组名称');
+                  return;
+                }
+                Navigator.of(dialogContext).pop(name);
+              },
+            ),
+          ],
+          child: NeuInsetField(
+            controller: controller,
+            label: '设备组名称',
+            hint: '例如：家庭工作站、工作室备份组',
+            prefixIcon: Icons.group_work_outlined,
+            onSubmitted: (val) {
+              final trimmed = val.trim();
+              if (trimmed.isNotEmpty) {
+                Navigator.of(dialogContext).pop(trimmed);
+              }
+            },
+          ),
+        );
+      },
+    );
+    controller.dispose();
+    if (createdName == null || !mounted) return;
+
+    try {
+      await widget.bridge.createDeviceGroup(createdName);
+      if (!mounted) return;
+      NeuToast.success(context, '已创建设备组「$createdName」');
+      await _refreshDeviceGroups();
+    } catch (err) {
+      if (!mounted) return;
+      NeuToast.error(
+        context,
+        '创建设备组失败：${LanVaultBridge.formatUserError(err)}',
+      );
+    }
+  }
+
+  Future<void> _openRenameGroupDialog(DeviceGroupModel group) async {
+    final controller = TextEditingController(text: group.name);
+    final nextName = await showNeuDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return NeuDialog(
+          title: '重命名设备组',
+          maxWidth: 420,
+          actions: <Widget>[
+            NeuButton(
+              label: '取消',
+              semanticLabel: '取消重命名设备组',
+              onPressed: () => Navigator.of(dialogContext).pop(),
+            ),
+            NeuButton(
+              label: '保存名称',
+              icon: Icons.check_rounded,
+              tone: NeuButtonTone.primary,
+              semanticLabel: '保存设备组新名称',
+              onPressed: () {
+                final name = controller.text.trim();
+                if (name.isEmpty) {
+                  NeuToast.warning(dialogContext, '请输入新的设备组名称');
+                  return;
+                }
+                Navigator.of(dialogContext).pop(name);
+              },
+            ),
+          ],
+          child: NeuInsetField(
+            controller: controller,
+            label: '新名称',
+            hint: '输入新的设备组名称',
+            prefixIcon: Icons.edit_outlined,
+            onSubmitted: (val) {
+              final trimmed = val.trim();
+              if (trimmed.isNotEmpty) {
+                Navigator.of(dialogContext).pop(trimmed);
+              }
+            },
+          ),
+        );
+      },
+    );
+    controller.dispose();
+    if (nextName == null || nextName == group.name || !mounted) return;
+
+    try {
+      await widget.bridge.renameDeviceGroup(
+        groupId: group.groupId,
+        name: nextName,
+      );
+      if (!mounted) return;
+      NeuToast.success(context, '设备组已重命名为「$nextName」');
+      await _refreshDeviceGroups();
+    } catch (err) {
+      if (!mounted) return;
+      NeuToast.error(
+        context,
+        '重命名失败：${LanVaultBridge.formatUserError(err)}',
+      );
+    }
+  }
+
+  Future<void> _confirmDeleteGroup(DeviceGroupModel group) async {
+    final confirmed = await showNeuDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return NeuDialog(
+          title: '删除设备组「${group.name}」',
+          subtitle: '请确认是否删除此设备组',
+          maxWidth: 440,
+          actions: <Widget>[
+            NeuButton(
+              label: '取消',
+              semanticLabel: '取消删除设备组',
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+            ),
+            NeuButton(
+              label: '确认删除',
+              icon: Icons.delete_outline_rounded,
+              tone: NeuButtonTone.danger,
+              semanticLabel: '确认删除设备组 ${group.name}',
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+            ),
+          ],
+          child: NeuCard(
+            inset: true,
+            padding: const EdgeInsets.all(14),
+            child: Text(
+              '删除设备组后，该组关联的所有同步与镜像规则将被自动停用，不会继续自动执行；但已有备份数据与历史版本归档将完整保留，仍可随时执行恢复。',
+              style: Theme.of(dialogContext).textTheme.bodyMedium,
+            ),
+          ),
+        );
+      },
+    );
+    if (confirmed != true || !mounted) return;
+
+    try {
+      await widget.bridge.deleteDeviceGroup(group.groupId);
+      if (!mounted) return;
+      NeuToast.info(context, '已删除设备组「${group.name}」，关联规则已停用');
+      await _refreshDeviceGroups();
+    } catch (err) {
+      if (!mounted) return;
+      NeuToast.error(
+        context,
+        '删除设备组失败：${LanVaultBridge.formatUserError(err)}',
+      );
+    }
+  }
+
+  Future<void> _openAddMemberDialog(
+    DeviceGroupViewModel groupView,
+    List<PairedPeerModel> pairedPeers,
+  ) async {
+    final activeIds = groupView.activeMembers.map((m) => m.deviceId).toSet();
+    final candidates = pairedPeers
+        .where((p) => !activeIds.contains(p.deviceId))
+        .toList(growable: false);
+    if (candidates.isEmpty) {
+      NeuToast.info(context, '所有已配对设备均已在该设备组中');
+      return;
+    }
+
+    String? selectedDeviceId = candidates.first.deviceId;
+    final pickedDeviceId = await showNeuDialog<String>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return NeuDialog(
+              title: '添加成员到「${groupView.group.name}」',
+              maxWidth: 440,
+              actions: <Widget>[
+                NeuButton(
+                  label: '取消',
+                  semanticLabel: '取消添加成员',
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                ),
+                NeuButton(
+                  label: '添加成员',
+                  icon: Icons.person_add_alt_1_rounded,
+                  tone: NeuButtonTone.primary,
+                  semanticLabel: '确认添加成员到设备组',
+                  onPressed: selectedDeviceId == null
+                      ? null
+                      : () => Navigator.of(dialogContext).pop(selectedDeviceId),
+                ),
+              ],
+              child: NeuDropdown<String>(
+                label: '选择已配对设备',
+                prefixIcon: Icons.devices_outlined,
+                value: selectedDeviceId,
+                options: candidates
+                    .map(
+                      (peer) => NeuDropdownOption<String>(
+                        value: peer.deviceId,
+                        label: peer.displayLabel,
+                        subtitle: peer.presenceLabel,
+                      ),
+                    )
+                    .toList(growable: false),
+                onChanged: (val) =>
+                    setDialogState(() => selectedDeviceId = val),
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    if (pickedDeviceId == null || !mounted) return;
+    try {
+      await widget.bridge.addGroupMember(
+        groupId: groupView.group.groupId,
+        deviceId: pickedDeviceId,
+        role: 'member',
+      );
+      if (!mounted) return;
+      NeuToast.success(context, '已添加成员到「${groupView.group.name}」');
+      await _refreshDeviceGroups();
+    } catch (err) {
+      if (!mounted) return;
+      NeuToast.error(
+        context,
+        '添加成员失败：${LanVaultBridge.formatUserError(err)}',
+      );
+    }
+  }
+
+  Future<void> _removeMember(
+    DeviceGroupModel group,
+    GroupMemberModel member,
+    String displayName,
+  ) async {
+    try {
+      await widget.bridge.removeGroupMember(
+        groupId: group.groupId,
+        deviceId: member.deviceId,
+      );
+      if (!mounted) return;
+      NeuToast.info(context, '已从「${group.name}」移除 $displayName');
+      await _refreshDeviceGroups();
+    } catch (err) {
+      if (!mounted) return;
+      NeuToast.error(
+        context,
+        '移除成员失败：${LanVaultBridge.formatUserError(err)}',
+      );
+    }
+  }
+
+  String _resolveDeviceLabel(
+    String deviceId,
+    List<PairedPeerModel> pairedPeers, {
+    bool isCoordinator = false,
+  }) {
+    for (final peer in pairedPeers) {
+      if (peer.deviceId == deviceId) {
+        return peer.deviceName.trim().isEmpty
+            ? peer.deviceId
+            : peer.deviceName.trim();
+      }
+    }
+    if (isCoordinator) {
+      return '本机设备 ($deviceId)';
+    }
+    return deviceId;
   }
 
   (IconData, Color, Color) _deviceIcon(String osType) {
@@ -269,8 +518,7 @@ class _PairingScreenState extends State<PairingScreen> {
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
-    final isWide =
-        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
+    final isWide = MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
     final discoveredList = _discovered.values.toList(growable: false);
 
     return ValueListenableBuilder<List<PairedPeerModel>>(
@@ -320,7 +568,7 @@ class _PairingScreenState extends State<PairingScreen> {
                           Text('设备', style: textTheme.headlineSmall),
                           const SizedBox(height: 4),
                           Text(
-                            '管理已配对的设备与局域网发现',
+                            '管理已配对的设备、局域网发现与设备组',
                             style: textTheme.bodySmall,
                           ),
                         ],
@@ -329,7 +577,7 @@ class _PairingScreenState extends State<PairingScreen> {
                   else
                     Expanded(
                       child: Text(
-                        '管理已配对设备与局域网发现',
+                        '管理已配对设备与设备组',
                         style: textTheme.bodySmall,
                       ),
                     ),
@@ -338,6 +586,7 @@ class _PairingScreenState extends State<PairingScreen> {
                     label: '配对新设备',
                     icon: Icons.add_rounded,
                     tone: NeuButtonTone.primary,
+                    semanticLabel: '配对新设备',
                     onPressed: () => _openPairDialog(),
                   ),
                 ],
@@ -370,10 +619,295 @@ class _PairingScreenState extends State<PairingScreen> {
                 _buildPairedListCard(context, pairedPeers)
               else
                 _buildDiscoveredListCard(context, discoveredList),
+              const SizedBox(height: NeuSpace.lg),
+              _buildDeviceGroupsSection(context, pairedPeers, isWide),
             ],
           ),
         );
       },
+    );
+  }
+
+  Widget _buildDeviceGroupsSection(
+    BuildContext context,
+    List<PairedPeerModel> pairedPeers,
+    bool isWide,
+  ) {
+    final textTheme = Theme.of(context).textTheme;
+    return Semantics(
+      container: true,
+      label: '设备组管理',
+      child: NeuCard(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            Wrap(
+              spacing: NeuSpace.sm,
+              runSpacing: NeuSpace.sm,
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: <Widget>[
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: <Widget>[
+                        Text('设备组管理', style: textTheme.titleMedium),
+                        const SizedBox(width: 8),
+                        NeuStatusBadge(
+                          label: '${_deviceGroups.length} 个组',
+                          tone: NeuStatusTone.accent,
+                          showDot: false,
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      '多设备协同分组，用于配置一对多差异备份与镜像同步规则',
+                      style: textTheme.bodySmall,
+                    ),
+                  ],
+                ),
+                Wrap(
+                  spacing: NeuSpace.sm,
+                  runSpacing: NeuSpace.xs,
+                  children: <Widget>[
+                    NeuButton(
+                      label: '刷新',
+                      icon: Icons.refresh_rounded,
+                      semanticLabel: '刷新设备组列表',
+                      loading: _loadingGroups,
+                      onPressed: () => _refreshDeviceGroups(),
+                    ),
+                    NeuButton(
+                      label: '新建设备组',
+                      icon: Icons.group_add_rounded,
+                      tone: NeuButtonTone.primary,
+                      semanticLabel: '新建设备组',
+                      onPressed: _openCreateGroupDialog,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            if (_loadingGroups && _deviceGroups.isEmpty)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                child: Center(
+                  child: Text('正在加载设备组…', style: textTheme.bodySmall),
+                ),
+              )
+            else if (_deviceGroups.isEmpty)
+              const NeuEmptyState(
+                icon: Icons.workspaces_outline,
+                title: '暂无设备组',
+                subtitle: '点击“新建设备组”将本机与已配对设备编组，便于配置多目标同步规则。',
+              )
+            else
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: <Widget>[
+                  for (var i = 0; i < _deviceGroups.length; i++) ...<Widget>[
+                    _buildSingleGroupCard(
+                      context,
+                      _deviceGroups[i],
+                      pairedPeers,
+                      isWide,
+                    ),
+                    if (i < _deviceGroups.length - 1)
+                      const SizedBox(height: 12),
+                  ],
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSingleGroupCard(
+    BuildContext context,
+    DeviceGroupViewModel groupView,
+    List<PairedPeerModel> pairedPeers,
+    bool isWide,
+  ) {
+    final textTheme = Theme.of(context).textTheme;
+    final group = groupView.group;
+    final activeMembers = groupView.activeMembers;
+
+    return Semantics(
+      container: true,
+      label: '设备组 ${group.name}，共 ${activeMembers.length} 名成员',
+      child: NeuCard(
+        key: ValueKey<String>('group_${group.groupId}'),
+        inset: true,
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            Wrap(
+              spacing: NeuSpace.sm,
+              runSpacing: NeuSpace.sm,
+              alignment: WrapAlignment.spaceBetween,
+              crossAxisAlignment: WrapCrossAlignment.center,
+              children: <Widget>[
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: <Widget>[
+                    const NeuIconBadge(
+                      icon: Icons.workspaces_rounded,
+                      color: NeuTokens.accent,
+                      backgroundColor: NeuTokens.accentSoft,
+                      size: 38,
+                      iconSize: 20,
+                    ),
+                    const SizedBox(width: 12),
+                    Flexible(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Wrap(
+                            spacing: 8,
+                            runSpacing: 4,
+                            crossAxisAlignment: WrapCrossAlignment.center,
+                            children: <Widget>[
+                              Text(group.name, style: textTheme.titleSmall),
+                              NeuStatusBadge(
+                                label: '${activeMembers.length} 台设备',
+                                tone: NeuStatusTone.neutral,
+                                showDot: false,
+                              ),
+                              NeuStatusBadge(
+                                label: 'Rev ${group.revision}',
+                                tone: NeuStatusTone.accent,
+                                showDot: false,
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            '组 ID：${group.groupId}',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ),
+                Wrap(
+                  spacing: NeuSpace.xs,
+                  runSpacing: NeuSpace.xs,
+                  children: <Widget>[
+                    NeuButton(
+                      label: '添加成员',
+                      icon: Icons.person_add_alt_1_rounded,
+                      semanticLabel: '向设备组 ${group.name} 添加成员',
+                      onPressed: pairedPeers.isEmpty
+                          ? null
+                          : () => _openAddMemberDialog(groupView, pairedPeers),
+                    ),
+                    NeuButton(
+                      label: '重命名',
+                      icon: Icons.edit_outlined,
+                      semanticLabel: '重命名设备组 ${group.name}',
+                      onPressed: () => _openRenameGroupDialog(group),
+                    ),
+                    NeuButton(
+                      label: '删除',
+                      icon: Icons.delete_outline_rounded,
+                      tone: NeuButtonTone.danger,
+                      semanticLabel: '删除设备组 ${group.name}',
+                      onPressed: () => _confirmDeleteGroup(group),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            const Divider(height: 1),
+            const SizedBox(height: 10),
+            if (activeMembers.isEmpty)
+              Text('暂无活跃成员', style: textTheme.bodySmall)
+            else
+              Column(
+                children: <Widget>[
+                  for (var idx = 0;
+                      idx < activeMembers.length;
+                      idx++) ...<Widget>[
+                    Builder(
+                      builder: (context) {
+                        final member = activeMembers[idx];
+                        final memberLabel = _resolveDeviceLabel(
+                          member.deviceId,
+                          pairedPeers,
+                          isCoordinator: member.isCoordinator,
+                        );
+                        return Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 6),
+                          child: Row(
+                            children: <Widget>[
+                              Icon(
+                                member.isCoordinator
+                                    ? Icons.star_rounded
+                                    : Icons.devices_rounded,
+                                size: 18,
+                                color: member.isCoordinator
+                                    ? NeuTokens.warning
+                                    : NeuTokens.accent,
+                              ),
+                              const SizedBox(width: 10),
+                              Expanded(
+                                child: Text(
+                                  memberLabel,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: textTheme.bodyMedium,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              NeuStatusBadge(
+                                label: member.isCoordinator ? '协调者' : '成员',
+                                tone: member.isCoordinator
+                                    ? NeuStatusTone.warning
+                                    : NeuStatusTone.neutral,
+                                showDot: false,
+                              ),
+                              if (!member.isCoordinator) ...<Widget>[
+                                const SizedBox(width: 8),
+                                Semantics(
+                                  button: true,
+                                  label: '从设备组 ${group.name} 移除成员 $memberLabel',
+                                  child: NeuButton(
+                                    label: '移除',
+                                    tone: NeuButtonTone.danger,
+                                    semanticLabel:
+                                        '从设备组 ${group.name} 移除成员 $memberLabel',
+                                    onPressed: () => _removeMember(
+                                      group,
+                                      member,
+                                      memberLabel,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        );
+                      },
+                    ),
+                    if (idx < activeMembers.length - 1)
+                      const Divider(height: 1),
+                  ],
+                ],
+              ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -416,83 +950,85 @@ class _PairingScreenState extends State<PairingScreen> {
                   },
                   borderRadius: const BorderRadius.all(Radius.circular(12)),
                   child: Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
-                  child: Row(
-                    children: <Widget>[
-                      NeuIconBadge(
-                        icon: icon,
-                        color: fg,
-                        backgroundColor: bg,
-                        size: 44,
-                        iconSize: 22,
-                      ),
-                      const SizedBox(width: 14),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: <Widget>[
-                            Text(
-                              peer.deviceName.trim().isEmpty
-                                  ? peer.deviceId
-                                  : peer.deviceName,
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                              style: textTheme.titleSmall?.copyWith(
-                                fontSize: 15,
+                    padding:
+                        const EdgeInsets.symmetric(vertical: 12, horizontal: 4),
+                    child: Row(
+                      children: <Widget>[
+                        NeuIconBadge(
+                          icon: icon,
+                          color: fg,
+                          backgroundColor: bg,
+                          size: 44,
+                          iconSize: 22,
+                        ),
+                        const SizedBox(width: 14),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: <Widget>[
+                              Text(
+                                peer.deviceName.trim().isEmpty
+                                    ? peer.deviceId
+                                    : peer.deviceName,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: textTheme.titleSmall?.copyWith(
+                                  fontSize: 15,
+                                ),
                               ),
-                            ),
-                            const SizedBox(height: 2),
-                            Text(
-                              hasIp
-                                  ? '${peer.ip}${peer.port != null ? ':${peer.port}' : ''}'
-                                  : peer.deviceId,
-                              overflow: TextOverflow.ellipsis,
-                              style: textTheme.bodySmall,
+                              const SizedBox(height: 2),
+                              Text(
+                                hasIp
+                                    ? '${peer.ip}${peer.port != null ? ':${peer.port}' : ''}'
+                                    : peer.deviceId,
+                                overflow: TextOverflow.ellipsis,
+                                style: textTheme.bodySmall,
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        NeuStatusBadge(
+                          label: peer.presenceLabel,
+                          tone: peer.online
+                              ? NeuStatusTone.healthy
+                              : NeuStatusTone.neutral,
+                        ),
+                        const SizedBox(width: 4),
+                        PopupMenuButton<String>(
+                          tooltip: '设备操作',
+                          icon: const Icon(
+                            Icons.more_horiz_rounded,
+                            color: NeuTokens.textSecondary,
+                          ),
+                          onSelected: (value) {
+                            if (value == 'revoke') {
+                              _revokePeer(peer);
+                            }
+                          },
+                          itemBuilder: (context) =>
+                              const <PopupMenuEntry<String>>[
+                            PopupMenuItem<String>(
+                              value: 'revoke',
+                              child: Row(
+                                children: <Widget>[
+                                  Icon(
+                                    Icons.link_off_rounded,
+                                    size: 18,
+                                    color: NeuTokens.danger,
+                                  ),
+                                  SizedBox(width: 8),
+                                  Text(
+                                    '解绑设备',
+                                    style: TextStyle(color: NeuTokens.danger),
+                                  ),
+                                ],
+                              ),
                             ),
                           ],
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      NeuStatusBadge(
-                        label: peer.presenceLabel,
-                        tone: peer.online
-                            ? NeuStatusTone.healthy
-                            : NeuStatusTone.neutral,
-                      ),
-                      const SizedBox(width: 4),
-                      PopupMenuButton<String>(
-                        tooltip: '设备操作',
-                        icon: const Icon(
-                          Icons.more_horiz_rounded,
-                          color: NeuTokens.textSecondary,
-                        ),
-                        onSelected: (value) {
-                          if (value == 'revoke') {
-                            _revokePeer(peer);
-                          }
-                        },
-                        itemBuilder: (context) => const <PopupMenuEntry<String>>[
-                          PopupMenuItem<String>(
-                            value: 'revoke',
-                            child: Row(
-                              children: <Widget>[
-                                Icon(
-                                  Icons.link_off_rounded,
-                                  size: 18,
-                                  color: NeuTokens.danger,
-                                ),
-                                SizedBox(width: 8),
-                                Text(
-                                  '解绑设备',
-                                  style: TextStyle(color: NeuTokens.danger),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
+                      ],
+                    ),
                   ),
                 );
               },
@@ -567,7 +1103,8 @@ class _PairingScreenState extends State<PairingScreen> {
                         label: '配对',
                         icon: Icons.link_rounded,
                         tone: NeuButtonTone.primary,
-                        onPressed: () => _initiateInteractivePairing(peer),
+                        onPressed: () => _openPairDialog(
+                            initialIp: peer.ip, initialPort: peer.port),
                       ),
                     ],
                   ),
@@ -605,6 +1142,7 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     text: (widget.initialPort ?? LanVaultBridge.defaultServerPort).toString(),
   );
   final TextEditingController _pinController = TextEditingController();
+  final TextEditingController _fingerprintController = TextEditingController();
 
   PairingInfoModel? _localInfo;
   bool _loadingInfo = true;
@@ -627,6 +1165,7 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     _ipController.dispose();
     _portController.dispose();
     _pinController.dispose();
+    _fingerprintController.dispose();
     super.dispose();
   }
 
@@ -642,22 +1181,19 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     } catch (err) {
       if (!mounted) return;
       setState(() => _loadingInfo = false);
-      NeuToast.error(context, '读取本机配对信息失败：${LanVaultBridge.formatUserError(err)}');
+      NeuToast.error(
+        context,
+        '读取本机配对信息失败：${LanVaultBridge.formatUserError(err)}',
+      );
     }
   }
 
-  Future<void> _submitInteractiveRequest() async {
-    final ip = _ipController.text.trim();
-    final port = int.tryParse(_portController.text.trim());
-    if (ip.isEmpty || port == null || port <= 0 || port > 65535) {
-      NeuToast.warning(context, '请输入有效的目标 IP 与端口（1–65535）');
-      return;
-    }
-
+  Future<void> _submitInteractiveRequest(String address, int port) async {
     setState(() => _pairing = true);
     try {
-      NeuToast.info(context, '已发送配对请求，请在对方设备弹窗中确认…');
-      final pairedId = await widget.bridge.requestPairing(ip: ip, port: port);
+      NeuToast.info(context, '请在对方设备确认配对');
+      final pairedId =
+          await widget.bridge.requestPairing(ip: address, port: port);
       if (!mounted) return;
       NeuToast.success(context, '配对成功（设备：$pairedId）');
       Navigator.of(context).pop(true);
@@ -672,13 +1208,19 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     final ip = _ipController.text.trim();
     final port = int.tryParse(_portController.text.trim());
     final pin = _pinController.text.trim();
+    final fingerprint = _fingerprintController.text.trim();
 
     if (ip.isEmpty || port == null || port <= 0 || port > 65535) {
       NeuToast.warning(context, '请输入有效的目标 IP 与端口（1–65535）');
       return;
     }
+    if (!RegExp(r'^[0-9a-fA-F]{32}$').hasMatch(fingerprint)) {
+      NeuToast.warning(context, '请从对方设备复制 32 位十六进制指纹');
+      return;
+    }
+    final address = '$ip#$fingerprint';
     if (pin.isEmpty) {
-      await _submitInteractiveRequest();
+      await _submitInteractiveRequest(address, port);
       return;
     }
     if (!RegExp(r'^\d{6}$').hasMatch(pin)) {
@@ -689,7 +1231,7 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
     setState(() => _pairing = true);
     try {
       final pairedId = await widget.bridge.pairWithPin(
-        ip: ip,
+        ip: address,
         port: port,
         pin: pin,
       );
@@ -707,6 +1249,8 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
     final info = _localInfo;
+    final localFingerprint =
+        Uri.tryParse(info?.pairingQrUri ?? '')?.queryParameters['fp'];
 
     return NeuDialog(
       title: '配对新设备',
@@ -792,6 +1336,18 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
                       ),
                     ],
                   ),
+                if (localFingerprint != null)
+                  NeuButton(
+                    label: '复制本机指纹',
+                    icon: Icons.fingerprint,
+                    onPressed: () async {
+                      await Clipboard.setData(
+                          ClipboardData(text: localFingerprint));
+                      if (context.mounted) {
+                        NeuToast.success(context, '已复制本机指纹');
+                      }
+                    },
+                  ),
               ],
             ),
           ),
@@ -820,6 +1376,13 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
                 ),
               ),
             ],
+          ),
+          const SizedBox(height: 12),
+          NeuInsetField(
+            controller: _fingerprintController,
+            label: '对端设备指纹',
+            hint: '从对方设备的配对信息复制',
+            prefixIcon: Icons.fingerprint,
           ),
           const SizedBox(height: 12),
           NeuInsetField(

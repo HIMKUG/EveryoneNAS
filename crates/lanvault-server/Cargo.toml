@@ -25,3 +25,9 @@ tower-cookies = { workspace = true }
 static-serve = { workspace = true, optional = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+
+[dev-dependencies]
+lanvault-client = { path = "../lanvault-client" }

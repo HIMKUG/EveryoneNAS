@@ -88,5 +88,9 @@ pub(super) async fn handle_report_client_log(
         req.source
     };
     lanvault_core::record_frontend_log(&req.level, &source, req.message, req.detail);
-    (StatusCode::ACCEPTED, Json(serde_json::json!({ "recorded": true }))).into_response()
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "recorded": true })),
+    )
+        .into_response()
 }

@@ -1,9 +1,6 @@
 <!DOCTYPE html>
 <!--
   EveryoneNAS Local Area Network Web Management Console
-  Reference basis:
-  - /working_dir/c_0c10370daccfa96e/lanvault/ARCHITECTURE_CONTRACTS.md
-  - /working_dir/c_0c10370daccfa96e/lanvault/vendor_refs/web-neumorphism-ui/src/index.html
   Zero build dependencies; embedded directly by Rust static-serve.
 -->
 <html lang="zh-CN">
@@ -89,7 +86,7 @@
       <button id="system-banner-dismiss" type="button" class="neu-btn neu-btn--compact">关闭</button>
     </div>
 
-    <!-- 4 Cognitive Blocks Grid -->
+    <!-- Dashboard Grid -->
     <main class="dashboard-grid">
       <!-- Block 1: Service & Keep-Alive -->
       <section class="neu-surface block-card" aria-labelledby="block-service-title">
@@ -269,11 +266,125 @@
         </div>
       </section>
 
+      <!-- Block 5: v2 Device Groups, Sync Rules & Catalog/Version Browser -->
+      <section class="neu-surface block-card block-card--wide" aria-labelledby="block-groups-title">
+        <div class="block-header">
+          <div class="block-title-row">
+            <h2 id="block-groups-title" class="block-title">设备组与组同步状态</h2>
+            <span id="v2-capabilities-badge" class="status-badge status-badge--neutral mono" aria-label="协议能力">v2</span>
+          </div>
+          <div class="block-actions">
+            <button id="btn-refresh-groups" type="button" class="neu-btn neu-btn--compact" aria-label="刷新设备组列表">刷新设备组</button>
+          </div>
+        </div>
+
+        <form id="create-group-form" class="inline-action-form" autocomplete="off">
+          <input
+            id="group-name-input"
+            name="name"
+            type="text"
+            class="neu-input"
+            placeholder="输入新设备组名称，例如：家庭同步组"
+            aria-label="新设备组名称"
+            required
+          >
+          <button id="btn-create-group" type="submit" class="neu-btn neu-btn--primary" aria-label="新建设备组">新建设备组</button>
+        </form>
+
+        <p id="group-feedback" class="feedback-line" aria-live="polite"></p>
+
+        <div id="groups-list" class="group-list" role="list" aria-label="设备组列表" aria-live="polite">
+          <p class="empty-state">暂无设备组，可在上方新建设备组以管理成员与同步规则</p>
+        </div>
+
+        <!-- Selected Group Details -->
+        <div id="group-detail-panel" class="group-detail-panel" hidden>
+          <div class="group-detail-bar">
+            <div class="group-detail-meta">
+              <h3 id="group-detail-name" class="subpanel-title">--</h3>
+              <span id="group-detail-rev" class="status-badge status-badge--neutral mono">rev 1</span>
+            </div>
+            <form id="rename-group-form" class="inline-action-form inline-action-form--compact" autocomplete="off">
+              <input
+                id="rename-group-input"
+                name="name"
+                type="text"
+                class="neu-input"
+                placeholder="输入新的组名称"
+                aria-label="重命名设备组"
+                required
+              >
+              <button id="btn-rename-group" type="submit" class="neu-btn neu-btn--compact" aria-label="确认重命名设备组">重命名</button>
+              <button id="btn-delete-group" type="button" class="neu-btn neu-btn--danger neu-btn--compact" aria-label="删除当前设备组">删除设备组</button>
+            </form>
+          </div>
+
+          <div class="group-detail-grid">
+            <!-- Group Members -->
+            <div class="neu-inset group-subpanel">
+              <div class="block-header">
+                <h4 class="subpanel-heading">组成员</h4>
+              </div>
+              <ul id="group-members-list" class="member-list" aria-live="polite"></ul>
+              <form id="add-group-member-form" class="member-add-form">
+                <select id="group-member-device" class="neu-select" aria-label="选择要添加的已配对设备"></select>
+                <select id="group-member-role" class="neu-select" aria-label="成员角色">
+                  <option value="member">成员 (member)</option>
+                  <option value="coordinator">协调者 (coordinator)</option>
+                </select>
+                <button id="btn-add-group-member" type="submit" class="neu-btn neu-btn--compact" aria-label="添加设备组成员">添加成员</button>
+              </form>
+            </div>
+
+            <!-- Group Sync Rules -->
+            <div class="neu-inset group-subpanel">
+              <div class="block-header">
+                <h4 class="subpanel-heading">组同步规则与目标绑定</h4>
+              </div>
+              <div id="group-rules-list" class="rule-list" aria-live="polite"></div>
+            </div>
+          </div>
+
+          <!-- Catalog & Version Browser -->
+          <div id="catalog-browser-panel" class="neu-inset catalog-panel" hidden>
+            <div class="block-header">
+              <h4 id="catalog-binding-title" class="subpanel-heading">目录与历史版本浏览</h4>
+              <div class="block-actions">
+                <label class="field field--inline catalog-toggle">
+                  <input id="catalog-deleted-only" type="checkbox" aria-label="仅看源已删除">
+                  <span class="field__label">仅看源已删除</span>
+                </label>
+                <button id="btn-refresh-catalog" type="button" class="neu-btn neu-btn--compact" aria-label="刷新目录列表">刷新目录</button>
+                <button id="btn-close-catalog" type="button" class="neu-btn neu-btn--compact" aria-label="收起目录浏览">收起</button>
+              </div>
+            </div>
+
+            <p id="catalog-feedback" class="feedback-line" aria-live="polite"></p>
+
+            <div class="catalog-split">
+              <div class="catalog-col">
+                <span class="field__label">增量目录条目</span>
+                <div id="catalog-entries-list" class="catalog-list" aria-live="polite"></div>
+                <button id="btn-catalog-load-more" type="button" class="neu-btn neu-btn--compact" aria-label="加载更多目录条目" hidden>加载更多条目</button>
+              </div>
+              <div class="catalog-col">
+                <span id="catalog-versions-title" class="field__label">历史归档版本</span>
+                <div id="catalog-versions-list" class="catalog-list" aria-live="polite">
+                  <p class="empty-state">点击左侧目录条目的“查看版本”以浏览历史版本</p>
+                </div>
+                <button id="btn-versions-load-more" type="button" class="neu-btn neu-btn--compact" aria-label="加载更多历史版本" hidden>加载更多版本</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- Block 4: Security Logout & LAN Clipboard Quick-Transfer -->
       <section class="neu-surface block-card block-card--wide" aria-labelledby="block-security-title">
         <div class="block-header">
           <h2 id="block-security-title" class="block-title">安全与局域网快传</h2>
           <div class="block-actions">
+            <button id="btn-refresh-clipboard" type="button" class="neu-btn neu-btn--compact" aria-label="刷新快传历史">刷新记录</button>
             <button id="btn-logout" type="button" class="neu-btn neu-btn--danger neu-btn--compact">安全登出</button>
           </div>
         </div>
@@ -302,7 +413,7 @@
 
           <div class="field">
             <label class="field__label" for="clip-content">发送内容</label>
-            <textarea id="clip-content" name="content" class="neu-textarea" placeholder="粘贴需要同步至局域网设备的文本或内容" required></textarea>
+            <textarea id="clip-content" name="content" class="neu-textarea" placeholder="粘贴需要同步至局域网设备的文本或内容（支持连续非阻塞发送）" required></textarea>
           </div>
 
           <div class="block-actions">
@@ -312,7 +423,7 @@
         </form>
 
         <div class="field">
-          <span class="field__label">已接收的局域网剪贴板</span>
+          <span class="field__label">局域网快传消息与状态</span>
           <div id="clipboard-feed" class="neu-inset clipboard-feed" aria-live="polite">
             <p class="empty-state">等待局域网设备推送剪贴板内容</p>
           </div>
@@ -324,6 +435,7 @@
   <script defer src="./js/api.js"></script>
   <script defer src="./js/ws.js"></script>
   <script defer src="./js/timeline.js"></script>
+  <script defer src="./js/qr.js"></script>
   <script defer src="./js/app.js"></script>
 </body>
 </html>

@@ -15,6 +15,7 @@ import 'features/vault/vault_screen.dart';
 import 'theme/neu_theme.dart';
 import 'theme/neu_toast.dart';
 import 'widgets/device_switcher_pill.dart';
+import 'widgets/nav_rail_item.dart';
 import 'widgets/windows_title_bar.dart';
 
 bool _isReportingError = false;
@@ -521,8 +522,7 @@ class _LanVaultShellState extends State<LanVaultShell> {
 
   @override
   Widget build(BuildContext context) {
-    final isWide =
-        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
+    final isWide = MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
     final hasCustomChrome = WindowChrome.isSupported;
 
     final Widget content = isWide
@@ -691,37 +691,11 @@ class _DesktopNavRail extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: <Widget>[
           if (showBrandHeader) ...<Widget>[
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
-              child: Row(
-                children: <Widget>[
-                  const BrandLogoMark(size: 30),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: <Widget>[
-                        Text(
-                          'EveryoneNAS',
-                          overflow: TextOverflow.ellipsis,
-                          style:
-                              Theme.of(context).textTheme.titleMedium?.copyWith(
-                                    fontWeight: FontWeight.w800,
-                                    letterSpacing: -0.3,
-                                  ),
-                        ),
-                        Text(
-                          'v${LanVaultBridge.appVersion}',
-                          style:
-                              Theme.of(context).textTheme.labelMedium?.copyWith(
-                                    fontSize: 11,
-                                    color: NeuTokens.textSecondary,
-                                  ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ],
+            const Padding(
+              padding: EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: BrandLogoFull(height: 36),
               ),
             ),
             const SizedBox(height: 12),
@@ -760,10 +734,13 @@ class _DesktopNavRail extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: <Widget>[
                       for (var i = 0; i < destinations.length; i++) ...<Widget>[
-                        _NavRailButton(
-                          item: destinations[i],
+                        NavRailItem(
+                          label: destinations[i].label,
+                          icon: destinations[i].icon,
+                          selectedIcon: destinations[i].selectedIcon,
                           selected: destinations[i].tab == selectedTab,
                           onTap: () => onSelected(destinations[i].tab),
+                          paintSelectedSurface: false,
                         ),
                         if (i < destinations.length - 1)
                           const SizedBox(height: gap),
@@ -822,129 +799,6 @@ class _DesktopNavRail extends StatelessWidget {
             },
           ),
         ],
-      ),
-    );
-  }
-}
-
-class _NavRailButton extends StatefulWidget {
-  const _NavRailButton({
-    required this.item,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final _NavItem item;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  State<_NavRailButton> createState() => _NavRailButtonState();
-}
-
-class _NavRailButtonState extends State<_NavRailButton> {
-  final FocusNode _focusNode = FocusNode(debugLabel: 'NavRailButton');
-  bool _hovered = false;
-  bool _pressed = false;
-
-  @override
-  void dispose() {
-    _focusNode.dispose();
-    super.dispose();
-  }
-
-  KeyEventResult _handleKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
-    if (event.logicalKey == LogicalKeyboardKey.enter ||
-        event.logicalKey == LogicalKeyboardKey.numpadEnter ||
-        event.logicalKey == LogicalKeyboardKey.space) {
-      widget.onTap();
-      return KeyEventResult.handled;
-    }
-    return KeyEventResult.ignored;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final fg = widget.selected
-        ? Colors.white
-        : (_hovered ? NeuTokens.textPrimary : NeuTokens.textSecondary);
-    final stateDuration = NeuMotion.resolveState(context);
-    final stateCurve = NeuMotion.resolveStateCurve(context);
-    final pressDuration = NeuMotion.resolvePress(context);
-    final pressCurve = NeuMotion.resolvePressCurve(context);
-    final reduced = NeuMotion.isReduced(context);
-    final targetScale = (_pressed && !reduced) ? NeuMotion.pressedScale : 1.0;
-
-    return RepaintBoundary(
-      child: Semantics(
-        button: true,
-        selected: widget.selected,
-        label: widget.item.label,
-        child: Focus(
-          focusNode: _focusNode,
-          onKeyEvent: _handleKey,
-          child: MouseRegion(
-            cursor: SystemMouseCursors.click,
-            onEnter: (_) => setState(() => _hovered = true),
-            onExit: (_) => setState(() {
-              _hovered = false;
-              _pressed = false;
-            }),
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTapDown: (_) => setState(() => _pressed = true),
-              onTapUp: (_) => setState(() => _pressed = false),
-              onTapCancel: () => setState(() => _pressed = false),
-              onTap: widget.onTap,
-              child: TweenAnimationBuilder<double>(
-                tween: Tween<double>(end: targetScale),
-                duration: pressDuration,
-                curve: pressCurve,
-                builder: (context, scale, child) {
-                  return Transform.scale(
-                    scale: scale,
-                    alignment: Alignment.center,
-                    child: child,
-                  );
-                },
-                child: AnimatedContainer(
-                  duration: stateDuration,
-                  curve: stateCurve,
-                  height: 44,
-                  padding: const EdgeInsets.symmetric(horizontal: 14),
-                  decoration: BoxDecoration(
-                    color: (!widget.selected && _hovered)
-                        ? NeuTokens.insetSurface
-                        : Colors.transparent,
-                    borderRadius: const BorderRadius.all(Radius.circular(12)),
-                  ),
-                  child: Row(
-                    children: <Widget>[
-                      Icon(
-                        widget.selected
-                            ? widget.item.selectedIcon
-                            : widget.item.icon,
-                        size: 19,
-                        color: fg,
-                      ),
-                      const SizedBox(width: 11),
-                      Text(
-                        widget.item.label,
-                        style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                              color: fg,
-                              fontWeight: widget.selected
-                                  ? FontWeight.w600
-                                  : FontWeight.w500,
-                            ),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
       ),
     );
   }

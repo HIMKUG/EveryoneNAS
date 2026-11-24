@@ -5,12 +5,13 @@
 //! - Keep 1 snapshot per day for the last 7 days
 //! - Keep 1 snapshot per week for the last 4 weeks
 //! - Keep 1 snapshot per month for the last 6 months
+//! - Recycle expired mirror archive catalog versions (`expires_at <= now_ts AND recycled_at IS NULL`)
 //! - Delete expired snapshots and reclaim chunks with `ref_count == 0`.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use lanvault_core::{ProbeGuard, Database, Result, RetentionTier, SnapshotRecord};
+use lanvault_core::{Database, ProbeGuard, Result, RetentionTier, SnapshotRecord};
 use serde::{Deserialize, Serialize};
 
 use crate::vault::VaultStore;
@@ -93,8 +94,7 @@ impl GarbageCollector {
                 };
                 let cutoff = now_unix_secs.saturating_sub(window_secs);
                 let bucket = snap.created_at.div_euclid(bucket_secs);
-                if snap.created_at < cutoff
-                    || !seen.insert((snap.retention_tier.as_str(), bucket))
+                if snap.created_at < cutoff || !seen.insert((snap.retention_tier.as_str(), bucket))
                 {
                     expired.push(snap.snapshot_id.clone());
                 }
@@ -104,7 +104,8 @@ impl GarbageCollector {
         expired
     }
 
-    /// Applies GFS retention to `vault_id` and reclaims all orphan chunks (`ref_count == 0`).
+    /// Applies GFS retention to `vault_id`, recycles expired mirror archive catalog versions,
+    /// and reclaims all orphan chunks (`ref_count == 0`).
     pub fn run_gc(
         &self,
         vault_id: &str,
@@ -118,16 +119,16 @@ impl GarbageCollector {
         let _probe = ProbeGuard::start(
             "server.gc",
             "server.gc_run",
-            Some(format!("vault_id={vault_id}, snapshots={evaluated_snapshots}")),
+            Some(format!(
+                "vault_id={vault_id}, snapshots={evaluated_snapshots}"
+            )),
         );
         let expired_count = self.db.delete_snapshots_batch(&expired_ids)? as u64;
         if !expired_ids.is_empty() {
             if let Ok(roots) = self.vault_store.manifest_backup_roots(vault_id) {
                 for root in roots {
                     for snapshot_id in &expired_ids {
-                        let path = root
-                            .join("manifests")
-                            .join(format!("{snapshot_id}.json"));
+                        let path = root.join("manifests").join(format!("{snapshot_id}.json"));
                         if let Err(err) = std::fs::remove_file(&path) {
                             if err.kind() != std::io::ErrorKind::NotFound {
                                 tracing::warn!(
@@ -141,34 +142,45 @@ impl GarbageCollector {
             }
         }
 
+        // Recycle expired mirror archive catalog versions (`expires_at <= now_ts AND recycled_at IS NULL`)
+        // before orphan chunk reclamation; diff_backup versions (`expires_at IS NULL`) and
+        // `source_deleted = 1` current entries remain untouched.
+        let recycled_versions = self
+            .db
+            .recycle_expired_catalog_versions(now_unix_secs, 500)?;
+        if !recycled_versions.is_empty() {
+            let total_recycled: usize = recycled_versions.iter().map(|(_, count)| *count).sum();
+            tracing::info!(
+                vault_id = %vault_id,
+                total_recycled,
+                "recycled expired mirror archive catalog versions"
+            );
+        }
+
         let (deleted_chunks, reclaimed_bytes) = self.vault_store.with_write_lock(|| {
             // 5-minute grace period prevents GC from deleting in-flight chunks before `create_snapshot` commits.
             const ORPHAN_GRACE_SECS: i64 = 300;
             let cutoff = now_unix_secs.saturating_sub(ORPHAN_GRACE_SECS);
             let orphans = self.db.list_orphan_chunks_before(vault_id, cutoff)?;
-            let orphan_hashes: Vec<[u8; 32]> = orphans.iter().map(|o| o.hash_blake3).collect();
-            let batch_deleted = self.db.delete_chunks_batch(vault_id, &orphan_hashes)? as u64;
-
-            let mut reclaimed = 0u64;
-            let mut deleted = 0u64;
-            if batch_deleted > 0 {
-                let all_deleted = batch_deleted == orphans.len() as u64;
-                for orphan in &orphans {
-                    if all_deleted || self.db.get_chunk(vault_id, &orphan.hash_blake3)?.is_none() {
-                        self.vault_store
-                            .delete_chunk_files(vault_id, &orphan.hash_blake3)?;
-                        deleted += 1;
-                        reclaimed = reclaimed.saturating_add(orphan.stored_size);
+            let mut removed = Vec::with_capacity(orphans.len());
+            for orphan in orphans {
+                match self
+                    .vault_store
+                    .delete_chunk_files(vault_id, &orphan.hash_blake3)
+                {
+                    Ok(()) => removed.push(orphan.hash_blake3),
+                    Err(err) => {
+                        tracing::warn!(
+                            vault_id = %vault_id,
+                            hash = %hex::encode(orphan.hash_blake3),
+                            %err,
+                            "orphan chunk file deletion failed; index retained for retry"
+                        );
                     }
                 }
             }
-
-            if reclaimed > 0 {
-                self.db
-                    .update_vault_used_bytes(vault_id, -(reclaimed as i64))?;
-            }
-
-            Ok((deleted, reclaimed))
+            let (deleted, reclaimed) = self.db.delete_chunks_batch(vault_id, &removed)?;
+            Ok((deleted as u64, reclaimed))
         })?;
 
         self.db.prune_revoked_sessions(now_unix_secs)?;

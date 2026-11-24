@@ -4,7 +4,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
-import '../bridge/lanvault_bridge.dart';
 import '../bridge/window_chrome.dart';
 import '../theme/neu_theme.dart';
 
@@ -63,7 +62,8 @@ class _WindowsTitleBarState extends State<WindowsTitleBar> {
     for (final key in <GlobalKey>[_controlsKey, _centerKey]) {
       final RenderObject? box = key.currentContext?.findRenderObject();
       if (box is RenderBox && box.hasSize) {
-        final Offset origin = root.globalToLocal(box.localToGlobal(Offset.zero));
+        final Offset origin =
+            root.globalToLocal(box.localToGlobal(Offset.zero));
         exclusions.add(origin & box.size);
       }
     }
@@ -92,6 +92,7 @@ class _WindowsTitleBarState extends State<WindowsTitleBar> {
     return MouseRegion(
       cursor: SystemMouseCursors.basic,
       child: Container(
+        width: MediaQuery.sizeOf(context).width,
         height: WindowsTitleBar.height,
         padding: const EdgeInsets.only(left: 14, right: 8),
         decoration: const BoxDecoration(
@@ -105,40 +106,18 @@ class _WindowsTitleBarState extends State<WindowsTitleBar> {
           children: <Widget>[
             Row(
               children: <Widget>[
-                const BrandLogoMark(size: 24),
-                const SizedBox(width: 10),
-                Flexible(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: <Widget>[
-                      Text(
-                        'EveryoneNAS',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: -0.2,
-                            ),
-                      ),
-                      Text(
-                        'v${LanVaultBridge.appVersion}',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 10.5,
-                          height: 1.15,
-                          color: NeuTokens.textSecondary,
-                        ),
-                      ),
-                    ],
+                const Expanded(
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: BrandLogoFull(height: 32),
                   ),
                 ),
-                const Spacer(),
                 Padding(
                   key: _controlsKey,
-                  padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
                   child: Row(
+                    mainAxisSize: MainAxisSize.min,
                     children: <Widget>[
                       _CaptionButton(
                         icon: Icons.remove_rounded,

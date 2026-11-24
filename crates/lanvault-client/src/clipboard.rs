@@ -1,18 +1,19 @@
 //! 复用加密信道的局域网剪贴板双向同步与临时文件快传客户端。
 //!
 //! 对齐 `ARCHITECTURE_CONTRACTS.md` §3.1 路由 11 (`POST /api/clipboard`)：
-//! `{ "target_device_id": string|null, "kind": "text|file", "content": string, "filename": string|null }`。
+//! `{ "target_device_id": string|null, "kind": "text|file", "content": string, "filename": string|null, "client_msg_id": string|null }`。
 
 use std::path::Path;
 use std::time::Duration;
 
-use lanvault_core::{decrypt_aead, encrypt_aead, SymmetricKey};
+use lanvault_core::{
+    decrypt_aead, encrypt_aead, MessageSendResponseV2, SymmetricKey, CLIPBOARD_AAD,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::error::ClientError;
-use lanvault_core::CLIPBOARD_AAD;
 
 /// 单次剪贴板/快传 JSON 请求体上限（12 MiB，匹配服务端 16 MiB 帧与请求体限制）。
 pub const MAX_CLIPBOARD_JSON_BYTES: usize = 12 * 1024 * 1024;
@@ -27,9 +28,11 @@ pub struct ClipboardPushRequest {
     pub kind: String,
     pub content: String,
     pub filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_msg_id: Option<String>,
 }
 
-/// 对齐契约 `POST /api/clipboard` 响应载荷。
+/// 对齐契约 `POST /api/clipboard` 响应载荷（v1）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipboardPushResponse {
     pub delivered_to: usize,
@@ -63,9 +66,9 @@ impl ClipboardClient {
         endpoint_base_url: String,
         session_cookie: Option<String>,
         channel_key: SymmetricKey,
+        pin: crate::transport::PeerFingerprint,
     ) -> Result<Self, ClientError> {
-        let http = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
+        let http = crate::transport::peer_http_builder(pin)?
             .timeout(Duration::from_secs(20))
             .build()?;
         Ok(Self {
@@ -89,6 +92,61 @@ impl ClipboardClient {
             kind: "text".to_string(),
             content,
             filename: None,
+            client_msg_id: None,
+        })
+        .await
+    }
+
+    /// v2 幂等文本推送：携带 `client_msg_id`，返回 `MessageSendResponseV2`
+    /// （若对端为未回显 `client_msg_id` 的 v1 服务端，则平滑返回空 `client_msg_id` 供上层标记 `unknown_legacy`）。
+    pub async fn push_text_with_id(
+        &self,
+        client_msg_id: &str,
+        target_device_id: Option<String>,
+        text: &str,
+    ) -> Result<MessageSendResponseV2, ClientError> {
+        let envelope = seal_payload(text.as_bytes(), &self.channel_key)?;
+        let content = serde_json::to_string(&envelope)?;
+        self.send_request_v2(ClipboardPushRequest {
+            target_device_id,
+            kind: "text".to_string(),
+            content,
+            filename: None,
+            client_msg_id: Some(client_msg_id.to_string()),
+        })
+        .await
+    }
+
+    /// v2 幂等文件字节推送：携带 `client_msg_id` 与校验后内存字节，返回 `MessageSendResponseV2`。
+    pub async fn push_file_bytes_with_id(
+        &self,
+        client_msg_id: &str,
+        target_device_id: Option<String>,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<MessageSendResponseV2, ClientError> {
+        if bytes.len() as u64 > MAX_TEMP_FILE_BYTES {
+            return Err(ClientError::InvalidInput(format!(
+                "temp file exceeds limit ({} > {} bytes)",
+                bytes.len(),
+                MAX_TEMP_FILE_BYTES
+            )));
+        }
+        let safe_name = sanitize_received_filename(filename)?;
+        let envelope = seal_payload(bytes, &self.channel_key)?;
+        let content = serde_json::to_string(&envelope)?;
+        info!(
+            client_msg_id = %client_msg_id,
+            filename = %safe_name,
+            bytes = bytes.len(),
+            "pushing encrypted v2 temp file"
+        );
+        self.send_request_v2(ClipboardPushRequest {
+            target_device_id,
+            kind: "file".to_string(),
+            content,
+            filename: Some(safe_name),
+            client_msg_id: Some(client_msg_id.to_string()),
         })
         .await
     }
@@ -133,6 +191,7 @@ impl ClipboardClient {
             kind: "file".to_string(),
             content,
             filename: Some(filename),
+            client_msg_id: None,
         })
         .await
     }
@@ -169,11 +228,11 @@ impl ClipboardClient {
         }
     }
 
-    async fn send_request(
+    async fn send_raw_post(
         &self,
-        payload: ClipboardPushRequest,
-    ) -> Result<ClipboardPushResponse, ClientError> {
-        let body = serde_json::to_vec(&payload)?;
+        payload: &ClipboardPushRequest,
+    ) -> Result<reqwest::Response, ClientError> {
+        let body = serde_json::to_vec(payload)?;
         if body.len() > MAX_CLIPBOARD_JSON_BYTES {
             return Err(ClientError::InvalidInput(format!(
                 "clipboard JSON payload exceeds limit ({} > {} bytes)",
@@ -199,8 +258,36 @@ impl ClipboardClient {
                 status: resp.status().as_u16(),
             });
         }
+        Ok(resp)
+    }
+
+    async fn send_request(
+        &self,
+        payload: ClipboardPushRequest,
+    ) -> Result<ClipboardPushResponse, ClientError> {
+        let resp = self.send_raw_post(&payload).await?;
         let parsed = resp.json::<ClipboardPushResponse>().await?;
         Ok(parsed)
+    }
+
+    async fn send_request_v2(
+        &self,
+        payload: ClipboardPushRequest,
+    ) -> Result<MessageSendResponseV2, ClientError> {
+        let resp = self.send_raw_post(&payload).await?;
+        let raw_json: serde_json::Value = resp.json().await?;
+        if raw_json.get("client_msg_id").is_some() {
+            Ok(serde_json::from_value::<MessageSendResponseV2>(raw_json)?)
+        } else {
+            let legacy: ClipboardPushResponse = serde_json::from_value(raw_json)?;
+            Ok(MessageSendResponseV2 {
+                client_msg_id: String::new(),
+                delivered_to: legacy.delivered_to,
+                accepted_to: legacy.delivered_to,
+                server_ack_at: legacy.timestamp,
+                targets: Vec::new(),
+            })
+        }
     }
 }
 
@@ -225,11 +312,7 @@ fn sanitize_received_filename(raw: &str) -> Result<String, ClientError> {
             "clipboard filename must not be empty or contain NUL".to_string(),
         ));
     }
-    let basename = trimmed
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("")
-        .trim();
+    let basename = trimmed.rsplit(['/', '\\']).next().unwrap_or("").trim();
     if basename.is_empty()
         || basename == "."
         || basename == ".."
@@ -242,7 +325,6 @@ fn sanitize_received_filename(raw: &str) -> Result<String, ClientError> {
     Ok(basename.to_string())
 }
 
-
 /// 工业级流式分片直传客户端（突破 5 MiB JSON 限制，支持任意大文件 + 断点续传 + 分片 BLAKE3 校验）。
 pub struct ResumableFileTransferClient {
     http: Client,
@@ -251,9 +333,12 @@ pub struct ResumableFileTransferClient {
 }
 
 impl ResumableFileTransferClient {
-    pub fn new(endpoint_base_url: String, session_cookie: Option<String>) -> Result<Self, ClientError> {
-        let http = Client::builder()
-            .connect_timeout(Duration::from_secs(5))
+    pub fn new(
+        endpoint_base_url: String,
+        session_cookie: Option<String>,
+        pin: crate::transport::PeerFingerprint,
+    ) -> Result<Self, ClientError> {
+        let http = crate::transport::peer_http_builder(pin)?
             .read_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(8)
             .tcp_nodelay(true)
@@ -270,21 +355,22 @@ impl ResumableFileTransferClient {
         const PART_SIZE: u64 = 2 * 1024 * 1024;
 
         let path_owned = file_path.to_path_buf();
-        let (filename, total_size, file_blake3_hex) = tokio::task::spawn_blocking(move || -> std::io::Result<(String, u64, String)> {
-            let meta = std::fs::metadata(&path_owned)?;
-            let total_size = meta.len();
-            let filename = path_owned
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("file")
-                .to_string();
-            let mut file = std::fs::File::open(&path_owned)?;
-            let hash = lanvault_core::blake3_hash_reader(&mut file)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            Ok((filename, total_size, hex::encode(hash)))
-        })
-        .await
-        .map_err(|e| ClientError::Io(std::io::Error::other(e.to_string())))??;
+        let (filename, total_size, file_blake3_hex) =
+            tokio::task::spawn_blocking(move || -> std::io::Result<(String, u64, String)> {
+                let meta = std::fs::metadata(&path_owned)?;
+                let total_size = meta.len();
+                let filename = path_owned
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file")
+                    .to_string();
+                let mut file = std::fs::File::open(&path_owned)?;
+                let hash = lanvault_core::blake3_hash_reader(&mut file)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                Ok((filename, total_size, hex::encode(hash)))
+            })
+            .await
+            .map_err(|e| ClientError::Io(std::io::Error::other(e.to_string())))??;
 
         let id_seed = format!("{filename}:{total_size}:{file_blake3_hex}");
         let transfer_id = hex::encode(&lanvault_core::blake3_hash(id_seed.as_bytes())[..16]);
@@ -322,11 +408,10 @@ impl ResumableFileTransferClient {
             if received_set.contains(&part_idx) {
                 continue;
             }
-            let permit = sem
-                .clone()
-                .acquire_owned()
-                .await
-                .map_err(|_| ClientError::Io(std::io::Error::other("transfer semaphore closed")))?;
+            let permit =
+                sem.clone().acquire_owned().await.map_err(|_| {
+                    ClientError::Io(std::io::Error::other("transfer semaphore closed"))
+                })?;
             let path_for_part = file_path.to_path_buf();
             let http = self.http.clone();
             let base = self.endpoint_base_url.clone();
@@ -371,15 +456,19 @@ impl ResumableFileTransferClient {
                         Ok(resp) if resp.status().is_success() => return Ok::<(), ClientError>(()),
                         Ok(resp) => {
                             let status = resp.status().as_u16();
-                            if matches!(status, 408 | 429 | 500 | 502 | 503 | 504) && attempt < max_attempts {
-                                tokio::time::sleep(Duration::from_millis(400u64 << (attempt - 1))).await;
+                            if matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+                                && attempt < max_attempts
+                            {
+                                tokio::time::sleep(Duration::from_millis(400u64 << (attempt - 1)))
+                                    .await;
                                 continue;
                             }
                             let body = resp.text().await.unwrap_or_default();
                             return Err(ClientError::RemoteRejected { status, body });
                         }
-                        Err(err) if attempt < max_attempts => {
-                            tokio::time::sleep(Duration::from_millis(400u64 << (attempt - 1))).await;
+                        Err(_err) if attempt < max_attempts => {
+                            tokio::time::sleep(Duration::from_millis(400u64 << (attempt - 1)))
+                                .await;
                         }
                         Err(err) => return Err(err.into()),
                     }
@@ -391,7 +480,10 @@ impl ResumableFileTransferClient {
             res.map_err(|e| ClientError::Io(std::io::Error::other(e.to_string())))??;
         }
 
-        let commit_url = format!("{}/api/transfers/{}/commit", self.endpoint_base_url, transfer_id);
+        let commit_url = format!(
+            "{}/api/transfers/{}/commit",
+            self.endpoint_base_url, transfer_id
+        );
         let mut commit_req = self.http.post(&commit_url);
         if let Some(c) = &self.session_cookie {
             commit_req = commit_req.header("Cookie", format!("lv_session={c}"));

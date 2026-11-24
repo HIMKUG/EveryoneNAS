@@ -25,25 +25,28 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex as AsyncMutex, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+use lanvault_client::transport::{peer_http_builder, PeerFingerprint};
 use lanvault_client::{
-    reconcile_directory, ClipboardClient, DirectoryWatcher, PowerNetworkPolicy,
-    DeviceEnvironment, ReconnectController, ReconnectEvent, ReconnectTarget, SyncEngine,
-    TokenBucket, WatchEvent,
+    reconcile_directory, ClipboardClient, DeviceEnvironment, DirectoryWatcher, PowerNetworkPolicy,
+    ReconnectController, ReconnectEvent, ReconnectTarget, SyncEngine, TokenBucket, WatchEvent,
 };
 use lanvault_core::{
-    unpack_chunk, CHUNK_MAX_SIZE,
     blake3_hash, decrypt_aead, encrypt_aead, pairing_identity_message, pairing_response_message,
-    session_renew_message,
-    parse_role_mode, verify_ed25519, Database, DeviceIdentity, DiscoveredPeerInfo,
-    DiscoveryBrowser, PoolMode, RoleMode, SessionKeyExchange, SymmetricKey, SyncRuleRecord,
-    TransferHistoryRecord, TrustedPeer, VolumeRole,
+    parse_role_mode, session_renew_message, verify_ed25519, Database, DeviceIdentity,
+    DiscoveredPeerInfo, DiscoveryBrowser, PoolMode, RoleMode, SessionKeyExchange, SymmetricKey,
+    SyncRuleRecord, TransferHistoryRecord, TrustedPeer, VolumeRole, CHUNK_MAX_SIZE,
 };
 use lanvault_server::scrub::{BitRotAlertEvent, BitRotScrubber};
 use lanvault_server::vault::{ExtraVolumeSpec, VaultStore};
-use lanvault_server::web::PendingPairRequestDto;
+use lanvault_server::web::{
+    load_snapshot_manifest, validate_relative_snapshot_path, PendingPairRequestDto,
+    SnapshotManifest,
+};
 use lanvault_server::{ServerConfig, ServerExitReason};
 
 use crate::frb_generated::StreamSink;
+
+pub use crate::api_v2::*;
 
 /// 默认服务端监听端口（对齐 `ARCHITECTURE_CONTRACTS.md` §3.1）。
 const DEFAULT_SERVER_PORT: u16 = 7842;
@@ -58,6 +61,7 @@ const SETTING_ROLE_MODE: &str = "role_mode";
 const SETTING_VAULT_MASTER_KEY_HEX: &str = "vault_master_key_hex";
 const SETTING_POWER_POLICY_JSON: &str = "power_network_policy";
 const SETTING_ACTIVE_PEER_JSON: &str = "active_peer_session_json";
+const SETTING_PEER_SESSIONS_JSON: &str = "peer_sessions_json";
 const SETTING_AUTO_RECONNECT: &str = "auto_reconnect_enabled";
 const SETTING_DEFAULTS_INITIALIZED: &str = "default_sync_rules_initialized";
 const SETTING_DEBUG_MODE: &str = "debug_mode";
@@ -183,13 +187,15 @@ impl From<SyncRuleRecord> for SyncRuleDto {
 }
 
 #[derive(Clone)]
-struct ActivePeerSession {
-    device_id: String,
-    addr: SocketAddr,
-    endpoint_base_url: String,
-    session_cookie: Option<String>,
-    channel_key: SymmetricKey,
-    default_vault_id: Option<String>,
+pub(crate) struct ActivePeerSession {
+    pub(crate) device_id: String,
+    pub(crate) addr: SocketAddr,
+    pub(crate) endpoint_base_url: String,
+    pub(crate) fingerprint: PeerFingerprint,
+    pub(crate) http: Client,
+    pub(crate) session_cookie: Option<String>,
+    pub(crate) channel_key: SymmetricKey,
+    pub(crate) default_vault_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -215,28 +221,30 @@ struct VaultKeyBackup {
 }
 
 /// 全局 FFI 异步运行时与服务句柄容器。
-struct FfiRuntimeState {
-    runtime: tokio::runtime::Runtime,
-    http_client: Client,
-    client_db: Arc<Database>,
-    client_identity: DeviceIdentity,
-    client_device_id: String,
-    vault_master_key: RwLock<SymmetricKey>,
+pub(crate) struct FfiRuntimeState {
+    pub(crate) runtime: tokio::runtime::Runtime,
+    pub(crate) http_client: Client,
+    pub(crate) client_db: Arc<Database>,
+    pub(crate) client_identity: DeviceIdentity,
+    pub(crate) client_device_id: String,
+    pub(crate) vault_master_key: RwLock<SymmetricKey>,
     lifecycle: AsyncMutex<LifecycleState>,
     reconnect: ReconnectController,
-    policy: Arc<RwLock<PowerNetworkPolicy>>,
-    rate_limiter: Arc<TokenBucket>,
+    pub(crate) policy: Arc<RwLock<PowerNetworkPolicy>>,
+    pub(crate) rate_limiter: Arc<TokenBucket>,
     progress_tx: broadcast::Sender<SyncProgressEvent>,
     latest_progress: Arc<Mutex<HashMap<String, SyncProgressEvent>>>,
     discovered_peers: Arc<Mutex<HashMap<String, DiscoveredPeer>>>,
     /// `device_id -> 最近一次握手成功的时刻`。UI 的"在线"唯一来源：
     /// 只有双方真的互相握过手，才会显示在线（不再用 mDNS 缓存或残留会话推断）。
-    peer_last_heartbeat: Arc<Mutex<HashMap<String, Instant>>>,
+    pub(crate) peer_last_heartbeat: Arc<Mutex<HashMap<String, Instant>>>,
     mdns_browser_started: Mutex<bool>,
-    active_peer: Arc<RwLock<Option<ActivePeerSession>>>,
-    environment: Arc<RwLock<DeviceEnvironment>>,
-    sync_inflight: Arc<AsyncMutex<HashSet<String>>>,
-    sync_engine_cache: AsyncMutex<Option<(String, Arc<SyncEngine>)>>,
+    pub(crate) active_peer: Arc<RwLock<Option<ActivePeerSession>>>,
+    pub(crate) peer_sessions: Arc<RwLock<HashMap<String, ActivePeerSession>>>,
+    pub(crate) outbox_notify: Arc<tokio::sync::Notify>,
+    pub(crate) environment: Arc<RwLock<DeviceEnvironment>>,
+    pub(crate) sync_inflight: Arc<AsyncMutex<HashSet<String>>>,
+    sync_engine_cache: AsyncMutex<Option<(SocketAddr, PeerFingerprint, Arc<SyncEngine>)>>,
     fast_backup_mode: AtomicBool,
 }
 
@@ -245,6 +253,10 @@ static INIT_LOCK: Mutex<()> = Mutex::new(());
 static DAEMON_MODE: AtomicBool = AtomicBool::new(false);
 
 impl FfiRuntimeState {
+    pub(crate) async fn role_mode(&self) -> RoleMode {
+        self.lifecycle.lock().await.role_mode
+    }
+
     /// 本机服务端当前监听端口（未启动时回退到最近一次配置的端口），
     /// 用于握手时告知对端"到我这个端口来连"，使对端的地址簿在 DHCP 变更后自愈。
     async fn own_server_port(&self) -> Option<u16> {
@@ -258,7 +270,7 @@ impl FfiRuntimeState {
     }
 }
 
-fn client_data_dir() -> PathBuf {
+pub(crate) fn client_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LANVAULT_DATA_DIR") {
         let trimmed = dir.trim();
         if !trimmed.is_empty() {
@@ -315,11 +327,7 @@ fn encrypt_setting(value: &[u8], protection_key: &SymmetricKey, aad: &[u8]) -> R
     .map_err(Into::into)
 }
 
-fn decrypt_setting(
-    raw: &str,
-    protection_key: &SymmetricKey,
-    aad: &[u8],
-) -> Result<Vec<u8>> {
+fn decrypt_setting(raw: &str, protection_key: &SymmetricKey, aad: &[u8]) -> Result<Vec<u8>> {
     let envelope: EncryptedSetting =
         serde_json::from_str(raw).context("invalid encrypted local setting")?;
     let ciphertext =
@@ -443,15 +451,24 @@ fn load_persisted_peer(
         .addr
         .parse()
         .context("invalid persisted peer SocketAddr")?;
-    let key_bytes = hex::decode(&persisted.channel_key_hex)
-        .context("invalid persisted channel_key_hex")?;
+    let Some(trusted) = db
+        .get_trusted_peer(&persisted.device_id)?
+        .filter(|peer| peer.revoked_at.is_none())
+    else {
+        return Ok(None);
+    };
+    let fingerprint = trusted_peer_fingerprint(&trusted)?;
+    let key_bytes =
+        hex::decode(&persisted.channel_key_hex).context("invalid persisted channel_key_hex")?;
     let key_arr: [u8; 32] = key_bytes
         .try_into()
         .map_err(|_| anyhow!("persisted channel_key must be 32 bytes"))?;
     Ok(Some(ActivePeerSession {
         device_id: persisted.device_id,
         addr,
-        endpoint_base_url: persisted.endpoint_base_url,
+        endpoint_base_url: format!("https://{addr}"),
+        fingerprint,
+        http: peer_http_client(fingerprint)?,
         session_cookie: persisted.session_cookie,
         channel_key: SymmetricKey::from_bytes(key_arr),
         default_vault_id: persisted.default_vault_id,
@@ -486,6 +503,142 @@ fn save_persisted_peer(
     Ok(())
 }
 
+fn load_persisted_peer_sessions(
+    db: &Database,
+    protection_key: &SymmetricKey,
+) -> Result<HashMap<String, ActivePeerSession>> {
+    const AAD: &[u8] = b"lanvault.local.peer-sessions.v1";
+    let Some(raw) = db.get_setting(SETTING_PEER_SESSIONS_JSON)? else {
+        return Ok(HashMap::new());
+    };
+    if raw.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+    let decoded = decrypt_setting(&raw, protection_key, AAD)?;
+    let list: Vec<PersistedPeerSession> =
+        serde_json::from_slice(&decoded).context("invalid persisted peer_sessions_json")?;
+    let mut map = HashMap::with_capacity(list.len());
+    for persisted in list {
+        let addr: SocketAddr = persisted
+            .addr
+            .parse()
+            .context("invalid persisted peer_sessions SocketAddr")?;
+        let Some(trusted) = db
+            .get_trusted_peer(&persisted.device_id)?
+            .filter(|peer| peer.revoked_at.is_none())
+        else {
+            continue;
+        };
+        let fingerprint = trusted_peer_fingerprint(&trusted)?;
+        let key_bytes = hex::decode(&persisted.channel_key_hex)
+            .context("invalid persisted peer_sessions channel_key_hex")?;
+        let key_arr: [u8; 32] = key_bytes
+            .try_into()
+            .map_err(|_| anyhow!("persisted peer_sessions channel_key must be 32 bytes"))?;
+        map.insert(
+            persisted.device_id.clone(),
+            ActivePeerSession {
+                device_id: persisted.device_id,
+                addr,
+                endpoint_base_url: format!("https://{addr}"),
+                fingerprint,
+                http: peer_http_client(fingerprint)?,
+                session_cookie: persisted.session_cookie,
+                channel_key: SymmetricKey::from_bytes(key_arr),
+                default_vault_id: persisted.default_vault_id,
+            },
+        );
+    }
+    Ok(map)
+}
+
+fn save_persisted_peer_sessions(
+    db: &Database,
+    sessions: &HashMap<String, ActivePeerSession>,
+    protection_key: &SymmetricKey,
+) -> Result<()> {
+    const AAD: &[u8] = b"lanvault.local.peer-sessions.v1";
+    let list: Vec<PersistedPeerSession> = sessions
+        .values()
+        .map(|peer| PersistedPeerSession {
+            device_id: peer.device_id.clone(),
+            addr: peer.addr.to_string(),
+            endpoint_base_url: peer.endpoint_base_url.clone(),
+            session_cookie: peer.session_cookie.clone(),
+            channel_key_hex: hex::encode(peer.channel_key.as_bytes()),
+            default_vault_id: peer.default_vault_id.clone(),
+        })
+        .collect();
+    let json = serde_json::to_vec(&list)?;
+    db.set_setting(
+        SETTING_PEER_SESSIONS_JSON,
+        &encrypt_setting(&json, protection_key, AAD)?,
+    )?;
+    Ok(())
+}
+
+async fn upsert_peer_session(
+    state: &Arc<FfiRuntimeState>,
+    session: ActivePeerSession,
+) -> Result<()> {
+    let mut guard = state.peer_sessions.write().await;
+    guard.insert(session.device_id.clone(), session);
+    save_persisted_peer_sessions(
+        &state.client_db,
+        &guard,
+        &state
+            .client_identity
+            .derive_local_storage_key("client-state"),
+    )?;
+    Ok(())
+}
+
+async fn remove_peer_session(state: &Arc<FfiRuntimeState>, device_id: &str) -> Result<bool> {
+    let mut guard = state.peer_sessions.write().await;
+    let removed = guard.remove(device_id).is_some();
+    if removed {
+        save_persisted_peer_sessions(
+            &state.client_db,
+            &guard,
+            &state
+                .client_identity
+                .derive_local_storage_key("client-state"),
+        )?;
+    }
+    Ok(removed)
+}
+
+fn spawn_outbox_dispatcher_task(state: &Arc<FfiRuntimeState>) -> JoinHandle<()> {
+    let state_for_task = Arc::clone(state);
+    state.runtime.spawn(async move {
+        loop {
+            let sessions = state_for_task.peer_sessions.read().await.clone();
+            let dispatch_res = lanvault_client::outbox::dispatch_pending_outbox(
+                &state_for_task.client_db,
+                move |device_id: &str| {
+                    sessions.get(device_id).map(|s| {
+                        (
+                            s.endpoint_base_url.clone(),
+                            s.session_cookie.clone().unwrap_or_default(),
+                            s.channel_key.clone(),
+                            s.fingerprint,
+                        )
+                    })
+                },
+                4,
+            )
+            .await;
+            if let Err(err) = dispatch_res {
+                warn!("background outbox dispatch cycle failed: {err}");
+            }
+            tokio::select! {
+                _ = state_for_task.outbox_notify.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+            }
+        }
+    })
+}
+
 #[derive(Deserialize)]
 struct RemoteVaultSummary {
     vault_id: String,
@@ -496,7 +649,7 @@ struct RemoteVaultsResponse {
     vaults: Vec<RemoteVaultSummary>,
 }
 
-async fn fetch_remote_default_vault_id(
+pub(crate) async fn fetch_remote_default_vault_id(
     client: &Client,
     endpoint_base_url: &str,
     session_cookie: Option<&str>,
@@ -559,8 +712,8 @@ fn spawn_peer_heartbeat_task(
                 continue;
             };
             let url = format!("{}/api/peers/heartbeat", current.endpoint_base_url);
-            let result = state_for_task
-                .http_client
+            let result = current
+                .http
                 .post(&url)
                 .header("Cookie", format!("lv_session={cookie}"))
                 .json(&serde_json::json!({
@@ -591,12 +744,14 @@ fn spawn_peer_heartbeat_task(
                                 continue;
                             }
                             Err(err) => {
-                                warn!(
-                                    peer = %current.device_id,
-                                    "peer session renewal rejected ({err:#}); dropping stale pairing"
-                                );
-                                abandon_peer_session(&state_for_task, &current.device_id).await;
-                                break;
+                                let denied = err.downcast_ref::<reqwest::Error>()
+                                    .and_then(reqwest::Error::status)
+                                    .is_some_and(|status| status.as_u16() == 401 || status.as_u16() == 403);
+                                warn!(peer = %current.device_id, "peer session renewal failed ({err:#})");
+                                if denied {
+                                    abandon_peer_session(&state_for_task, &current.device_id).await;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -654,7 +809,12 @@ async fn handle_heartbeat_ack(
         if peer.device_id == state.client_device_id {
             continue;
         }
-        let Some(existing) = state.client_db.get_trusted_peer(&peer.device_id).ok().flatten() else {
+        let Some(existing) = state
+            .client_db
+            .get_trusted_peer(&peer.device_id)
+            .ok()
+            .flatten()
+        else {
             continue;
         };
         let device_name = if peer.device_name.trim().is_empty() {
@@ -690,27 +850,14 @@ struct SessionRenewChallengeResp {
     server_device_id: String,
 }
 
-/// 拒绝从加密通道（https/wss）无声降级为明文（http/ws）。
-#[allow(dead_code)]
-fn validate_no_scheme_downgrade(previous_url: &str, next_url: &str) -> Result<()> {
-    let prev_secure = previous_url.starts_with("https://") || previous_url.starts_with("wss://");
-    let next_secure = next_url.starts_with("https://") || next_url.starts_with("wss://");
-    if prev_secure && !next_secure {
-        bail!(
-            "refusing silent transport downgrade from `{previous_url}` to `{next_url}`"
-        );
-    }
-    Ok(())
-}
-
 /// 用本机设备私钥向对端换发新的 `lv_session`，并把新 Cookie 写回活跃会话。
 async fn renew_peer_session(
     state: &Arc<FfiRuntimeState>,
     current: &ActivePeerSession,
 ) -> Result<ActivePeerSession> {
     let challenge_url = format!("{}/api/peers/session/challenge", current.endpoint_base_url);
-    let challenge_resp = state
-        .http_client
+    let challenge_resp = current
+        .http
         .post(&challenge_url)
         .json(&serde_json::json!({
             "device_id": state.client_device_id,
@@ -719,6 +866,7 @@ async fn renew_peer_session(
         .await
         .with_context(|| format!("session renewal challenge request to {challenge_url} failed"))?;
     if !challenge_resp.status().is_success() {
+        challenge_resp.error_for_status_ref()?;
         bail!(
             "session renewal challenge rejected with HTTP {}",
             challenge_resp.status().as_u16()
@@ -746,8 +894,8 @@ async fn renew_peer_session(
     );
     let signature = state.client_identity.sign(&message);
     let url = format!("{}/api/peers/session", current.endpoint_base_url);
-    let resp = state
-        .http_client
+    let resp = current
+        .http
         .post(&url)
         .json(&serde_json::json!({
             "device_id": state.client_device_id,
@@ -760,6 +908,7 @@ async fn renew_peer_session(
         .with_context(|| format!("session renewal request to {url} failed"))?;
 
     if !resp.status().is_success() {
+        resp.error_for_status_ref()?;
         bail!(
             "session renewal rejected with HTTP {}",
             resp.status().as_u16()
@@ -774,21 +923,26 @@ async fn renew_peer_session(
         .filter(|token| !token.trim().is_empty())
         .ok_or_else(|| anyhow!("session renewal response missing session cookie"))?;
 
-    let mut refreshed_out = current.clone();
-    refreshed_out.session_cookie = Some(cookie.clone());
-    let mut guard = state.active_peer.write().await;
-    if let Some(session) = guard.as_mut() {
-        if session.device_id == current.device_id {
-            session.session_cookie = Some(cookie);
-            refreshed_out = session.clone();
-            save_persisted_peer(
-                &state.client_db,
-                &refreshed_out,
-                &state.client_identity.derive_local_storage_key("client-state"),
-            )?;
+    let mut renewed = current.clone();
+    renewed.session_cookie = Some(cookie.clone());
+    {
+        let mut guard = state.active_peer.write().await;
+        if let Some(session) = guard.as_mut() {
+            if session.device_id == current.device_id {
+                session.session_cookie = Some(cookie);
+                renewed = session.clone();
+                save_persisted_peer(
+                    &state.client_db,
+                    &renewed,
+                    &state
+                        .client_identity
+                        .derive_local_storage_key("client-state"),
+                )?;
+            }
         }
     }
-    Ok(refreshed_out)
+    upsert_peer_session(state, renewed.clone()).await?;
+    Ok(renewed)
 }
 
 #[derive(Deserialize)]
@@ -800,12 +954,19 @@ struct SessionRenewAck {
 /// 对端已撤销本设备会话：清空活跃会话与持久化记录，避免继续向死会话上传。
 async fn abandon_peer_session(state: &Arc<FfiRuntimeState>, device_id: &str) {
     let mut guard = state.active_peer.write().await;
-    if guard.as_ref().is_some_and(|peer| peer.device_id == device_id) {
+    if guard
+        .as_ref()
+        .is_some_and(|peer| peer.device_id == device_id)
+    {
         *guard = None;
         if let Err(err) = clear_persisted_peer(&state.client_db) {
             warn!("failed to clear persisted peer session: {err}");
         }
         info!(peer = %device_id, "active peer session abandoned after remote revocation");
+    }
+    drop(guard);
+    if let Err(err) = remove_peer_session(state, device_id).await {
+        warn!("failed to remove abandoned peer from peer_sessions: {err:#}");
     }
 }
 
@@ -941,7 +1102,7 @@ fn is_daemon_mode_active(explicit_daemon: bool) -> bool {
         || std::env::var("LANVAULT_DAEMON_MODE").ok().as_deref() == Some("1")
 }
 
-fn runtime_state() -> Result<Arc<FfiRuntimeState>> {
+pub(crate) fn runtime_state() -> Result<Arc<FfiRuntimeState>> {
     runtime_state_with_mode(false)
 }
 
@@ -985,8 +1146,7 @@ fn runtime_state_with_mode(explicit_daemon: bool) -> Result<Arc<FfiRuntimeState>
         .context("failed to load or generate client DeviceIdentity")?;
     let client_device_id = format!("lv-{}", &client_identity.fingerprint_hex()[..12]);
     let local_storage_key = client_identity.derive_local_storage_key("client-state");
-    let vault_master_key =
-        load_or_generate_vault_master_key(&client_db, &local_storage_key)?;
+    let vault_master_key = load_or_generate_vault_master_key(&client_db, &local_storage_key)?;
     let persisted_role = if daemon_mode {
         RoleMode::ServerOnly
     } else {
@@ -1001,10 +1161,22 @@ fn runtime_state_with_mode(explicit_daemon: bool) -> Result<Arc<FfiRuntimeState>
     } else {
         load_persisted_peer(&client_db, &local_storage_key)?
     };
-    let debug_enabled = client_db
-        .get_setting(SETTING_DEBUG_MODE)?
-        .as_deref()
-        == Some("1");
+    let mut persisted_peer_sessions = if daemon_mode {
+        HashMap::new()
+    } else {
+        load_persisted_peer_sessions(&client_db, &local_storage_key)?
+    };
+    if let Some(ref peer) = persisted_peer {
+        persisted_peer_sessions
+            .entry(peer.device_id.clone())
+            .or_insert_with(|| peer.clone());
+    }
+    if !daemon_mode {
+        if let Err(err) = client_db.migrate_legacy_rules_to_groups(&client_device_id) {
+            warn!("legacy sync rules migration skipped: {err}");
+        }
+    }
+    let debug_enabled = client_db.get_setting(SETTING_DEBUG_MODE)?.as_deref() == Some("1");
     lanvault_core::set_debug_mode(debug_enabled);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1016,11 +1188,10 @@ fn runtime_state_with_mode(explicit_daemon: bool) -> Result<Arc<FfiRuntimeState>
     let (progress_tx, _) = broadcast::channel(256);
     let reconnect_enabled = !daemon_mode
         && persisted_role != RoleMode::ServerOnly
-        && client_db
-            .get_setting(SETTING_AUTO_RECONNECT)?
-            .as_deref()
-            != Some("0");
+        && client_db.get_setting(SETTING_AUTO_RECONNECT)?.as_deref() != Some("0");
     let http_client = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .build()
@@ -1054,6 +1225,8 @@ fn runtime_state_with_mode(explicit_daemon: bool) -> Result<Arc<FfiRuntimeState>
         peer_last_heartbeat: Arc::new(Mutex::new(HashMap::new())),
         mdns_browser_started: Mutex::new(false),
         active_peer: Arc::new(RwLock::new(persisted_peer.clone())),
+        peer_sessions: Arc::new(RwLock::new(persisted_peer_sessions)),
+        outbox_notify: Arc::new(tokio::sync::Notify::new()),
         environment: Arc::new(RwLock::new(DeviceEnvironment {
             on_wifi: !cfg!(target_os = "android"),
             current_ssid: None,
@@ -1064,6 +1237,9 @@ fn runtime_state_with_mode(explicit_daemon: bool) -> Result<Arc<FfiRuntimeState>
         fast_backup_mode: AtomicBool::new(false),
     });
 
+    if !daemon_mode {
+        let _outbox_task = spawn_outbox_dispatcher_task(&state);
+    }
     if !daemon_mode && persisted_role != RoleMode::ServerOnly {
         let mut life = state.lifecycle.blocking_lock();
         start_client_background_tasks(&state, &mut life, persisted_peer);
@@ -1433,10 +1609,62 @@ struct PendingPairRequestsResponse {
     requests: Vec<PendingPairRequestDto>,
 }
 
+fn peer_http_client(fingerprint: PeerFingerprint) -> Result<Client> {
+    Ok(peer_http_builder(fingerprint)?
+        .timeout(Duration::from_secs(10))
+        .build()?)
+}
+
+fn trusted_peer_fingerprint(peer: &TrustedPeer) -> Result<PeerFingerprint> {
+    let key = peer
+        .ed25519_pubkey
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("invalid public key for trusted device {}", peer.device_id))?;
+    Ok(PeerFingerprint::from_public_key(key))
+}
+
+fn pairing_target(
+    state: &FfiRuntimeState,
+    input: &str,
+    port: u16,
+) -> Result<(SocketAddr, PeerFingerprint)> {
+    let (host, supplied_pin) = match input.trim().split_once('#') {
+        Some((host, pin)) => (host, Some(pin.parse::<PeerFingerprint>()?)),
+        None => (input.trim(), None),
+    };
+    let ip: IpAddr = host.parse().context("invalid peer IP address")?;
+    if port == 0 {
+        bail!("peer port must be non-zero");
+    }
+    let addr = SocketAddr::new(ip, port);
+    if let Some(pin) = supplied_pin {
+        return Ok((addr, pin));
+    }
+    let mut matching = state
+        .client_db
+        .list_trusted_peers()?
+        .into_iter()
+        .filter(|peer| {
+            peer.revoked_at.is_none()
+                && peer
+                    .last_ip
+                    .as_deref()
+                    .and_then(|value| value.parse::<IpAddr>().ok())
+                    == Some(ip)
+                && peer.last_port == Some(port)
+        });
+    match (matching.next(), matching.next()) {
+        (Some(peer), None) => Ok((addr, trusted_peer_fingerprint(&peer)?)),
+        _ => bail!("verify the fingerprint displayed on the other device before pairing"),
+    }
+}
+
 async fn finalize_paired_peer(
     state: &Arc<FfiRuntimeState>,
-    parsed_ip: IpAddr,
-    port: u16,
+    addr: SocketAddr,
+    fingerprint: PeerFingerprint,
+    http: Client,
     challenge: &str,
     kex: SessionKeyExchange,
     client_ed25519_pubkey: &[u8; 32],
@@ -1446,8 +1674,8 @@ async fn finalize_paired_peer(
 ) -> Result<String> {
     let server_ed25519_pubkey = hex::decode(&body.server_ed25519_pubkey_hex)
         .context("invalid server_ed25519_pubkey_hex")?;
-    let peer_pub_bytes = hex::decode(&body.server_x25519_pubkey_hex)
-        .context("invalid server_x25519_pubkey_hex")?;
+    let peer_pub_bytes =
+        hex::decode(&body.server_x25519_pubkey_hex).context("invalid server_x25519_pubkey_hex")?;
     let server_signature = hex::decode(&body.server_ed25519_signature_hex)
         .context("invalid server_ed25519_signature_hex")?;
     let clipboard_envelope = hex::decode(&body.clipboard_key_envelope_hex)
@@ -1461,15 +1689,14 @@ async fn finalize_paired_peer(
         &body.device_id,
         &clipboard_envelope,
     );
-    verify_ed25519(
-        &server_ed25519_pubkey,
-        &response_message,
-        &server_signature,
-    )
-    .context("server identity signature verification failed")?;
+    verify_ed25519(&server_ed25519_pubkey, &response_message, &server_signature)
+        .context("server identity signature verification failed")?;
     let server_public_key: [u8; 32] = server_ed25519_pubkey
         .try_into()
         .map_err(|_| anyhow!("invalid server Ed25519 public key length"))?;
+    if PeerFingerprint::from_public_key(&server_public_key) != fingerprint {
+        bail!("pairing identity does not match the TLS device fingerprint");
+    }
     let expected_server_device_id = format!(
         "lv-{}",
         &lanvault_core::public_key_fingerprint(&server_public_key)[..12]
@@ -1500,7 +1727,11 @@ async fn finalize_paired_peer(
         .device_name
         .filter(|name| !name.trim().is_empty())
         .or_else(|| discovered_meta.as_ref().map(|(name, _)| name.clone()))
-        .or_else(|| existing_trusted.as_ref().map(|peer| peer.device_name.clone()))
+        .or_else(|| {
+            existing_trusted
+                .as_ref()
+                .map(|peer| peer.device_name.clone())
+        })
         .unwrap_or_else(|| body.device_id.clone());
     let peer_os_type = body
         .os_type
@@ -1518,25 +1749,23 @@ async fn finalize_paired_peer(
         device_name: peer_device_name,
         os_type: peer_os_type,
         ed25519_pubkey: server_public_key.to_vec(),
-        last_ip: Some(parsed_ip.to_string()),
-        last_port: Some(port),
+        last_ip: Some(addr.ip().to_string()),
+        last_port: Some(addr.port()),
         auto_connect: state.reconnect.is_enabled(),
         paired_at,
         revoked_at: None,
     })?;
 
-    let socket_addr = SocketAddr::new(parsed_ip, port);
-    let endpoint_base_url = format!("http://{socket_addr}");
-    let default_vault_id = fetch_remote_default_vault_id(
-        &state.http_client,
-        &endpoint_base_url,
-        body.session_cookie.as_deref(),
-    )
-    .await;
+    let endpoint_base_url = format!("https://{addr}");
+    let default_vault_id =
+        fetch_remote_default_vault_id(&http, &endpoint_base_url, body.session_cookie.as_deref())
+            .await;
     let session = ActivePeerSession {
         device_id: body.device_id.clone(),
-        addr: socket_addr,
+        addr,
         endpoint_base_url,
+        fingerprint,
+        http,
         session_cookie: body.session_cookie,
         channel_key,
         default_vault_id,
@@ -1549,6 +1778,7 @@ async fn finalize_paired_peer(
             .derive_local_storage_key("client-state"),
     )?;
     *state.active_peer.write().await = Some(session.clone());
+    upsert_peer_session(state, session.clone()).await?;
     // 配对成功的瞬间即视为一次握手：两端状态机从这一刻起就一致。
     if let Ok(mut guard) = state.peer_last_heartbeat.lock() {
         guard.insert(session.device_id.clone(), Instant::now());
@@ -1562,23 +1792,14 @@ async fn finalize_paired_peer(
 
 /// 2. 使用 6 位动态 PIN 码执行 X25519 + Ed25519 零信任配对，返回对端 `device_id`。
 pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String> {
-    let _probe = lanvault_core::ProbeGuard::start(
-        "rust.ffi",
-        "ffi.pair_with_pin",
-        Some(format!("target={ip}:{port}")),
-    );
-    let parsed_ip: IpAddr = ip
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid peer IP address: `{ip}`"))?;
-    if port == 0 {
-        bail!("peer port must be non-zero");
-    }
+    let _probe = lanvault_core::ProbeGuard::start("rust.ffi", "ffi.pair_with_pin", None);
     if pin.len() != 6 || !pin.chars().all(|c| c.is_ascii_digit()) {
         bail!("pairing PIN must be a 6-digit numeric string");
     }
 
     let state = runtime_state()?;
+    let (socket_addr, fingerprint) = pairing_target(&state, &ip, port)?;
+    let http = peer_http_client(fingerprint)?;
     let kex = SessionKeyExchange::new();
     let client_ed25519_pubkey = state.client_identity.public_key_bytes();
     let client_x25519_pubkey = kex.public_key_bytes();
@@ -1593,11 +1814,9 @@ pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String>
     );
     let client_signature = state.client_identity.sign(&identity_message);
 
-    let socket_addr = SocketAddr::new(parsed_ip, port);
-    let url = format!("http://{socket_addr}/api/peers/pair");
+    let url = format!("https://{socket_addr}/api/peers/pair");
 
-    let resp = state
-        .http_client
+    let resp = http
         .post(&url)
         .json(&PairPinRequest {
             pin: pin.clone(),
@@ -1621,8 +1840,9 @@ pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String>
     let body: PairPinResponse = resp.json().await.context("invalid pairing response JSON")?;
     let device_id = finalize_paired_peer(
         &state,
-        parsed_ip,
-        port,
+        socket_addr,
+        fingerprint,
+        http,
         &pin,
         kex,
         &client_ed25519_pubkey,
@@ -1638,20 +1858,11 @@ pub async fn pair_with_pin(ip: String, port: u16, pin: String) -> Result<String>
 
 /// 2b. 向对端发起交互式配对请求（接收方弹窗点击“同意配对”后自动完成密钥协商，无需输入 PIN）。
 pub async fn request_pairing(ip: String, port: u16) -> Result<String> {
-    let _probe = lanvault_core::ProbeGuard::start(
-        "rust.ffi",
-        "ffi.request_pairing",
-        Some(format!("target={ip}:{port}")),
-    );
-    let parsed_ip: IpAddr = ip
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid peer IP address: `{ip}`"))?;
-    if port == 0 {
-        bail!("peer port must be non-zero");
-    }
+    let _probe = lanvault_core::ProbeGuard::start("rust.ffi", "ffi.request_pairing", None);
 
     let state = runtime_state()?;
+    let (socket_addr, fingerprint) = pairing_target(&state, &ip, port)?;
+    let http = peer_http_client(fingerprint)?;
     let kex = SessionKeyExchange::new();
     let client_ed25519_pubkey = state.client_identity.public_key_bytes();
     let client_x25519_pubkey = kex.public_key_bytes();
@@ -1669,10 +1880,8 @@ pub async fn request_pairing(ip: String, port: u16) -> Result<String> {
     );
     let client_signature = state.client_identity.sign(&identity_message);
 
-    let socket_addr = SocketAddr::new(parsed_ip, port);
-    let init_url = format!("http://{socket_addr}/api/peers/pair-request");
-    let init_resp = state
-        .http_client
+    let init_url = format!("https://{socket_addr}/api/peers/pair-request");
+    let init_resp = http
         .post(&init_url)
         .json(&PairRequestInitiatePayload {
             nonce: nonce.clone(),
@@ -1697,7 +1906,7 @@ pub async fn request_pairing(ip: String, port: u16) -> Result<String> {
         .json()
         .await
         .context("invalid pair-request response JSON")?;
-    let status_url = format!("http://{socket_addr}/api/peers/pair-status");
+    let status_url = format!("https://{socket_addr}/api/peers/pair-status");
     let deadline = Instant::now() + Duration::from_secs(init_body.expires_in_secs.clamp(10, 90));
 
     loop {
@@ -1706,8 +1915,7 @@ pub async fn request_pairing(ip: String, port: u16) -> Result<String> {
         }
         tokio::time::sleep(Duration::from_millis(750)).await;
 
-        let poll_resp = state
-            .http_client
+        let poll_resp = http
             .post(&status_url)
             .json(&PairRequestStatusPayload {
                 request_id: init_body.request_id.clone(),
@@ -1739,8 +1947,9 @@ pub async fn request_pairing(ip: String, port: u16) -> Result<String> {
                     .ok_or_else(|| anyhow!("approved pairing status missing response payload"))?;
                 let device_id = finalize_paired_peer(
                     &state,
-                    parsed_ip,
-                    port,
+                    socket_addr,
+                    fingerprint,
+                    http,
                     &nonce,
                     kex,
                     &client_ed25519_pubkey,
@@ -1785,7 +1994,10 @@ pub async fn list_pending_pair_requests() -> Result<Vec<PendingPairRequestDto>> 
         .send()
         .await?;
     if !resp.status().is_success() {
-        bail!("failed to query pending pair requests: HTTP {}", resp.status().as_u16());
+        bail!(
+            "failed to query pending pair requests: HTTP {}",
+            resp.status().as_u16()
+        );
     }
     let parsed: PendingPairRequestsResponse = resp.json().await?;
     Ok(parsed.requests)
@@ -1820,7 +2032,10 @@ pub async fn respond_pair_request(request_id: String, accept: bool) -> Result<bo
             .send()
             .await?;
         if !resp.status().is_success() {
-            bail!("respond_pair_request failed with HTTP {}", resp.status().as_u16());
+            bail!(
+                "respond_pair_request failed with HTTP {}",
+                resp.status().as_u16()
+            );
         }
         accept
     } else {
@@ -1852,10 +2067,9 @@ pub async fn enable_auto_reconnect(enabled: bool) -> Result<()> {
         );
     }
     state.reconnect.set_enabled(enabled);
-    state.client_db.set_setting(
-        SETTING_AUTO_RECONNECT,
-        if enabled { "1" } else { "0" },
-    )?;
+    state
+        .client_db
+        .set_setting(SETTING_AUTO_RECONNECT, if enabled { "1" } else { "0" })?;
     Ok(())
 }
 
@@ -1949,8 +2163,7 @@ async fn start_local_server_internal(
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let (bound_tx, bound_rx) = oneshot::channel::<SocketAddr>();
-    let (app_state_tx, app_state_rx) =
-        oneshot::channel::<Arc<lanvault_server::web::AppState>>();
+    let (app_state_tx, app_state_rx) = oneshot::channel::<Arc<lanvault_server::web::AppState>>();
     let mut initial_bound_tx = Some(bound_tx);
     let mut initial_app_state_tx = Some(app_state_tx);
 
@@ -2056,9 +2269,7 @@ async fn start_local_server_internal(
 
     info!(
         port = actual_port,
-        quota_gb,
-        daemon_mode,
-        "started local LanVault server"
+        quota_gb, daemon_mode, "started local LanVault server"
     );
     Ok(actual_port)
 }
@@ -2127,10 +2338,7 @@ pub async fn autostart_local_server() -> Result<Option<u16>> {
     let protection_key = state
         .client_identity
         .derive_local_storage_key("client-state");
-    let Some(encrypted) = state
-        .client_db
-        .get_setting(SETTING_SERVER_PASSWORD_ENC)?
-    else {
+    let Some(encrypted) = state.client_db.get_setting(SETTING_SERVER_PASSWORD_ENC)? else {
         return Ok(None);
     };
     let password_bytes = decrypt_setting(&encrypted, &protection_key, AUTOSTART_AAD)?;
@@ -2146,7 +2354,10 @@ pub async fn autostart_local_server() -> Result<Option<u16>> {
     .await
     {
         Ok(port) => {
-            info!(port, "local storage server autostarted from previous configuration");
+            info!(
+                port,
+                "local storage server autostarted from previous configuration"
+            );
             Ok(Some(port))
         }
         Err(err) => {
@@ -2170,10 +2381,9 @@ pub async fn get_autostart_server() -> Result<bool> {
 /// 设置"启动时自动开启存储服务"开关。
 pub async fn set_autostart_server(enabled: bool) -> Result<bool> {
     let state = runtime_state()?;
-    state.client_db.set_setting(
-        SETTING_AUTOSTART_SERVER,
-        if enabled { "1" } else { "0" },
-    )?;
+    state
+        .client_db
+        .set_setting(SETTING_AUTOSTART_SERVER, if enabled { "1" } else { "0" })?;
     info!(enabled, "autostart local storage server preference updated");
     Ok(enabled)
 }
@@ -2270,22 +2480,21 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
         .await
         .clone()
         .ok_or_else(|| anyhow!("no paired peer session active for incremental upload"))?;
-    let resolved_vault_id = if rule.target_vault_id == "default"
-        || rule.target_vault_id == "vault-primary"
-    {
-        match peer.default_vault_id.clone() {
-            Some(vault_id) => vault_id,
-            None => fetch_remote_default_vault_id(
-                &state.http_client,
-                &peer.endpoint_base_url,
-                peer.session_cookie.as_deref(),
-            )
-            .await
-            .ok_or_else(|| anyhow!("remote peer has no available vault"))?,
-        }
-    } else {
-        rule.target_vault_id.clone()
-    };
+    let resolved_vault_id =
+        if rule.target_vault_id == "default" || rule.target_vault_id == "vault-primary" {
+            match peer.default_vault_id.clone() {
+                Some(vault_id) => vault_id,
+                None => fetch_remote_default_vault_id(
+                    &peer.http,
+                    &peer.endpoint_base_url,
+                    peer.session_cookie.as_deref(),
+                )
+                .await
+                .ok_or_else(|| anyhow!("remote peer has no available vault"))?,
+            }
+        } else {
+            rule.target_vault_id.clone()
+        };
 
     let diff_db = Arc::clone(&state.client_db);
     let diff_rule_id = rule_id.clone();
@@ -2296,6 +2505,12 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
     })
     .await
     .context("reconcile_directory worker panicked")??;
+    let up_to_date = diff.is_empty()
+        && !SyncEngine::has_pending_checkpoint(
+            &state.client_db,
+            &rule_id,
+            &resolved_vault_id,
+        )?;
     let total_bytes: u64 = diff.changed_files().map(|f| f.size).sum();
 
     emit_progress(
@@ -2308,7 +2523,7 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
             chunks_uploaded: 0,
             chunks_deduplicated: 0,
             throughput_bps: 0,
-            status: if diff.is_empty() {
+            status: if up_to_date {
                 "up_to_date".to_string()
             } else {
                 "scanning".to_string()
@@ -2317,7 +2532,7 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
         },
     );
 
-    if diff.is_empty() {
+    if up_to_date {
         return Ok(());
     }
 
@@ -2325,9 +2540,11 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
     let environment = state.environment.read().await.clone();
     let engine = {
         let mut cache = state.sync_engine_cache.lock().await;
-        if let Some((cached_url, existing)) = cache.as_ref() {
-            if cached_url == &peer.endpoint_base_url {
-                existing.update_session_cookie(peer.session_cookie.clone()).await;
+        if let Some((addr, pin, existing)) = cache.as_ref() {
+            if *addr == peer.addr && *pin == peer.fingerprint {
+                existing
+                    .update_session_cookie(peer.session_cookie.clone())
+                    .await;
                 existing.update_policy(policy.clone()).await;
                 existing.update_environment(environment.clone()).await;
                 existing.set_fast_mode(state.fast_backup_mode.load(Ordering::Relaxed));
@@ -2341,9 +2558,10 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
                     policy.clone(),
                     environment.clone(),
                     Some(Arc::clone(&state.rate_limiter)),
+                    peer.fingerprint,
                 )?);
                 created.set_fast_mode(state.fast_backup_mode.load(Ordering::Relaxed));
-                *cache = Some((peer.endpoint_base_url.clone(), Arc::clone(&created)));
+                *cache = Some((peer.addr, peer.fingerprint, Arc::clone(&created)));
                 created
             }
         } else {
@@ -2355,9 +2573,10 @@ async fn trigger_incremental_scan_inner(rule_id: String) -> Result<()> {
                 policy.clone(),
                 environment.clone(),
                 Some(Arc::clone(&state.rate_limiter)),
+                peer.fingerprint,
             )?);
             created.set_fast_mode(state.fast_backup_mode.load(Ordering::Relaxed));
-            *cache = Some((peer.endpoint_base_url.clone(), Arc::clone(&created)));
+            *cache = Some((peer.addr, peer.fingerprint, Arc::clone(&created)));
             created
         }
     };
@@ -2492,11 +2711,8 @@ pub async fn export_vault_key_backup(passphrase: String) -> Result<String> {
         let mut salt = [0u8; 16];
         OsRng.fill_bytes(&mut salt);
         let backup_key = derive_key_backup_key(&passphrase, &salt)?;
-        let ciphertext = encrypt_aead(
-            &backup_key,
-            vault_key.as_bytes(),
-            b"lanvault.key-backup.v1",
-        )?;
+        let ciphertext =
+            encrypt_aead(&backup_key, vault_key.as_bytes(), b"lanvault.key-backup.v1")?;
         Ok(serde_json::to_string(&VaultKeyBackup {
             version: 1,
             salt_hex: hex::encode(salt),
@@ -2514,18 +2730,12 @@ pub async fn import_vault_key_backup(passphrase: String, backup_json: String) ->
         bail!("unsupported vault key backup version");
     }
     let salt = hex::decode(backup.salt_hex).context("invalid key-backup salt")?;
-    let ciphertext =
-        hex::decode(backup.ciphertext_hex).context("invalid key-backup ciphertext")?;
+    let ciphertext = hex::decode(backup.ciphertext_hex).context("invalid key-backup ciphertext")?;
     let key = tokio::task::spawn_blocking(move || -> Result<SymmetricKey> {
         let backup_key = derive_key_backup_key(&passphrase, &salt)?;
-        let plaintext = decrypt_aead(
-            &backup_key,
-            &ciphertext,
-            b"lanvault.key-backup.v1",
-        )
-        .context("key-backup passphrase is incorrect or backup is corrupted")?;
-        SymmetricKey::from_slice(&plaintext)
-            .context("vault key backup contains an invalid key")
+        let plaintext = decrypt_aead(&backup_key, &ciphertext, b"lanvault.key-backup.v1")
+            .context("key-backup passphrase is incorrect or backup is corrupted")?;
+        SymmetricKey::from_slice(&plaintext).context("vault key backup contains an invalid key")
     })
     .await
     .context("import_vault_key_backup worker panicked")??;
@@ -2554,7 +2764,10 @@ pub async fn push_clipboard_text(target_device_id: Option<String>, text: String)
     let mut _probe = lanvault_core::ProbeGuard::start(
         "rust.ffi",
         "ffi.push_clipboard_text",
-        Some(format!("target={}", target_device_id.as_deref().unwrap_or("broadcast"))),
+        Some(format!(
+            "target={}",
+            target_device_id.as_deref().unwrap_or("broadcast")
+        )),
     );
     _probe.add_bytes(text.len() as u64);
     if text.is_empty() {
@@ -2573,12 +2786,13 @@ pub async fn push_clipboard_text(target_device_id: Option<String>, text: String)
         peer.endpoint_base_url,
         peer.session_cookie,
         peer.channel_key,
+        peer.fingerprint,
     )?;
     let target_label = target_device_id
         .as_deref()
         .map(str::to_string)
         .unwrap_or_else(|| peer.device_id.clone());
-    let resp = client.push_text(target_device_id, &text).await?;
+    client.push_text(target_device_id, &text).await?;
     let now_ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -2685,7 +2899,10 @@ pub async fn set_role_mode(mode: String) -> anyhow::Result<String> {
         }
     }
 
-    info!(role_mode = target_mode.as_str(), "runtime role_mode updated and persisted");
+    info!(
+        role_mode = target_mode.as_str(),
+        "runtime role_mode updated and persisted"
+    );
     Ok(target_mode.as_str().to_string())
 }
 
@@ -2701,7 +2918,6 @@ fn current_hostname() -> String {
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "lanvault-node".to_string())
 }
-
 
 /// 12. 列出本地持久化的全部增量同步规则。
 pub async fn list_sync_rules() -> Result<Vec<SyncRuleDto>> {
@@ -2773,7 +2989,6 @@ pub async fn delete_sync_rule(rule_id: String) -> Result<bool> {
     Ok(deleted)
 }
 
-
 /// 15. 开启或关闭全局 Debug 调试与微秒级性能探针模式。
 pub async fn set_debug_mode(enabled: bool) -> Result<bool> {
     let state = runtime_state()?;
@@ -2833,10 +3048,9 @@ pub(crate) fn load_or_generate_jni_web_password(daemon_mode: bool) -> Result<Str
                 return Ok(existing);
             }
         } else if raw.len() >= 12 {
-            state.client_db.set_setting(
-                KEY,
-                &encrypt_setting(raw.as_bytes(), &protection_key, AAD)?,
-            )?;
+            state
+                .client_db
+                .set_setting(KEY, &encrypt_setting(raw.as_bytes(), &protection_key, AAD)?)?;
             return Ok(raw);
         }
     }
@@ -2848,7 +3062,6 @@ pub(crate) fn load_or_generate_jni_web_password(daemon_mode: bool) -> Result<Str
     )?;
     Ok(generated)
 }
-
 
 /// FFI DTO: 已配对的可信设备（供快传下拉选择）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3089,8 +3302,8 @@ pub async fn get_auto_reconnect() -> Result<bool> {
 pub async fn get_backup_storage_config() -> Result<BackupStorageConfigDto> {
     let state = runtime_state()?;
     if let Some(raw) = state.client_db.get_setting(SETTING_BACKUP_STORAGE_JSON)? {
-        let mut cfg: BackupStorageConfigDto = serde_json::from_str(&raw)
-            .context("invalid persisted backup_storage_config_json")?;
+        let mut cfg: BackupStorageConfigDto =
+            serde_json::from_str(&raw).context("invalid persisted backup_storage_config_json")?;
         // 兼容升级前只存 `primary_dir` 的旧配置：隔离根在读取时补齐。
         if cfg.primary_root.trim().is_empty() && !cfg.primary_dir.trim().is_empty() {
             cfg.primary_root = backup_isolation_root(&cfg.primary_dir)
@@ -3127,10 +3340,9 @@ pub async fn set_backup_storage_config(
         .filter(|v| !v.is_empty());
 
     if let Some(ref fb) = fallback {
-        if let (Some(p_drive), Some(f_drive)) = (
-            normalized_drive_key(&primary),
-            normalized_drive_key(fb),
-        ) {
+        if let (Some(p_drive), Some(f_drive)) =
+            (normalized_drive_key(&primary), normalized_drive_key(fb))
+        {
             if p_drive == f_drive {
                 bail!(
                     "主备份文件夹与备用备份文件夹不能位于同一盘符（当前同为 {p_drive}），主盘空间不足时备用盘将同样无剩余空间"
@@ -3142,9 +3354,8 @@ pub async fn set_backup_storage_config(
     let state = runtime_state()?;
     // 隔离根必须真实存在：用户只选一次目录，之后备份只写进 everyonenasbackup。
     let primary_root = backup_isolation_root(&primary);
-    fs::create_dir_all(&primary_root).with_context(|| {
-        format!("无法创建备份隔离子目录 {}", primary_root.display())
-    })?;
+    fs::create_dir_all(&primary_root)
+        .with_context(|| format!("无法创建备份隔离子目录 {}", primary_root.display()))?;
     let fallback_root = match fallback {
         Some(ref fb) => {
             let root = backup_isolation_root(fb);
@@ -3168,7 +3379,6 @@ pub async fn set_backup_storage_config(
     Ok(cfg)
 }
 
-
 /// FFI DTO: 最近一次成功启动的本地服务端配置（不含明文密码）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LastServerConfigDto {
@@ -3180,17 +3390,23 @@ pub struct LastServerConfigDto {
 /// 25. 读取最近一次成功启动的本地服务端配置（Windows 与 Android C-ABI 共用，不含明文密码）。
 pub async fn get_last_server_config() -> Result<Option<LastServerConfigDto>> {
     let state = runtime_state()?;
-    if let Some(raw) = state.client_db.get_setting(SETTING_LAST_SERVER_CONFIG_JSON)? {
-        let cfg: LastServerConfigDto = serde_json::from_str(&raw)
-            .context("invalid persisted last_server_config_json")?;
+    if let Some(raw) = state
+        .client_db
+        .get_setting(SETTING_LAST_SERVER_CONFIG_JSON)?
+    {
+        let cfg: LastServerConfigDto =
+            serde_json::from_str(&raw).context("invalid persisted last_server_config_json")?;
         return Ok(Some(cfg));
     }
     let life = state.lifecycle.lock().await;
-    Ok(life.last_server_config.as_ref().map(|cfg| LastServerConfigDto {
-        vault_path: cfg.vault_root.to_string_lossy().into_owned(),
-        quota_gb: (cfg.default_quota_bytes / (1024 * 1024 * 1024)).max(1),
-        port: cfg.port,
-    }))
+    Ok(life
+        .last_server_config
+        .as_ref()
+        .map(|cfg| LastServerConfigDto {
+            vault_path: cfg.vault_root.to_string_lossy().into_owned(),
+            quota_gb: (cfg.default_quota_bytes / (1024 * 1024 * 1024)).max(1),
+            port: cfg.port,
+        }))
 }
 
 /// FFI DTO: 内置探针自检诊断报告。
@@ -3220,11 +3436,7 @@ pub async fn get_debug_log_path() -> Result<Option<String>> {
 
 /// 27. 运行内置全链路探针自检（校验数据目录可写性与主/备备份目录有效性，供 UI 与自动化脚本调用）。
 pub async fn run_self_diagnostics() -> Result<SelfDiagnosticsReport> {
-    let _probe = lanvault_core::ProbeGuard::start(
-        "rust.debug",
-        "debug.self_diagnostics",
-        None,
-    );
+    let _probe = lanvault_core::ProbeGuard::start("rust.debug", "debug.self_diagnostics", None);
     let state = runtime_state()?;
     let life = state.lifecycle.lock().await;
     let role_mode = life.role_mode.as_str().to_string();
@@ -3270,9 +3482,7 @@ pub async fn run_self_diagnostics() -> Result<SelfDiagnosticsReport> {
                 normalized_drive_key(fb),
             ) {
                 if p_drive == f_drive {
-                    issues.push(format!(
-                        "主备份目录与备用备份目录位于同一盘符: {p_drive}"
-                    ));
+                    issues.push(format!("主备份目录与备用备份目录位于同一盘符: {p_drive}"));
                 }
             }
         }
@@ -3303,7 +3513,11 @@ pub async fn run_self_diagnostics() -> Result<SelfDiagnosticsReport> {
         None,
         format!(
             "self-diagnostics {}: version={} mode={} rules={} peers={} server_running={} issues={}",
-            if report.checks_passed { "passed" } else { "failed" },
+            if report.checks_passed {
+                "passed"
+            } else {
+                "failed"
+            },
             report.version,
             report.role_mode,
             report.sync_rule_count,
@@ -3458,9 +3672,7 @@ fn is_usable_lan_ipv4(ip: Ipv4Addr) -> bool {
 
 fn is_rfc1918_ipv4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
-    o[0] == 192 && o[1] == 168
-        || o[0] == 10
-        || (o[0] == 172 && (16..=31).contains(&o[1]))
+    o[0] == 192 && o[1] == 168 || o[0] == 10 || (o[0] == 172 && (16..=31).contains(&o[1]))
 }
 
 fn detect_lan_ipv4() -> String {
@@ -3637,7 +3849,7 @@ fn extract_ip_from_qr_uri(uri: &str) -> Option<String> {
     None
 }
 
-async fn resolve_local_server_db_path(
+pub(crate) async fn resolve_local_server_db_path(
     state: &FfiRuntimeState,
 ) -> Result<Option<(PathBuf, bool, u16)>> {
     {
@@ -3652,9 +3864,12 @@ async fn resolve_local_server_db_path(
         }
     }
 
-    if let Some(raw) = state.client_db.get_setting(SETTING_LAST_SERVER_CONFIG_JSON)? {
-        let cfg: LastServerConfigDto = serde_json::from_str(&raw)
-            .context("invalid persisted last_server_config_json")?;
+    if let Some(raw) = state
+        .client_db
+        .get_setting(SETTING_LAST_SERVER_CONFIG_JSON)?
+    {
+        let cfg: LastServerConfigDto =
+            serde_json::from_str(&raw).context("invalid persisted last_server_config_json")?;
         return Ok(Some((
             PathBuf::from(cfg.vault_path).join("index.db"),
             false,
@@ -4008,11 +4223,7 @@ pub async fn get_system_overview() -> Result<SystemOverviewDto> {
     recent_activities.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     recent_activities.truncate(10);
 
-    let sync_paused = state
-        .client_db
-        .get_setting(SETTING_SYNC_PAUSED)?
-        .as_deref()
-        == Some("1");
+    let sync_paused = state.client_db.get_setting(SETTING_SYNC_PAUSED)?.as_deref() == Some("1");
     let bit_rot_auto_scrub = state
         .client_db
         .get_setting(SETTING_BIT_ROT_AUTO_SCRUB)?
@@ -4057,7 +4268,10 @@ pub async fn list_vaults() -> Result<Vec<VaultSummaryDto>> {
         let mut volumes_by_vault: HashMap<String, Vec<lanvault_core::VaultVolumeRecord>> =
             HashMap::new();
         for vol in db.list_all_volumes()? {
-            volumes_by_vault.entry(vol.vault_id.clone()).or_default().push(vol);
+            volumes_by_vault
+                .entry(vol.vault_id.clone())
+                .or_default()
+                .push(vol);
         }
         let mut result = Vec::with_capacity(vaults.len());
         for v in vaults {
@@ -4119,19 +4333,18 @@ pub async fn create_vault(
     let (db_path, server_running, app_state) = {
         let life = state.lifecycle.lock().await;
         match life.server_handle.as_ref() {
-            Some(handle) if !handle.task.is_finished() => (
-                Some(handle.db_path.clone()),
-                true,
-                handle.app_state.clone(),
-            ),
+            Some(handle) if !handle.task.is_finished() => {
+                (Some(handle.db_path.clone()), true, handle.app_state.clone())
+            }
             _ => (None, false, None),
         }
     };
     if !server_running {
         bail!("local server is not running; start local server first");
     }
-    let db_path = db_path
-        .ok_or_else(|| anyhow!("local server database is not initialized; start local server first"))?;
+    let db_path = db_path.ok_or_else(|| {
+        anyhow!("local server database is not initialized; start local server first")
+    })?;
 
     tokio::task::spawn_blocking(move || -> Result<VaultSummaryDto> {
         let (vault, volumes) = if let Some(app_state) = app_state {
@@ -4202,7 +4415,7 @@ pub async fn list_snapshots(vault_id: Option<String>) -> Result<Vec<SnapshotSumm
 pub async fn set_fast_backup_mode(enabled: bool) -> Result<bool> {
     let state = runtime_state()?;
     state.fast_backup_mode.store(enabled, Ordering::Relaxed);
-    if let Some((_, engine)) = state.sync_engine_cache.lock().await.as_ref() {
+    if let Some((_, _, engine)) = state.sync_engine_cache.lock().await.as_ref() {
         engine.set_fast_mode(enabled);
     }
     Ok(enabled)
@@ -4211,16 +4424,16 @@ pub async fn set_fast_backup_mode(enabled: bool) -> Result<bool> {
 pub async fn trigger_bit_rot_scrub() -> Result<ScrubResultDto> {
     let state = runtime_state()?;
     let local_db = resolve_local_server_db_path(&state).await?;
-    let local_available = local_db.as_ref().map(|(p, _, _)| p.exists()).unwrap_or(false);
+    let local_available = local_db
+        .as_ref()
+        .map(|(p, _, _)| p.exists())
+        .unwrap_or(false);
     if !local_available {
-        let peer = state
-            .active_peer
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("local server database is not initialized and no paired peer connected"))?;
+        let peer = state.active_peer.read().await.clone().ok_or_else(|| {
+            anyhow!("local server database is not initialized and no paired peer connected")
+        })?;
         let url = format!("{}/api/scrub/trigger", peer.endpoint_base_url);
-        let mut req = state.http_client.post(&url);
+        let mut req = peer.http.post(&url);
         if let Some(ref c) = peer.session_cookie {
             req = req.header("Cookie", format!("lv_session={c}"));
         }
@@ -4296,6 +4509,8 @@ pub async fn revoke_paired_peer(device_id: String) -> Result<RevokePeerResultDto
 
     let state = runtime_state()?;
     let client_revoked = state.client_db.delete_trusted_peer(&target_id)?;
+    let revoked_groups = state.client_db.revoke_peer_from_all_groups(&target_id)?;
+    let cleared_session = remove_peer_session(&state, &target_id).await?;
 
     let cleared_active = {
         let mut active_guard = state.active_peer.write().await;
@@ -4333,14 +4548,21 @@ pub async fn revoke_paired_peer(device_id: String) -> Result<RevokePeerResultDto
             let tid = target_id.clone();
             server_revoked = tokio::task::spawn_blocking(move || -> Result<bool> {
                 let server_db = Database::shared(&db_path)?;
-                Ok(server_db.delete_trusted_peer(&tid)?)
+                let peer_deleted = server_db.delete_trusted_peer(&tid)?;
+                let groups_revoked = server_db.revoke_peer_from_all_groups(&tid)?;
+                Ok(peer_deleted || groups_revoked > 0)
             })
             .await
             .context("revoke_paired_peer worker panicked")??;
         }
     }
 
-    if !client_revoked && !cleared_active && !server_revoked {
+    if !client_revoked
+        && !cleared_active
+        && !cleared_session
+        && !server_revoked
+        && revoked_groups == 0
+    {
         bail!("paired peer `{target_id}` not found");
     }
 
@@ -4457,6 +4679,7 @@ pub async fn push_clipboard_file(
     let transfer_client = lanvault_client::ResumableFileTransferClient::new(
         peer.endpoint_base_url.clone(),
         peer.session_cookie.clone(),
+        peer.fingerprint,
     )?;
     let send_res = transfer_client
         .send_file_resumable(Path::new(&trimmed_path))
@@ -4469,6 +4692,7 @@ pub async fn push_clipboard_file(
         let retry_client = lanvault_client::ResumableFileTransferClient::new(
             renewed.endpoint_base_url,
             renewed.session_cookie,
+            renewed.fingerprint,
         )?;
         retry_client
             .send_file_resumable(Path::new(&trimmed_path))
@@ -4476,7 +4700,10 @@ pub async fn push_clipboard_file(
     } else {
         send_res?;
     }
-    let file_size = tokio::fs::metadata(&trimmed_path).await.map(|m| m.len()).unwrap_or(0);
+    let file_size = tokio::fs::metadata(&trimmed_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
     let file_name = Path::new(&trimmed_path)
         .file_name()
         .and_then(|n| n.to_str())
@@ -4502,10 +4729,7 @@ pub async fn push_clipboard_file(
         "rust.transfer",
         Some("clipboard.push_file"),
         None,
-        format!(
-            "pushed resumable file {} to {}",
-            trimmed_path, target_label
-        ),
+        format!("pushed resumable file {} to {}", trimmed_path, target_label),
         None,
     );
 
@@ -4522,7 +4746,6 @@ pub async fn push_clipboard_file(
     })
 }
 
-
 /// FFI DTO: 快照文件恢复结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreSnapshotResultDto {
@@ -4530,37 +4753,6 @@ pub struct RestoreSnapshotResultDto {
     pub restored_chunks: u64,
     pub restored_bytes: u64,
     pub output_path: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RestoreManifestFile {
-    rel_path: String,
-    chunk_hashes_hex: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RestoreSnapshotManifest {
-    files: Vec<RestoreManifestFile>,
-}
-
-fn sanitize_restore_rel_path(raw: &str) -> Result<PathBuf> {
-    use std::path::Component;
-    let p = Path::new(raw);
-    if raw.trim().is_empty() || raw.contains('\0') || p.is_absolute() {
-        bail!("invalid snapshot manifest path `{raw}`");
-    }
-    let mut clean = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::Normal(seg) => clean.push(seg),
-            Component::CurDir => {}
-            _ => bail!("unsafe snapshot manifest path `{raw}`"),
-        }
-    }
-    if clean.as_os_str().is_empty() {
-        bail!("empty snapshot manifest path");
-    }
-    Ok(clean)
 }
 
 /// 37. 从本地存储池解密、校验并还原指定快照数据块至目标目录（优先按 manifest 重建原始目录树）。
@@ -4572,7 +4764,9 @@ pub async fn restore_snapshot(
     let target_trim = target_dir.trim().to_string();
     if snap_id.is_empty()
         || snap_id.len() > 128
-        || !snap_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || !snap_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         || target_trim.is_empty()
     {
         bail!("invalid snapshot_id or empty target_dir");
@@ -4608,39 +4802,49 @@ pub async fn restore_snapshot(
             let chunk_key = key_local.derive_vault_chunk_key(&snap.vault_id);
 
             let out_dir = PathBuf::from(&target_local);
-            std::fs::create_dir_all(&out_dir)
-                .with_context(|| format!("failed to create restore directory {}", out_dir.display()))?;
+            std::fs::create_dir_all(&out_dir).with_context(|| {
+                format!("failed to create restore directory {}", out_dir.display())
+            })?;
 
-            let mut loaded_manifest: Option<RestoreSnapshotManifest> = None;
-            if let Ok(roots) = vault_store.manifest_backup_roots(&snap.vault_id) {
-                for root in roots {
-                    let candidate = root.join("manifests").join(format!("{}.json", snap.snapshot_id));
-                    if candidate.is_file() {
-                        let bytes = std::fs::read(&candidate)?;
-                        loaded_manifest = Some(serde_json::from_slice::<RestoreSnapshotManifest>(&bytes)?);
-                        break;
-                    }
-                }
+            let loaded_manifest = load_snapshot_manifest(&vault_store, &snap)?;
+            if loaded_manifest.is_none() && !snap.rule_id.is_empty() {
+                bail!("snapshot manifest is missing or failed verification");
             }
 
             let mut restored_chunks = 0u64;
             let mut restored_bytes = 0u64;
-            let output_path_str: String;
+            let restore_name = format!(
+                "restore_{}_{:016x}",
+                snap.snapshot_id,
+                rand::random::<u64>()
+            );
+            let restore_root = out_dir.join(&restore_name);
+            let staging_root = out_dir.join(format!(".{restore_name}.partial"));
+            std::fs::create_dir(&staging_root)?;
 
-            if let Some(manifest) = loaded_manifest {
-                let restore_root = out_dir.join(format!("restore_{}", snap.snapshot_id));
-                std::fs::create_dir_all(&restore_root)?;
-                for file in &manifest.files {
-                    let rel = sanitize_restore_rel_path(&file.rel_path)?;
-                    let dest_path = restore_root.join(rel);
-                    if let Some(parent) = dest_path.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    let part_path = PathBuf::from(format!("{}.lanvault.part", dest_path.display()));
-                    {
-                        let mut dest_file = std::fs::File::create(&part_path)?;
+            let staged = (|| -> Result<PathBuf> {
+                let output_path = if let Some(manifest) = loaded_manifest {
+                    for file in &manifest.files {
+                        let rel = validate_relative_snapshot_path(&file.rel_path)?;
+                        #[cfg(windows)]
+                        if file.rel_path.contains(':') {
+                            bail!("snapshot file path contains a Windows stream separator");
+                        }
+                        let dest_path = staging_root.join(rel);
+                        if let Some(parent) = dest_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        let mut dest_file =
+                            std::fs::File::create_new(&dest_path).with_context(|| {
+                                format!(
+                                    "failed to create restored file {}",
+                                    dest_path.display()
+                                )
+                            })?;
+                        let file_start = restored_bytes;
                         for hash_hex in &file.chunk_hashes_hex {
-                            let hash_bytes = hex::decode(hash_hex)?;
+                            let hash_bytes = hex::decode(hash_hex)
+                                .with_context(|| format!("invalid chunk hash hex `{hash_hex}`"))?;
                             let hash: [u8; 32] = hash_bytes
                                 .try_into()
                                 .map_err(|_| anyhow!("invalid chunk hash length"))?;
@@ -4660,17 +4864,23 @@ pub async fn restore_snapshot(
                             restored_chunks += 1;
                             restored_bytes += plain.len() as u64;
                         }
+                        if restored_bytes - file_start != file.size {
+                            bail!("restored file size does not match the snapshot manifest");
+                        }
                         dest_file.sync_all()?;
                     }
-                    std::fs::rename(&part_path, &dest_path)?;
-                }
-                output_path_str = restore_root.to_string_lossy().into_owned();
-            } else {
-                let hashes = db.list_snapshot_chunks(&snap.snapshot_id)?;
-                let out_file_path = out_dir.join(format!("restore_{}.bin", snap.snapshot_id));
-                let part_path = PathBuf::from(format!("{}.lanvault.part", out_file_path.display()));
-                {
-                    let mut out_file = std::fs::File::create(&part_path)?;
+                    staging_root.clone()
+                } else {
+                    let hashes = db.list_snapshot_chunks(&snap.snapshot_id)?;
+                    let filename = format!("restore_{}.bin", snap.snapshot_id);
+                    let out_file_path = staging_root.join(&filename);
+                    let mut out_file = std::fs::File::create_new(&out_file_path)
+                        .with_context(|| {
+                            format!(
+                                "failed to create restore output {}",
+                                out_file_path.display()
+                            )
+                        })?;
                     for hash in &hashes {
                         let stored_bytes = vault_store.get_chunk(&snap.vault_id, hash)?;
                         let comp = lanvault_core::ChunkCompression::from_db_tag(
@@ -4689,133 +4899,193 @@ pub async fn restore_snapshot(
                         restored_bytes += plain.len() as u64;
                     }
                     out_file.sync_all()?;
+                    out_file_path
+                };
+                std::fs::rename(&staging_root, &restore_root)?;
+                if output_path == staging_root {
+                    Ok(restore_root)
+                } else {
+                    Ok(restore_root.join(
+                        output_path
+                            .file_name()
+                            .ok_or_else(|| anyhow!("restore output has no filename"))?,
+                    ))
                 }
-                std::fs::rename(&part_path, &out_file_path)?;
-                output_path_str = out_file_path.to_string_lossy().into_owned();
+            })();
+            if staged.is_err() {
+                if let Err(err) = std::fs::remove_dir_all(&staging_root) {
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        warn!(%err, "failed to clean up interrupted restore");
+                    }
+                }
             }
+            let output_path = staged?;
 
             Ok(RestoreSnapshotResultDto {
                 snapshot_id: snap.snapshot_id,
                 restored_chunks,
                 restored_bytes,
-                output_path: output_path_str,
+                output_path: output_path.to_string_lossy().into_owned(),
             })
         })
         .await
         .context("snapshot restore worker panicked")??
     } else {
         // 远端 HTTP 回传恢复：纯客户端（如手机）从对端 NAS 拉取 manifest 与块并在本地校验解密落盘
-        let peer = state
-            .active_peer
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("local snapshot not found and no paired peer connected for remote restore"))?;
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
+        let peer = state.active_peer.read().await.clone().ok_or_else(|| {
+            anyhow!("local snapshot not found and no paired peer connected for remote restore")
+        })?;
+        let http = peer_http_builder(peer.fingerprint)?
             .read_timeout(Duration::from_secs(30))
             .build()?;
-        let manifest_url = format!("{}/api/snapshots/{}/manifest", peer.endpoint_base_url, snap_id);
+        let manifest_url = format!(
+            "{}/api/snapshots/{}/manifest",
+            peer.endpoint_base_url, snap_id
+        );
         let mut req = http.get(&manifest_url);
         if let Some(ref c) = peer.session_cookie {
             req = req.header("Cookie", format!("lv_session={c}"));
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
-            bail!("failed to fetch remote snapshot manifest: HTTP {}", resp.status());
+            bail!(
+                "failed to fetch remote snapshot manifest: HTTP {}",
+                resp.status()
+            );
         }
         #[derive(Deserialize)]
         struct RemoteManifestResp {
             vault_id: String,
             snapshot_id: String,
-            manifest: RestoreSnapshotManifest,
+            manifest: SnapshotManifest,
         }
         let remote: RemoteManifestResp = resp.json().await?;
         let chunk_key = vault_key.derive_vault_chunk_key(&remote.vault_id);
         if remote.snapshot_id.is_empty()
             || remote.snapshot_id.len() > 128
-            || !remote.snapshot_id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            || !remote
+                .snapshot_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         {
             bail!("invalid remote snapshot_id");
         }
-        let restore_root = PathBuf::from(&target_trim).join(format!("restore_{}", remote.snapshot_id));
-        tokio::fs::create_dir_all(&restore_root).await?;
-
-        let mut restored_chunks = 0u64;
-        let mut restored_bytes = 0u64;
-        for file in &remote.manifest.files {
-            let rel = sanitize_restore_rel_path(&file.rel_path)?;
-            let dest_path = restore_root.join(rel);
-            if let Some(parent) = dest_path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            let part_path = PathBuf::from(format!("{}.lanvault.part", dest_path.display()));
-            let mut out_file = std::fs::File::create(&part_path)?;
-            for hash_hex in &file.chunk_hashes_hex {
-                let hash_bytes = hex::decode(hash_hex)?;
-                let hash: [u8; 32] = hash_bytes
-                    .try_into()
-                    .map_err(|_| anyhow!("invalid chunk hash length"))?;
-                let chunk_url = format!(
-                    "{}/api/vaults/{}/chunks/{}",
-                    peer.endpoint_base_url, remote.vault_id, hash_hex
-                );
-                let mut cresp_opt = None;
-                for attempt in 1..=4u32 {
-                    let mut creq = http.get(&chunk_url);
-                    if let Some(ref c) = peer.session_cookie {
-                        creq = creq.header("Cookie", format!("lv_session={c}"));
-                    }
-                    match creq.send().await {
-                        Ok(r) if r.status().is_success() => {
-                            cresp_opt = Some(r);
-                            break;
-                        }
-                        Ok(r) if matches!(r.status().as_u16(), 408 | 429 | 500 | 502 | 503 | 504) && attempt < 4 => {
-                            tokio::time::sleep(Duration::from_millis(400u64 << (attempt - 1))).await;
-                        }
-                        Ok(r) => bail!("failed to download chunk {}: HTTP {}", hash_hex, r.status()),
-                        Err(_) if attempt < 4 => {
-                            tokio::time::sleep(Duration::from_millis(400u64 << (attempt - 1))).await;
-                        }
-                        Err(err) => return Err(err.into()),
-                    }
+        let restore_name = format!(
+            "restore_{}_{:016x}",
+            remote.snapshot_id,
+            rand::random::<u64>()
+        );
+        let restore_root = PathBuf::from(&target_trim).join(&restore_name);
+        let staging_root = PathBuf::from(&target_trim).join(format!(".{restore_name}.partial"));
+        let staged = async {
+            tokio::fs::create_dir(&staging_root).await?;
+            let mut restored_chunks = 0u64;
+            let mut restored_bytes = 0u64;
+            for file in &remote.manifest.files {
+                let rel = validate_relative_snapshot_path(&file.rel_path)?;
+                #[cfg(windows)]
+                if file.rel_path.contains(':') {
+                    bail!("snapshot file path contains a Windows stream separator");
                 }
-                let cresp = cresp_opt.ok_or_else(|| anyhow!("failed to download chunk {hash_hex} after retries"))?;
-                let enc_hdr = cresp
-                    .headers()
-                    .get("x-lanvault-encoding")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("xchacha20poly1305+zstd")
-                    .to_string();
-                let comp = if enc_hdr.ends_with("+raw") {
-                    lanvault_core::ChunkCompression::Raw
-                } else {
-                    lanvault_core::ChunkCompression::Zstd
-                };
-                let stored = cresp.bytes().await?;
-                let plain = lanvault_core::unpack_chunk_with_compression(
-                    &stored,
-                    &hash,
-                    Some(&chunk_key),
-                    remote.vault_id.as_bytes(),
-                    CHUNK_MAX_SIZE as usize,
-                    comp,
-                )?;
-                std::io::Write::write_all(&mut out_file, &plain)?;
-                restored_chunks += 1;
-                restored_bytes += plain.len() as u64;
+                let dest_path = staging_root.join(rel);
+                if let Some(parent) = dest_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
+                }
+                let mut out_file = std::fs::File::create_new(&dest_path)?;
+                let file_start = restored_bytes;
+                for hash_hex in &file.chunk_hashes_hex {
+                    let hash_bytes = hex::decode(hash_hex)?;
+                    let hash: [u8; 32] = hash_bytes
+                        .try_into()
+                        .map_err(|_| anyhow!("invalid chunk hash length"))?;
+                    let chunk_url = format!(
+                        "{}/api/vaults/{}/chunks/{}",
+                        peer.endpoint_base_url, remote.vault_id, hash_hex
+                    );
+                    let mut cresp_opt = None;
+                    for attempt in 1..=4u32 {
+                        let mut creq = http.get(&chunk_url);
+                        if let Some(ref cookie) = peer.session_cookie {
+                            creq = creq.header("Cookie", format!("lv_session={cookie}"));
+                        }
+                        match creq.send().await {
+                            Ok(response) if response.status().is_success() => {
+                                cresp_opt = Some(response);
+                                break;
+                            }
+                            Ok(response)
+                                if matches!(
+                                    response.status().as_u16(),
+                                    408 | 429 | 500 | 502 | 503 | 504
+                                ) && attempt < 4 =>
+                            {
+                                tokio::time::sleep(Duration::from_millis(
+                                    400u64 << (attempt - 1),
+                                ))
+                                .await;
+                            }
+                            Ok(response) => bail!(
+                                "failed to download chunk {}: HTTP {}",
+                                hash_hex,
+                                response.status()
+                            ),
+                            Err(_) if attempt < 4 => {
+                                tokio::time::sleep(Duration::from_millis(
+                                    400u64 << (attempt - 1),
+                                ))
+                                .await;
+                            }
+                            Err(err) => return Err(err.into()),
+                        }
+                    }
+                    let response = cresp_opt.ok_or_else(|| {
+                        anyhow!("failed to download chunk {hash_hex} after retries")
+                    })?;
+                    let enc_hdr = response
+                        .headers()
+                        .get("x-lanvault-encoding")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("xchacha20poly1305+zstd");
+                    let comp = if enc_hdr.ends_with("+raw") {
+                        lanvault_core::ChunkCompression::Raw
+                    } else {
+                        lanvault_core::ChunkCompression::Zstd
+                    };
+                    let stored = response.bytes().await?;
+                    let plain = lanvault_core::unpack_chunk_with_compression(
+                        &stored,
+                        &hash,
+                        Some(&chunk_key),
+                        remote.vault_id.as_bytes(),
+                        CHUNK_MAX_SIZE as usize,
+                        comp,
+                    )?;
+                    std::io::Write::write_all(&mut out_file, &plain)?;
+                    restored_chunks += 1;
+                    restored_bytes += plain.len() as u64;
+                }
+                if restored_bytes - file_start != file.size {
+                    bail!("restored file size does not match the snapshot manifest");
+                }
+                out_file.sync_all()?;
             }
-            out_file.sync_all()?;
-            drop(out_file);
-            std::fs::rename(&part_path, &dest_path)?;
+            tokio::fs::rename(&staging_root, &restore_root).await?;
+            Ok::<_, anyhow::Error>(RestoreSnapshotResultDto {
+                snapshot_id: remote.snapshot_id,
+                restored_chunks,
+                restored_bytes,
+                output_path: restore_root.to_string_lossy().into_owned(),
+            })
         }
-        RestoreSnapshotResultDto {
-            snapshot_id: remote.snapshot_id,
-            restored_chunks,
-            restored_bytes,
-            output_path: restore_root.to_string_lossy().into_owned(),
+        .await;
+        if staged.is_err() {
+            if let Err(err) = tokio::fs::remove_dir_all(&staging_root).await {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    warn!(%err, "failed to clean up interrupted remote restore");
+                }
+            }
         }
+        staged?
     };
 
     lanvault_core::record_event_always(
@@ -4861,11 +5131,7 @@ pub async fn set_sync_paused(paused: bool) -> Result<bool> {
 /// 40. 查询当前是否处于全局暂停备份状态。
 pub async fn get_sync_paused() -> Result<bool> {
     let state = runtime_state()?;
-    Ok(state
-        .client_db
-        .get_setting(SETTING_SYNC_PAUSED)?
-        .as_deref()
-        == Some("1"))
+    Ok(state.client_db.get_setting(SETTING_SYNC_PAUSED)?.as_deref() == Some("1"))
 }
 
 /// 41. 设置是否启用 Bit-Rot 定时自动巡检。

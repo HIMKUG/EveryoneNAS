@@ -21,6 +21,8 @@
 ### 3.1 REST API 路由与载荷（挂载于 `lanvault-server`）
 所有需鉴权接口校验 `lv_session` Cookie（`HttpOnly; SameSite=Strict; Path=/`），未认证返回 `401 Unauthorized`。
 
+局域网使用同一端口上的 TLS 1.3 HTTPS/WSS，服务启动时从本机设备身份生成自签证书。原生客户端使用对端 Ed25519 公钥指纹验证 TLS，首次配对需在对端界面复制指纹，现有可信设备直接使用已保存的公钥。配对链接的 `fp` 参数为 32 位十六进制指纹。局域网会话 Cookie 设置 `Secure`。本机回环仍提供管理 HTTP/WS，浏览器从局域网直连时需自行验证自签证书。
+
 1. `POST /api/auth/login`（公开，防爆破）
    - Request: `{ "password": string }`
    - 200 OK: `Set-Cookie: lv_session=<64-hex>; HttpOnly; SameSite=Strict; Path=/` + `{ "authenticated": true, "expires_in_secs": 86400 }`
@@ -116,3 +118,52 @@ Windows 与 Android 双端共享同一套 Rust FFI 核心（`lanvault-ffi`），
 - **Windows Release（MSVC AVX2 + LTCG 全程序优化）**：
   - CMake（`flutter_app/windows/CMakeLists.txt`）：Release 编译器启用 `/O2 /Ob2 /Oi /Ot /GL /arch:AVX2 /MP16`，链接器启用 `/LTCG /OPT:REF /OPT:ICF`，并自动定位拷贝 `lanvault_ffi.dll`（优先 `target/x86_64-pc-windows-msvc/release/lanvault_ffi.dll`，次选 `target/release/lanvault_ffi.dll`）至产物目录。
   - 一键构建：`scripts/build_windows_release.ps1`（支持 `-SkipWinSvc` 开关），以 `cargo build --release -p lanvault-ffi -p lanvault-win-svc --target x86_64-pc-windows-msvc -j 16` 编译原生组件，再执行 `flutter build windows --release --obfuscate --split-debug-info=build/symbols/windows`，最终将主程序、`lanvault_ffi.dll` 与可选 `lanvault-win-svc.exe` 统一归档至 `dist/windows-release/`。
+
+
+---
+
+## 8. v2 架构扩展契约（设备组、差异备份、镜像同步与非阻塞消息出站）
+
+### 8.1 协议能力协商与向后兼容边界
+- **`GET /api/capabilities`**（Cookie 鉴权）：返回 `{ "protocol_version": 2, "device_groups": true, "incremental_catalog": true, "mirror_sync": true, "message_idempotency": true }`。
+- 旧客户端（v1）可继续使用原有 `/api/vaults/{vault_id}/snapshots`、`GET /api/snapshots`、`GET /api/snapshots/{snapshot_id}/file` 与 `POST /api/clipboard`。
+- 未协商确认 `mirror_sync: true` 的目标节点禁止启用镜像同步；旧规则自动迁移仅生成 `diff_backup`（无法唯一解析 `target_vault_id = "default"` 时标记 `needs_binding_confirm = 1` 且 `enabled = 0`，不从全局 `active_peer` 猜测）。
+
+### 8.2 v2 REST API 路由（挂载于 `lanvault-server` 受保护路由）
+1. **设备组与成员**：
+   - `GET /api/groups`、`POST /api/groups`（admin）、`PATCH /api/groups/{group_id}`（admin）、`DELETE /api/groups/{group_id}`（admin，删除前停用关联规则并保留历史数据与恢复入口）
+   - `GET /api/groups/{group_id}/members`、`POST /api/groups/{group_id}/members`（admin）、`DELETE /api/groups/{group_id}/members/{device_id}`（admin，立即停用该成员绑定并作废活跃同步租约、递增 `group.revision`）
+   - `DELETE /api/peers/{device_id}` 同步调用 `revoke_peer_from_all_groups`，彻底吊销组内权限与在途租约。
+2. **组规则、目标绑定与本机镜像根登记**：
+   - `GET /api/groups/{group_id}/rules`、`POST /api/groups/{group_id}/rules`（admin）、`PATCH /api/rules/{rule_id}`（admin）、`DELETE /api/rules/{rule_id}`（admin）
+   - `GET /api/rules/{rule_id}/bindings`、`POST /api/rules/{rule_id}/bindings`（admin）、`DELETE /api/rules/{rule_id}/bindings/{binding_id}`（admin）
+   - `GET /api/mirror-roots`、`POST /api/mirror-roots/register`（admin 本机主动登记）、`DELETE /api/mirror-roots/{root_id}`（admin）
+   - 规则与绑定变更前强制运行 `detect_rule_topology_conflicts`（拦截同机路径重叠、同机同根、相互镜像与有向环，冲突返回 `409 Conflict`）。
+3. **增量目录、分块批量检查与版本恢复**：
+   - `POST /api/vaults/{vault_id}/chunks/check`：批量检查分块存在与校验状态（单次上限 4096），返回 `{ "present": [...], "missing": [...] }`。
+   - `POST /api/bindings/{binding_id}/leases`：申请或续期 `(rule_id, binding_id)` 单调栅栏租约（校验组成员资格与 `group_revision`）。
+   - `POST /api/bindings/{binding_id}/catalog/commit`：幂等增量提交（携带 `operation_id`, `group_revision`, `rule_revision`, `fence_token`, `base_revision`, `source_gen`, `ops`）；先在写锁外校验全部分块落盘，再在 `VaultStore::with_write_lock` 内单事务提交并更新 `catalog_chunk_refs` 与 `chunks.ref_count`；同 `operation_id` 相同载荷幂等重放，不同载荷返回 `409 Conflict`。
+   - `GET /api/bindings/{binding_id}/catalog/operations/{operation_id}`：丢响应后查询已提交结果。
+   - `GET /api/bindings/{binding_id}/catalog?after_path_key=...&limit=...&source_deleted_only=...`：游标分页目录查询（主键 `(binding_id, path_key)`，源已删除筛选走部分索引 `idx_catalog_source_deleted`）。
+   - `GET /api/bindings/{binding_id}/versions?path_key=...&after_archived_at=...&after_version_id=...&limit=...`：游标分页版本历史查询（索引 `(binding_id, path_key, archived_at DESC, version_id DESC)`）。
+   - `GET /api/bindings/{binding_id}/versions/{version_id}/download`：复用 `u32be-aead-v1` 分块帧流式恢复历史版本。
+4. **幂等消息推送与历史**：
+   - `POST /api/clipboard`：兼容 v1 字段（`delivered_to`, `timestamp`），新增可选 `client_msg_id` 与 `target_device_ids`，经 `message_dedup_receipts` 持久去重并返回 `{ "client_msg_id", "delivered_to", "accepted_to", "server_ack_at", "timestamp", "targets": [{ "target_device_id", "status", "error_code", "error_message" }] }`。
+   - `GET /api/clipboard/history?limit=...`：返回最近消息与出站状态记录。
+
+### 8.3 v2 WebSocket 事件扩展（`GET /ws`）
+- `clipboard_received`：新增可选字段 `client_msg_id`。
+- `clipboard_status`：`{ "client_msg_id": string, "from_device_id": string, "targets": [...], "timestamp": number }`。
+- `group_sync_update`：`{ "group_id": string, "rule_id": string, "binding_id": string, "status": string, "applied_revision": number, "timestamp": number }`。
+
+### 8.4 v2 C-ABI 指令契约（`lanvault_ffi_invoke_json`）
+保留原有全部 v1 指令与 6 个 Android JNI 导出，新增 24 项 v2 JSON 指令：
+- 设备组：`list_device_groups`、`create_device_group`、`rename_device_group`、`delete_device_group`、`add_group_member`、`remove_group_member`
+- 规则与镜像根：`list_group_rules`、`upsert_group_rule`、`delete_group_rule`、`toggle_group_rule`、`upsert_rule_target_binding`、`disable_rule_target_binding`、`register_mirror_root`、`list_mirror_roots`、`revoke_mirror_root`、`preview_group_rule`、`trigger_group_rule_sync`
+- 目录与版本恢复：`list_binding_catalog`、`list_binding_versions`、`restore_catalog_version`
+- 非阻塞消息出站：`enqueue_message_text`、`enqueue_message_file`、`retry_outbox_message`、`list_outbox_messages`（入队指令仅执行本地校验、文件暂存与 SQLite 写入并唤醒后台有界调度器，不在 FFI 工作 isolate 中等待网络往返）。
+
+### 8.5 镜像同步范围、保留期与统一 GC 引用保护
+- 同步范围：规范化相对路径、普通文件内容与空目录，按目标文件系统精度比较并保留可表达的修改时间；拒绝跟随符号链接/junction/reparse point 及逃逸路径，硬链接采用原子替换生成独立实体，其他特殊文件列为不支持。
+- 保留策略：镜像归档默认保留 30 天（UTC 时间戳 `expires_at`），规则变更仅影响新创建的归档；差异备份旧版本与 `source_deleted = 1` 条目 `expires_at = NULL`，不参与镜像 N 天回收。
+- 统一引用保护：`chunks.ref_count` 同时由 `snapshot_chunks`（v1）与 `catalog_chunk_refs`（v2）事务维护，`delete_chunks_batch` 双重校验两者皆无引用后才删除物理分块。

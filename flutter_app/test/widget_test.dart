@@ -1,15 +1,21 @@
 import 'dart:async';
+import 'dart:ui' show PointerDeviceKind;
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 
 import 'package:lanvault_app/bridge/lanvault_bridge.dart';
 import 'package:lanvault_app/bridge/system_env_helper.dart';
+import 'package:lanvault_app/bridge/window_chrome.dart';
 import 'package:lanvault_app/features/backup/backup_screen.dart';
+import 'package:lanvault_app/features/settings/settings_screen.dart';
 import 'package:lanvault_app/features/vault/vault_screen.dart';
 import 'package:lanvault_app/main.dart';
 import 'package:lanvault_app/theme/neu_theme.dart';
 import 'package:lanvault_app/theme/neu_toast.dart';
+import 'package:lanvault_app/widgets/nav_rail_item.dart';
+import 'package:lanvault_app/widgets/windows_title_bar.dart';
 
 class _FakeLanVaultFfi implements LanVaultRustFfi {
   _FakeLanVaultFfi({
@@ -187,7 +193,8 @@ class _FakeLanVaultFfi implements LanVaultRustFfi {
       );
 
   @override
-  Future<void> importVaultKeyBackup(String passphrase, String backupJson) async {}
+  Future<void> importVaultKeyBackup(
+      String passphrase, String backupJson) async {}
 
   @override
   Future<String> pairWithPin({
@@ -324,6 +331,240 @@ class _FakeLanVaultFfi implements LanVaultRustFfi {
     serverRunning = enabled;
     return enabled;
   }
+
+  @override
+  Future<List<DeviceGroupViewModel>> listDeviceGroups() async =>
+      const <DeviceGroupViewModel>[];
+
+  @override
+  Future<DeviceGroupModel> createDeviceGroup(String name) async =>
+      DeviceGroupModel(
+        groupId: 'grp-1',
+        name: name,
+        coordinatorDeviceId: 'local',
+        revision: 1,
+        createdAt: 0,
+        updatedAt: 0,
+      );
+
+  @override
+  Future<DeviceGroupModel> renameDeviceGroup({
+    required String groupId,
+    required String name,
+  }) async =>
+      DeviceGroupModel(
+        groupId: groupId,
+        name: name,
+        coordinatorDeviceId: 'local',
+        revision: 2,
+        createdAt: 0,
+        updatedAt: 0,
+      );
+
+  @override
+  Future<void> deleteDeviceGroup(String groupId) async {}
+
+  @override
+  Future<void> addGroupMember({
+    required String groupId,
+    required String deviceId,
+    String? role,
+  }) async {}
+
+  @override
+  Future<void> removeGroupMember({
+    required String groupId,
+    required String deviceId,
+  }) async {}
+
+  @override
+  Future<List<GroupRuleViewModel>> listGroupRules({String? groupId}) async =>
+      const <GroupRuleViewModel>[];
+
+  @override
+  Future<GroupSyncRuleModel> upsertGroupRule({
+    String? ruleId,
+    required String groupId,
+    required String name,
+    required String mode,
+    String? sourceDeviceId,
+    required String sourceRoot,
+    String? sourceRootId,
+    int archiveRetentionDays = 30,
+    bool wifiOnly = true,
+    String? allowedSsids,
+    bool requireCharging = false,
+    int maxKbps = 0,
+    int scheduleIntervalSecs = 0,
+    bool enabled = true,
+  }) async =>
+      GroupSyncRuleModel(
+        ruleId: ruleId ?? 'grule-1',
+        groupId: groupId,
+        name: name,
+        mode: mode,
+        sourceDeviceId: sourceDeviceId ?? 'local',
+        sourceRoot: sourceRoot,
+        sourceRootId: sourceRootId,
+        archiveRetentionDays: archiveRetentionDays,
+        wifiOnly: wifiOnly,
+        allowedSsids: allowedSsids,
+        requireCharging: requireCharging,
+        maxKbps: maxKbps,
+        scheduleIntervalSecs: scheduleIntervalSecs,
+        enabled: enabled,
+        revision: 1,
+        groupRevision: 1,
+        needsBindingConfirm: false,
+        createdAt: 0,
+        updatedAt: 0,
+      );
+
+  @override
+  Future<void> deleteGroupRule(String ruleId) async {}
+
+  @override
+  Future<void> toggleGroupRule({
+    required String ruleId,
+    required bool enabled,
+  }) async {}
+
+  @override
+  Future<RuleTargetBindingModel> upsertRuleTargetBinding({
+    String? bindingId,
+    required String ruleId,
+    required String targetDeviceId,
+    String? targetVaultId,
+    String? mirrorRootId,
+    String? targetRoot,
+    bool enabled = true,
+  }) async =>
+      RuleTargetBindingModel(
+        bindingId: bindingId ?? 'bind-1',
+        ruleId: ruleId,
+        groupId: 'grp-1',
+        targetDeviceId: targetDeviceId,
+        targetVaultId: targetVaultId,
+        mirrorRootId: mirrorRootId,
+        targetRoot: targetRoot,
+        enabled: enabled,
+        appliedRevision: 0,
+        lastSourceGen: 0,
+        status: 'pending',
+        needsBindingConfirm: false,
+        createdAt: 0,
+        updatedAt: 0,
+      );
+
+  @override
+  Future<void> disableRuleTargetBinding(String bindingId) async {}
+
+  @override
+  Future<MirrorRootModel> registerMirrorRoot({
+    required String canonicalPath,
+    String displayName = '',
+  }) async =>
+      MirrorRootModel(
+        mirrorRootId: 'mroot-1',
+        deviceId: 'local',
+        canonicalRoot: canonicalPath,
+        label: displayName.isEmpty ? 'Mirror' : displayName,
+        createdAt: 0,
+      );
+
+  @override
+  Future<List<MirrorRootModel>> listMirrorRoots() async =>
+      const <MirrorRootModel>[];
+
+  @override
+  Future<void> revokeMirrorRoot(String rootId) async {}
+
+  @override
+  Future<List<MirrorPreviewModel>> previewGroupRule(String ruleId) async =>
+      const <MirrorPreviewModel>[];
+
+  @override
+  Future<GroupRuleSyncOutcomeModel> triggerGroupRuleSync(String ruleId) async =>
+      GroupRuleSyncOutcomeModel(
+        ruleId: ruleId,
+        sourceComplete: true,
+        scannedEntries: 0,
+        blockedReasons: const <String>[],
+        volatilePaths: const <String>[],
+        bindings: const <BindingSyncOutcomeModel>[],
+      );
+
+  @override
+  Future<List<CatalogEntryModel>> listBindingCatalog({
+    required String bindingId,
+    String? afterPathKey,
+    int? limit,
+    bool sourceDeletedOnly = false,
+  }) async =>
+      const <CatalogEntryModel>[];
+
+  @override
+  Future<List<CatalogVersionModel>> listBindingVersions({
+    required String bindingId,
+    String? pathKey,
+    int? afterArchivedAt,
+    String? afterVersionId,
+    int? limit,
+  }) async =>
+      const <CatalogVersionModel>[];
+
+  @override
+  Future<RestoreCatalogVersionResultModel> restoreCatalogVersion({
+    required String bindingId,
+    required String versionId,
+    required String targetDir,
+  }) =>
+      throw UnimplementedError();
+
+  @override
+  Future<OutboxMessageViewModel> enqueueMessageText({
+    required List<String> targetDeviceIds,
+    required String text,
+  }) async =>
+      OutboxMessageViewModel(
+        clientMsgId: 'msg-1',
+        localSeq: 1,
+        sessionKey: targetDeviceIds.join(','),
+        kind: 'text',
+        title: text,
+        content: text,
+        sizeBytes: text.length,
+        overallStatus: 'sending',
+        createdAt: 0,
+        updatedAt: 0,
+        targets: const <OutboxTargetStatusModel>[],
+      );
+
+  @override
+  Future<OutboxMessageViewModel> enqueueMessageFile({
+    required List<String> targetDeviceIds,
+    required String filePath,
+  }) async =>
+      OutboxMessageViewModel(
+        clientMsgId: 'msg-2',
+        localSeq: 2,
+        sessionKey: targetDeviceIds.join(','),
+        kind: 'file',
+        title: filePath,
+        filePath: filePath,
+        sizeBytes: 0,
+        overallStatus: 'sending',
+        createdAt: 0,
+        updatedAt: 0,
+        targets: const <OutboxTargetStatusModel>[],
+      );
+
+  @override
+  Future<int> retryOutboxMessage(String clientMsgId) async => 1;
+
+  @override
+  Future<List<OutboxMessageViewModel>> listOutboxMessages({int? limit}) async =>
+      const <OutboxMessageViewModel>[];
 }
 
 void main() {
@@ -444,6 +685,177 @@ void main() {
     expect(docFinder, findsOneWidget);
     final docSize = tester.getSize(docFinder);
     expect(docSize.width, greaterThan(50));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Windows shell aligns caption controls and clears previous hover',
+      (tester) async {
+    tester.view.physicalSize = const Size(1280, 720);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    const channel = MethodChannel('com.lanvault.app/window');
+    final messenger = tester.binding.defaultBinaryMessenger;
+    Rect? captionExclusion;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'isMaximized') return false;
+      if (call.method == 'setCaptionMetrics') {
+        final arguments = call.arguments as Map<Object?, Object?>;
+        final exclusions = (arguments['exclusions'] as List<Object?>)
+            .whereType<Map<Object?, Object?>>()
+            .map(
+              (exclusion) => Rect.fromLTRB(
+                exclusion['left'] as double,
+                exclusion['top'] as double,
+                exclusion['right'] as double,
+                exclusion['bottom'] as double,
+              ),
+            )
+            .toList();
+        captionExclusion = exclusions.reduce(
+          (widest, candidate) =>
+              candidate.right > widest.right ? candidate : widest,
+        );
+      }
+      return null;
+    });
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+
+    final bridge = LanVaultBridge(rustFfi: _FakeLanVaultFfi());
+    addTearDown(bridge.dispose);
+    await tester.pumpWidget(LanVaultApp(bridge: bridge));
+    await tester.pumpAndSettle();
+
+    final titleBar = find.byType(WindowsTitleBar);
+    expect(
+      find.descendant(of: titleBar, matching: find.byType(BrandLogoFull)),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: titleBar,
+        matching: find.text('v${LanVaultBridge.appVersion}'),
+      ),
+      findsNothing,
+    );
+    final close = find.byTooltip('关闭');
+    expect(tester.getTopRight(close).dx, 1268);
+    expect(captionExclusion?.right, greaterThanOrEqualTo(1268));
+
+    final navItems = find.byType(NavRailItem);
+    final devices = navItems.at(1);
+    final backup = navItems.at(2);
+    Container navSurface(Finder item) => tester.widget<Container>(
+          find
+              .descendant(
+                of: item,
+                matching: find.byWidgetPredicate(
+                  (widget) =>
+                      widget is Container && widget.decoration is BoxDecoration,
+                ),
+              )
+              .first,
+        );
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: tester.getCenter(devices));
+    await tester.pump();
+    expect(
+      (navSurface(devices).decoration as BoxDecoration).color,
+      NeuTokens.insetSurface,
+    );
+
+    await mouse.moveTo(tester.getCenter(backup));
+    await tester.pump();
+    expect((navSurface(devices).decoration as BoxDecoration).color, isNull);
+    expect(
+      (navSurface(backup).decoration as BoxDecoration).color,
+      NeuTokens.insetSurface,
+    );
+    await mouse.removePointer();
+    await tester.pump();
+  }, skip: !WindowChrome.isSupported);
+
+  testWidgets('settings uses shared rail, inline scrub, and subdued dividers',
+      (tester) async {
+    tester.view.physicalSize = const Size(1280, 720);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final bridge = LanVaultBridge(rustFfi: _FakeLanVaultFfi());
+    addTearDown(bridge.dispose);
+    await tester.pumpWidget(LanVaultApp(bridge: bridge));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('设置'));
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(
+        of: find.byType(SettingsScreen),
+        matching: find.byType(NavRailItem),
+      ),
+      findsNWidgets(5),
+    );
+
+    await tester.tap(find.text('Web 访问与安全').first);
+    await tester.pumpAndSettle();
+    final scrubButton = find.widgetWithText(NeuButton, '立即校验');
+    expect(scrubButton, findsOneWidget);
+    expect(
+      find.descendant(
+        of: find
+            .ancestor(
+              of: find.text('数据完整性定期检查'),
+              matching: find.byType(Row),
+            )
+            .first,
+        matching: scrubButton,
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: find
+            .ancestor(
+              of: find.text('数据完整性定期检查'),
+              matching: find.byType(Row),
+            )
+            .first,
+        matching: find.byType(Switch),
+      ),
+      findsOneWidget,
+    );
+    final divider = tester.widget<Divider>(
+      find
+          .descendant(
+            of: find.byType(SettingsScreen),
+            matching: find.byType(Divider),
+          )
+          .first,
+    );
+    expect(divider.color, const Color(0x59000000));
+  });
+
+  testWidgets('settings security row fits compact 360px layout',
+      (tester) async {
+    tester.view.physicalSize = const Size(360, 760);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final bridge = LanVaultBridge(rustFfi: _FakeLanVaultFfi());
+    addTearDown(bridge.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildLanVaultTheme(),
+        home: Scaffold(body: SettingsScreen(bridge: bridge)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('数据完整性定期检查'), findsOneWidget);
+    expect(find.widgetWithText(NeuButton, '立即校验'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

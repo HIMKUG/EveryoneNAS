@@ -8,6 +8,7 @@ import '../../bridge/lanvault_bridge.dart';
 import '../../bridge/system_env_helper.dart';
 import '../../theme/neu_theme.dart';
 import '../../theme/neu_toast.dart';
+import '../../widgets/nav_rail_item.dart';
 
 enum _SettingsSection {
   general,
@@ -38,6 +39,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _autoReconnect = true;
   bool _autostartServer = true;
   bool _bitRotAutoScrub = true;
+  bool _scrubbing = false;
   bool _debugMode = false;
   bool _webPasswordEnabled = false;
 
@@ -170,7 +172,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
       ),
     );
-    unawaited(Future<void>.delayed(const Duration(milliseconds: 350), ctrl.dispose));
+    unawaited(
+        Future<void>.delayed(const Duration(milliseconds: 350), ctrl.dispose));
     if (saved == null || !mounted) return;
     await _savePolicyImmediate(
       PowerNetworkPolicyModel(
@@ -248,7 +251,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     final p = await widget.bridge.pickDirectory(
                       description: '选择主存储目录',
                     );
-                    if (ctx.mounted && p != null && p.isNotEmpty) primaryCtrl.text = p;
+                    if (ctx.mounted && p != null && p.isNotEmpty)
+                      primaryCtrl.text = p;
                   },
                 ),
               ],
@@ -272,7 +276,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     final p = await widget.bridge.pickDirectory(
                       description: '选择备用存储目录',
                     );
-                    if (ctx.mounted && p != null && p.isNotEmpty) fallbackCtrl.text = p;
+                    if (ctx.mounted && p != null && p.isNotEmpty)
+                      fallbackCtrl.text = p;
                   },
                 ),
               ],
@@ -281,7 +286,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
       ),
     );
-    unawaited(Future<void>.delayed(const Duration(milliseconds: 350), () { primaryCtrl.dispose(); fallbackCtrl.dispose(); }));
+    unawaited(Future<void>.delayed(const Duration(milliseconds: 350), () {
+      primaryCtrl.dispose();
+      fallbackCtrl.dispose();
+    }));
     if (saved == true && mounted) {
       NeuToast.success(context, '主 / 备存储目录已更新');
     }
@@ -327,7 +335,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
       ),
     );
-    unawaited(Future<void>.delayed(const Duration(milliseconds: 350), pwdCtrl.dispose));
+    unawaited(Future<void>.delayed(
+        const Duration(milliseconds: 350), pwdCtrl.dispose));
     if (confirmed == null || !mounted) return;
 
     if (vaultPath.isNotEmpty) {
@@ -348,6 +357,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
     } else {
       setState(() => _webPasswordEnabled = true);
       NeuToast.success(context, '已启用 Web 访问密码保护');
+    }
+  }
+
+  Future<void> _triggerQuickScrub() async {
+    setState(() => _scrubbing = true);
+    try {
+      final result = await widget.bridge.triggerBitRotScrub();
+      if (!mounted) return;
+      NeuToast.success(
+        context,
+        '校验完成：检查 ${result.checkedChunks} 块，发现 ${result.corruptedChunks} 个异常，已修复 ${result.healedChunks} 个',
+      );
+    } catch (err) {
+      if (!mounted) return;
+      NeuToast.error(context, LanVaultBridge.formatUserError(err));
+    } finally {
+      if (mounted) setState(() => _scrubbing = false);
     }
   }
 
@@ -412,7 +438,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
       ),
     );
-    unawaited(Future<void>.delayed(const Duration(milliseconds: 350), ctrl.dispose));
+    unawaited(
+        Future<void>.delayed(const Duration(milliseconds: 350), ctrl.dispose));
   }
 
   Future<void> _restartServer() async {
@@ -449,7 +476,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (mounted) setState(() => _runningDiag = false);
     }
   }
-
 
   Future<void> _openAllowedWifiDialog() async {
     final selected = List<String>.from(_policy.allowedSsids);
@@ -591,7 +617,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
         },
       ),
     );
-    unawaited(Future<void>.delayed(const Duration(milliseconds: 350), manualCtrl.dispose));
+    unawaited(Future<void>.delayed(
+        const Duration(milliseconds: 350), manualCtrl.dispose));
   }
 
   Future<void> _openDebugLogsDialog() async {
@@ -610,7 +637,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
               tone: NeuButtonTone.danger,
               onPressed: () async {
                 await widget.bridge.clearDebugLogs();
-                if (ctx.mounted) setDialogState(() => logs = const <DebugLogEntryModel>[]);
+                if (ctx.mounted)
+                  setDialogState(() => logs = const <DebugLogEntryModel>[]);
                 if (mounted) NeuToast.info(this.context, '调试日志已清空');
               },
             ),
@@ -646,8 +674,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final isWide =
-        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
+    final isWide = MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
 
     if (!isWide) {
       // 手机端：对标参考图，单一纵向分组白卡列表，零顶部两排药丸
@@ -693,28 +720,61 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       .headlineSmall
                       ?.copyWith(fontWeight: FontWeight.w800),
                 ),
-                const SizedBox(height: 16),
-                for (final entry in const <(_SettingsSection, String, IconData)>[
-                  (_SettingsSection.general, '常规与节点', Icons.tune_rounded),
-                  (_SettingsSection.backup, '备份与容灾', Icons.cloud_sync_outlined),
-                  (
-                    _SettingsSection.webSecurity,
-                    'Web 访问与安全',
-                    Icons.shield_outlined
+                const SizedBox(height: 12),
+                Container(
+                  padding: const EdgeInsets.all(8),
+                  decoration: BoxDecoration(
+                    color: NeuTokens.surface,
+                    borderRadius: const BorderRadius.all(Radius.circular(16)),
+                    border: Border.all(color: NeuTokens.hairlineBorder),
+                    boxShadow: const <BoxShadow>[
+                      BoxShadow(
+                        color: Color(0x0A0F172A),
+                        offset: Offset(0, 4),
+                        blurRadius: 14,
+                      ),
+                    ],
                   ),
-                  (
-                    _SettingsSection.serviceDiag,
-                    '服务与诊断',
-                    Icons.dns_outlined
+                  child: Column(
+                    children: <Widget>[
+                      for (final entry
+                          in const <(_SettingsSection, String, IconData)>[
+                        (_SettingsSection.general, '常规与节点', Icons.tune_rounded),
+                        (
+                          _SettingsSection.backup,
+                          '备份与容灾',
+                          Icons.cloud_sync_outlined
+                        ),
+                        (
+                          _SettingsSection.webSecurity,
+                          'Web 访问与安全',
+                          Icons.shield_outlined
+                        ),
+                        (
+                          _SettingsSection.serviceDiag,
+                          '服务与诊断',
+                          Icons.dns_outlined
+                        ),
+                        (
+                          _SettingsSection.about,
+                          '关于',
+                          Icons.info_outline_rounded
+                        ),
+                      ]) ...<Widget>[
+                        NavRailItem(
+                          label: entry.$2,
+                          icon: entry.$3,
+                          selectedIcon: entry.$3,
+                          selected: _desktopSection == entry.$1,
+                          onTap: () =>
+                              setState(() => _desktopSection = entry.$1),
+                        ),
+                        if (entry.$1 != _SettingsSection.about)
+                          const SizedBox(height: 4),
+                      ],
+                    ],
                   ),
-                  (_SettingsSection.about, '关于', Icons.info_outline_rounded),
-                ])
-                  _DesktopSettingNavTile(
-                    label: entry.$2,
-                    icon: entry.$3,
-                    selected: _desktopSection == entry.$1,
-                    onTap: () => setState(() => _desktopSection = entry.$1),
-                  ),
+                ),
               ],
             ),
           ),
@@ -845,8 +905,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Widget _buildBackupGroup(BuildContext context) {
-    final speedText =
-        _policy.maxKbps > 0 ? '${_policy.maxKbps} KB/s' : '不限速';
+    final speedText = _policy.maxKbps > 0 ? '${_policy.maxKbps} KB/s' : '不限速';
     final primaryText = (_storageConfig?.primaryDir.isNotEmpty ?? false)
         ? _storageConfig!.primaryDir
         : '默认目录';
@@ -909,8 +968,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Widget _buildWebSecurityGroup(BuildContext context) {
-    final port =
-        _overview?.serverPort ?? _lastServerConfig?.port ?? LanVaultBridge.defaultServerPort;
+    final port = _overview?.serverPort ??
+        _lastServerConfig?.port ??
+        LanVaultBridge.defaultServerPort;
     return _SettingsGroupCard(
       children: <Widget>[
         _SettingsValueRow(
@@ -929,6 +989,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
           title: '数据完整性定期检查',
           subtitle: '后台定期校验备份数据块并利用副本自愈',
           value: _bitRotAutoScrub,
+          trailing: NeuButton(
+            label: _scrubbing ? '校验中…' : '立即校验',
+            icon: Icons.verified_outlined,
+            loading: _scrubbing,
+            onPressed: _scrubbing ? null : _triggerQuickScrub,
+          ),
           onChanged: (v) async {
             final prev = _bitRotAutoScrub;
             setState(() => _bitRotAutoScrub = v);
@@ -1132,7 +1198,7 @@ class _SettingsGroupCard extends StatelessWidget {
             if (i < children.length - 1)
               const Padding(
                 padding: EdgeInsets.symmetric(horizontal: 16),
-                child: Divider(height: 1),
+                child: Divider(height: 1, color: Color(0x59000000)),
               ),
           ],
         ],
@@ -1147,12 +1213,14 @@ class _SettingsSwitchRow extends StatelessWidget {
     this.subtitle,
     required this.value,
     required this.onChanged,
+    this.trailing,
   });
 
   final String title;
   final String? subtitle;
   final bool value;
   final ValueChanged<bool> onChanged;
+  final Widget? trailing;
 
   @override
   Widget build(BuildContext context) {
@@ -1182,7 +1250,11 @@ class _SettingsSwitchRow extends StatelessWidget {
               ],
             ),
           ),
-          const SizedBox(width: 12),
+          if (trailing != null) ...<Widget>[
+            const SizedBox(width: 10),
+            trailing!,
+          ],
+          const SizedBox(width: 10),
           Switch(value: value, onChanged: onChanged),
         ],
       ),
@@ -1255,57 +1327,6 @@ class _SettingsValueRow extends StatelessWidget {
               Icon(icon, size: 17, color: NeuTokens.textSecondary),
             ],
           ],
-        ),
-      ),
-    );
-  }
-}
-
-class _DesktopSettingNavTile extends StatelessWidget {
-  const _DesktopSettingNavTile({
-    required this.label,
-    required this.icon,
-    required this.selected,
-    required this.onTap,
-  });
-
-  final String label;
-  final IconData icon;
-  final bool selected;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 4),
-      child: InkWell(
-        onTap: onTap,
-        borderRadius: const BorderRadius.all(Radius.circular(10)),
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          decoration: BoxDecoration(
-            color: selected ? NeuTokens.accentSoft : Colors.transparent,
-            borderRadius: const BorderRadius.all(Radius.circular(10)),
-          ),
-          child: Row(
-            children: <Widget>[
-              Icon(
-                icon,
-                size: 18,
-                color: selected ? NeuTokens.accent : NeuTokens.textSecondary,
-              ),
-              const SizedBox(width: 10),
-              Text(
-                label,
-                style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                      color:
-                          selected ? NeuTokens.accent : NeuTokens.textPrimary,
-                      fontWeight:
-                          selected ? FontWeight.w700 : FontWeight.w500,
-                    ),
-              ),
-            ],
-          ),
         ),
       ),
     );

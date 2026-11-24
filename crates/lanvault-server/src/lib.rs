@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod gc;
 pub mod scrub;
+mod tls;
 pub mod vault;
 pub mod web;
 
@@ -277,12 +278,14 @@ pub async fn serve_with_shutdown_and_state(
     let bind_ip: IpAddr = config.bind_addr.parse().map_err(|_| {
         LanVaultError::InvalidInput(format!("invalid bind_addr: {}", config.bind_addr))
     })?;
-    let listener = TcpListener::bind(SocketAddr::from((bind_ip, config.port))).await?;
-    let local_addr = listener.local_addr()?;
+    let tcp = TcpListener::bind(SocketAddr::from((bind_ip, config.port))).await?;
+    let local_addr = tcp.local_addr()?;
+    let lan_ip = detect_lan_ipv4();
+    let listener = tls::LanListener::new(tcp, &identity, IpAddr::V4(lan_ip))?;
     if let Some(tx) = bound_addr_tx {
         let _ = tx.send(local_addr);
     }
-    let lan_ip = detect_lan_ipv4().to_string();
+    let lan_ip = lan_ip.to_string();
 
     let mdns_handle = match MdnsRegistrar::register(DiscoveryAnnouncement {
         id: device_id.clone(),
@@ -293,7 +296,7 @@ pub async fn serve_with_shutdown_and_state(
     }) {
         Ok(reg) => Some(reg),
         Err(e) => {
-            warn!("mDNS registration unavailable, continuing with HTTP/UDP: {e}");
+            warn!("mDNS registration unavailable, continuing with HTTPS/UDP: {e}");
             None
         }
     };
@@ -473,7 +476,7 @@ pub async fn serve_with_shutdown_and_state(
 
     axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
+        app.into_make_service_with_connect_info::<tls::LanConnectionInfo>(),
     )
     .with_graceful_shutdown(shutdown_signal)
     .await?;

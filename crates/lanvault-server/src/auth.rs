@@ -409,9 +409,10 @@ impl AuthManager {
 }
 
 /// Builds the `lv_session` cookie (`HttpOnly; SameSite=Strict; Path=/`).
-pub fn build_session_cookie(token: String) -> Cookie<'static> {
+pub fn build_session_cookie(token: String, secure: bool) -> Cookie<'static> {
     let mut cookie = Cookie::new(SESSION_COOKIE_NAME, token);
     cookie.set_http_only(true);
+    cookie.set_secure(secure);
     cookie.set_same_site(SameSite::Strict);
     cookie.set_path("/");
     cookie.set_max_age(CookieDuration::seconds(SESSION_TTL_SECS as i64));
@@ -419,9 +420,10 @@ pub fn build_session_cookie(token: String) -> Cookie<'static> {
 }
 
 /// Builds an expired `lv_session` cookie to clear the client's browser state on logout.
-pub fn build_clear_session_cookie() -> Cookie<'static> {
+pub fn build_clear_session_cookie(secure: bool) -> Cookie<'static> {
     let mut cookie = Cookie::new(SESSION_COOKIE_NAME, "");
     cookie.set_http_only(true);
+    cookie.set_secure(secure);
     cookie.set_same_site(SameSite::Strict);
     cookie.set_path("/");
     cookie.set_max_age(CookieDuration::ZERO);

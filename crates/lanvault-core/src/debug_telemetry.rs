@@ -76,7 +76,10 @@ pub fn set_debug_mode(enabled: bool) {
             "rust.debug",
             Some("debug.mode_toggle"),
             None,
-            format!("debug mode switched to {}", if enabled { "ON" } else { "OFF" }),
+            format!(
+                "debug mode switched to {}",
+                if enabled { "ON" } else { "OFF" }
+            ),
             None,
         );
     }
@@ -100,10 +103,12 @@ pub fn configure_debug_log_file(path: &Path) {
 
 /// Returns the currently configured disk debug log path (if any).
 pub fn get_debug_log_path() -> Option<String> {
-    sink()
-        .lock()
-        .ok()
-        .and_then(|guard| guard.log_file_path.as_ref().map(|p| p.to_string_lossy().into_owned()))
+    sink().lock().ok().and_then(|guard| {
+        guard
+            .log_file_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
 }
 
 /// Installs a global Rust panic hook that records native panics + backtraces into the unified log.
@@ -302,7 +307,12 @@ pub fn get_debug_logs(limit: usize) -> Vec<DebugLogEntry> {
     };
     let len = guard.ring.len();
     let skip = len.saturating_sub(cap);
-    guard.ring.iter().skip(skip).map(|item| item.entry.clone()).collect()
+    guard
+        .ring
+        .iter()
+        .skip(skip)
+        .map(|item| item.entry.clone())
+        .collect()
 }
 
 /// Clears the in-memory ring buffer.

@@ -14,7 +14,7 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lanvault_core::{
@@ -62,26 +62,41 @@ pub struct ChunkReplicaReport {
 /// Content-addressed multi-volume vault manager.
 pub struct VaultStore {
     db: Arc<Database>,
-    /// Serializes *metadata-destructive* operations only (heal overwrite, GC delete).
-    /// Ordinary chunk ingestion must never take this lock: the staging→`chunks/` rename
-    /// is atomic and idempotent per content hash, so concurrent uploads of different
-    /// chunks (or the same chunk) are safe and stay fully parallel.
-    write_lock: Mutex<()>,
+    /// GC and snapshot publication exclude chunk reads and writes. Per-prefix chunk locks
+    /// keep unrelated uploads parallel while serializing work on the same content hash.
+    write_lock: RwLock<()>,
+    chunk_locks: [Mutex<()>; 256],
 }
 
 impl VaultStore {
     pub fn new(db: Arc<Database>) -> Self {
         Self {
             db,
-            write_lock: Mutex::new(()),
+            write_lock: RwLock::new(()),
+            chunk_locks: std::array::from_fn(|_| Mutex::new(())),
         }
     }
 
     pub fn with_write_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
         let _guard = self
             .write_lock
-            .lock()
+            .write()
             .map_err(|_| LanVaultError::InvalidState("vault write lock poisoned".to_string()))?;
+        operation()
+    }
+
+    fn with_chunk_lock<T>(
+        &self,
+        hash: &[u8; 32],
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let _vault = self
+            .write_lock
+            .read()
+            .map_err(|_| LanVaultError::InvalidState("vault write lock poisoned".to_string()))?;
+        let _chunk = self.chunk_locks[usize::from(hash[0])]
+            .lock()
+            .map_err(|_| LanVaultError::InvalidState("chunk write lock poisoned".to_string()))?;
         operation()
     }
 
@@ -102,7 +117,7 @@ impl VaultStore {
     ) -> Result<(VaultRecord, Vec<VaultVolumeRecord>)> {
         let _guard = self
             .write_lock
-            .lock()
+            .write()
             .map_err(|_| LanVaultError::InvalidState("vault write lock poisoned".to_string()))?;
         if name.trim().is_empty() {
             return Err(LanVaultError::InvalidInput(
@@ -128,7 +143,10 @@ impl VaultStore {
         mount_paths.push(primary_key);
         for extra in &extra_volumes {
             let extra_key = normalized_mount_key(&extra.mount_path)?;
-            if mount_paths.iter().any(|existing| paths_overlap(existing, &extra_key)) {
+            if mount_paths
+                .iter()
+                .any(|existing| paths_overlap(existing, &extra_key))
+            {
                 return Err(LanVaultError::InvalidInput(
                     "vault volumes must use distinct, non-overlapping mount paths".to_string(),
                 ));
@@ -247,6 +265,25 @@ impl VaultStore {
         stored_bytes: &[u8],
         compression: &str,
     ) -> Result<bool> {
+        self.with_chunk_lock(expected_hash, || {
+            self.put_chunk_with_compression_locked(
+                vault_id,
+                expected_hash,
+                raw_size,
+                stored_bytes,
+                compression,
+            )
+        })
+    }
+
+    fn put_chunk_with_compression_locked(
+        &self,
+        vault_id: &str,
+        expected_hash: &[u8; 32],
+        raw_size: u64,
+        stored_bytes: &[u8],
+        compression: &str,
+    ) -> Result<bool> {
         if !matches!(compression, "zstd" | "raw") {
             return Err(LanVaultError::InvalidInput(format!(
                 "unsupported chunk compression: `{compression}`"
@@ -284,7 +321,12 @@ impl VaultStore {
                 )));
             }
             if existing.scrub_status == lanvault_core::ScrubStatus::Ok
-                && self.chunk_intact_on_pool(&vault, &volumes, &hash_hex, stored_size)
+                && self.chunk_matches_on_pool(
+                    &vault,
+                    &volumes,
+                    expected_hash,
+                    stored_bytes,
+                )?
             {
                 self.db.upsert_chunk_with_compression(
                     vault_id,
@@ -293,12 +335,13 @@ impl VaultStore {
                     stored_size,
                     compression,
                 )?;
+                self.db.renew_orphan_chunk(vault_id, expected_hash)?;
                 return Ok(false);
             }
         }
 
         let available = vault.quota_bytes.saturating_sub(vault.used_bytes);
-        if stored_size > available {
+        if existing.is_none() && stored_size > available {
             return Err(LanVaultError::QuotaExceeded {
                 required: stored_size,
                 available,
@@ -323,7 +366,8 @@ impl VaultStore {
                     .count();
                 if writable_count < 2 {
                     return Err(LanVaultError::InvalidState(
-                        "mirror_raid1 requires a primary and at least one online mirror".to_string(),
+                        "mirror_raid1 requires a primary and at least one online mirror"
+                            .to_string(),
                     ));
                 }
                 for vol in &volumes {
@@ -340,12 +384,16 @@ impl VaultStore {
             raw_size,
             stored_size,
             compression,
-        )
-        {
+        ) {
             Ok(is_new) => is_new,
             Err(err) => {
                 if existing.is_none()
-                    && self.db.get_chunk(vault_id, expected_hash).ok().flatten().is_none()
+                    && self
+                        .db
+                        .get_chunk(vault_id, expected_hash)
+                        .ok()
+                        .flatten()
+                        .is_none()
                 {
                     let _ = self.delete_chunk_files(vault_id, expected_hash);
                 }
@@ -363,6 +411,10 @@ impl VaultStore {
     /// Under `mirror_raid1`, if the primary copy is unreadable or corrupted, transparently
     /// reads from a healthy mirror and repairs the primary copy.
     pub fn get_chunk(&self, vault_id: &str, hash: &[u8; 32]) -> Result<Vec<u8>> {
+        self.with_chunk_lock(hash, || self.get_chunk_locked(vault_id, hash))
+    }
+
+    fn get_chunk_locked(&self, vault_id: &str, hash: &[u8; 32]) -> Result<Vec<u8>> {
         let _probe = lanvault_core::ProbeGuard::start(
             "server.vault",
             "vault.get_chunk",
@@ -397,7 +449,9 @@ impl VaultStore {
             PoolMode::MirrorRaid1 => {
                 let candidates: Vec<&VaultVolumeRecord> = volumes
                     .iter()
-                    .filter(|volume| matches!(volume.role, VolumeRole::Primary | VolumeRole::Mirror))
+                    .filter(|volume| {
+                        matches!(volume.role, VolumeRole::Primary | VolumeRole::Mirror)
+                    })
                     .collect();
                 for vol in &candidates {
                     if let Ok(bytes) =
@@ -429,13 +483,39 @@ impl VaultStore {
     }
 
     pub fn has_verified_chunk(&self, vault_id: &str, hash: &[u8; 32]) -> Result<bool> {
-        match self.get_chunk(vault_id, hash) {
-            Ok(_) => Ok(true),
-            Err(LanVaultError::NotFound(_)) | Err(LanVaultError::CorruptedChunk { .. }) => {
-                Ok(false)
+        self.with_chunk_lock(hash, || {
+            match self.get_chunk_locked(vault_id, hash) {
+                Ok(_) => {
+                    self.db.renew_orphan_chunk(vault_id, hash)?;
+                    Ok(true)
+                }
+                Err(LanVaultError::NotFound(_)) | Err(LanVaultError::CorruptedChunk { .. }) => {
+                    Ok(false)
+                }
+                Err(LanVaultError::Io(err))
+                    if err.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Ok(false)
+                }
+                Err(err) => Err(err),
             }
-            Err(err) => Err(err),
+        })
+    }
+
+    pub fn resume_chunk(&self, vault_id: &str, hash: &[u8; 32]) -> Result<bool> {
+        self.has_verified_chunk(vault_id, hash)
+    }
+
+    pub fn validate_snapshot_chunks(&self, vault_id: &str, hashes: &[[u8; 32]]) -> Result<()> {
+        for hash in hashes {
+            if !self.has_verified_chunk(vault_id, hash)? {
+                return Err(LanVaultError::NotFound(format!(
+                    "chunk {} in vault {vault_id}",
+                    hex::encode(hash)
+                )));
+            }
         }
+        Ok(())
     }
 
     /// O(1) 轻量级块完整性检查：验证索引记录与磁盘文件长度，避免快照提交时全盘重读和重复 BLAKE3 导致超时。
@@ -474,11 +554,7 @@ impl VaultStore {
     }
 
     /// Reads raw chunk bytes directly from disk without RAID failover (used by Bit-Rot scrub).
-    pub fn read_chunk_raw_on_primary(
-        &self,
-        vault_id: &str,
-        hash: &[u8; 32],
-    ) -> Result<Vec<u8>> {
+    pub fn read_chunk_raw_on_primary(&self, vault_id: &str, hash: &[u8; 32]) -> Result<Vec<u8>> {
         let vault = self
             .db
             .get_vault(vault_id)?
@@ -568,9 +644,10 @@ impl VaultStore {
         expected_hash: &[u8; 32],
         healthy_bytes: &[u8],
     ) -> Result<()> {
-        let _guard = self.write_lock.lock().map_err(|_| {
-            LanVaultError::InvalidState("vault write lock poisoned".to_string())
-        })?;
+        let _guard = self
+            .write_lock
+            .write()
+            .map_err(|_| LanVaultError::InvalidState("vault write lock poisoned".to_string()))?;
         if blake3_hash(healthy_bytes) != *expected_hash {
             return Err(LanVaultError::CorruptedChunk {
                 hash: hex::encode(expected_hash),
@@ -610,8 +687,10 @@ impl VaultStore {
         let hash_hex = hex::encode(hash);
         for vol in &volumes {
             let path = chunk_file_path(Path::new(&vol.mount_path), &hash_hex);
-            if path.exists() {
-                fs::remove_file(path)?;
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
             }
         }
         Ok(())
@@ -670,6 +749,46 @@ impl VaultStore {
                 .filter(|volume| matches!(volume.role, VolumeRole::Primary | VolumeRole::Mirror))
                 .all(intact),
         }
+    }
+
+    fn chunk_matches_on_pool(
+        &self,
+        vault: &VaultRecord,
+        volumes: &[VaultVolumeRecord],
+        hash: &[u8; 32],
+        expected_bytes: &[u8],
+    ) -> Result<bool> {
+        let hash_hex = hex::encode(hash);
+        let required: Vec<&VaultVolumeRecord> = match vault.pool_mode {
+            PoolMode::Single => volumes
+                .iter()
+                .filter(|volume| volume.role == VolumeRole::Primary)
+                .collect(),
+            PoolMode::Striped => match striped_target_volume(volumes, hash) {
+                Ok(volume) => vec![volume],
+                Err(_) => Vec::new(),
+            },
+            PoolMode::MirrorRaid1 => volumes
+                .iter()
+                .filter(|volume| matches!(volume.role, VolumeRole::Primary | VolumeRole::Mirror))
+                .collect(),
+        };
+        if required.is_empty() {
+            return Ok(false);
+        }
+        for volume in required {
+            match read_verified_chunk(Path::new(&volume.mount_path), &hash_hex, hash) {
+                Ok(bytes) if bytes == expected_bytes => {}
+                Ok(_)
+                | Err(LanVaultError::NotFound(_))
+                | Err(LanVaultError::CorruptedChunk { .. }) => return Ok(false),
+                Err(LanVaultError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(false);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -779,7 +898,7 @@ fn normalized_mount_key(raw: &str) -> Result<PathBuf> {
             "vault mount path must be an absolute path".to_string(),
         ));
     }
-    let mut resolved = if path.exists() {
+    let resolved = if path.exists() {
         fs::canonicalize(path)?
     } else {
         // Walk up to the longest existing ancestor so `..` or symlinks cannot bypass overlap checks.
@@ -813,10 +932,10 @@ fn normalized_mount_key(raw: &str) -> Result<PathBuf> {
         base
     };
     #[cfg(windows)]
-    {
+    let resolved = {
         let stripped = lanvault_core::strip_windows_verbatim(&resolved.to_string_lossy());
-        resolved = PathBuf::from(stripped.to_lowercase());
-    }
+        PathBuf::from(stripped.to_lowercase())
+    };
     Ok(resolved)
 }
 
@@ -829,7 +948,9 @@ fn striped_target_volume<'a>(
     hash: &[u8; 32],
 ) -> Result<&'a VaultVolumeRecord> {
     if volumes.is_empty() {
-        return Err(LanVaultError::NotFound("no online volumes in vault".to_string()));
+        return Err(LanVaultError::NotFound(
+            "no online volumes in vault".to_string(),
+        ));
     }
     let idx = (hash[0] as usize) % volumes.len();
     Ok(&volumes[idx])
@@ -848,8 +969,7 @@ mod tests {
 
     #[test]
     fn create_vault_rejects_nested_self_overlapping_extra_volumes() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("lanvault-vault-test-{}", Uuid::new_v4()));
+        let temp_dir = std::env::temp_dir().join(format!("lanvault-vault-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
         let db = Arc::new(Database::open(&temp_dir.join("index.db")).unwrap());
         let store = VaultStore::new(db);
