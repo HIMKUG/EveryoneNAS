@@ -1,15 +1,21 @@
 import 'dart:async';
+import 'dart:ui' show PointerDeviceKind;
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 
 import 'package:lanvault_app/bridge/lanvault_bridge.dart';
 import 'package:lanvault_app/bridge/system_env_helper.dart';
+import 'package:lanvault_app/bridge/window_chrome.dart';
 import 'package:lanvault_app/features/backup/backup_screen.dart';
+import 'package:lanvault_app/features/settings/settings_screen.dart';
 import 'package:lanvault_app/features/vault/vault_screen.dart';
 import 'package:lanvault_app/main.dart';
 import 'package:lanvault_app/theme/neu_theme.dart';
 import 'package:lanvault_app/theme/neu_toast.dart';
+import 'package:lanvault_app/widgets/nav_rail_item.dart';
+import 'package:lanvault_app/widgets/windows_title_bar.dart';
 
 class _FakeLanVaultFfi implements LanVaultRustFfi {
   _FakeLanVaultFfi({
@@ -187,7 +193,8 @@ class _FakeLanVaultFfi implements LanVaultRustFfi {
       );
 
   @override
-  Future<void> importVaultKeyBackup(String passphrase, String backupJson) async {}
+  Future<void> importVaultKeyBackup(
+      String passphrase, String backupJson) async {}
 
   @override
   Future<String> pairWithPin({
@@ -678,6 +685,177 @@ void main() {
     expect(docFinder, findsOneWidget);
     final docSize = tester.getSize(docFinder);
     expect(docSize.width, greaterThan(50));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('Windows shell aligns caption controls and clears previous hover',
+      (tester) async {
+    tester.view.physicalSize = const Size(1280, 720);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    const channel = MethodChannel('com.lanvault.app/window');
+    final messenger = tester.binding.defaultBinaryMessenger;
+    Rect? captionExclusion;
+    messenger.setMockMethodCallHandler(channel, (call) async {
+      if (call.method == 'isMaximized') return false;
+      if (call.method == 'setCaptionMetrics') {
+        final arguments = call.arguments as Map<Object?, Object?>;
+        final exclusions = (arguments['exclusions'] as List<Object?>)
+            .whereType<Map<Object?, Object?>>()
+            .map(
+              (exclusion) => Rect.fromLTRB(
+                exclusion['left'] as double,
+                exclusion['top'] as double,
+                exclusion['right'] as double,
+                exclusion['bottom'] as double,
+              ),
+            )
+            .toList();
+        captionExclusion = exclusions.reduce(
+          (widest, candidate) =>
+              candidate.right > widest.right ? candidate : widest,
+        );
+      }
+      return null;
+    });
+    addTearDown(() => messenger.setMockMethodCallHandler(channel, null));
+
+    final bridge = LanVaultBridge(rustFfi: _FakeLanVaultFfi());
+    addTearDown(bridge.dispose);
+    await tester.pumpWidget(LanVaultApp(bridge: bridge));
+    await tester.pumpAndSettle();
+
+    final titleBar = find.byType(WindowsTitleBar);
+    expect(
+      find.descendant(of: titleBar, matching: find.byType(BrandLogoFull)),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: titleBar,
+        matching: find.text('v${LanVaultBridge.appVersion}'),
+      ),
+      findsNothing,
+    );
+    final close = find.byTooltip('关闭');
+    expect(tester.getTopRight(close).dx, 1268);
+    expect(captionExclusion?.right, greaterThanOrEqualTo(1268));
+
+    final navItems = find.byType(NavRailItem);
+    final devices = navItems.at(1);
+    final backup = navItems.at(2);
+    Container navSurface(Finder item) => tester.widget<Container>(
+          find
+              .descendant(
+                of: item,
+                matching: find.byWidgetPredicate(
+                  (widget) =>
+                      widget is Container && widget.decoration is BoxDecoration,
+                ),
+              )
+              .first,
+        );
+    final mouse = await tester.createGesture(kind: PointerDeviceKind.mouse);
+    await mouse.addPointer(location: tester.getCenter(devices));
+    await tester.pump();
+    expect(
+      (navSurface(devices).decoration as BoxDecoration).color,
+      NeuTokens.insetSurface,
+    );
+
+    await mouse.moveTo(tester.getCenter(backup));
+    await tester.pump();
+    expect((navSurface(devices).decoration as BoxDecoration).color, isNull);
+    expect(
+      (navSurface(backup).decoration as BoxDecoration).color,
+      NeuTokens.insetSurface,
+    );
+    await mouse.removePointer();
+    await tester.pump();
+  }, skip: !WindowChrome.isSupported);
+
+  testWidgets('settings uses shared rail, inline scrub, and subdued dividers',
+      (tester) async {
+    tester.view.physicalSize = const Size(1280, 720);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final bridge = LanVaultBridge(rustFfi: _FakeLanVaultFfi());
+    addTearDown(bridge.dispose);
+    await tester.pumpWidget(LanVaultApp(bridge: bridge));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('设置'));
+    await tester.pumpAndSettle();
+    expect(
+      find.descendant(
+        of: find.byType(SettingsScreen),
+        matching: find.byType(NavRailItem),
+      ),
+      findsNWidgets(5),
+    );
+
+    await tester.tap(find.text('Web 访问与安全').first);
+    await tester.pumpAndSettle();
+    final scrubButton = find.widgetWithText(NeuButton, '立即校验');
+    expect(scrubButton, findsOneWidget);
+    expect(
+      find.descendant(
+        of: find
+            .ancestor(
+              of: find.text('数据完整性定期检查'),
+              matching: find.byType(Row),
+            )
+            .first,
+        matching: scrubButton,
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: find
+            .ancestor(
+              of: find.text('数据完整性定期检查'),
+              matching: find.byType(Row),
+            )
+            .first,
+        matching: find.byType(Switch),
+      ),
+      findsOneWidget,
+    );
+    final divider = tester.widget<Divider>(
+      find
+          .descendant(
+            of: find.byType(SettingsScreen),
+            matching: find.byType(Divider),
+          )
+          .first,
+    );
+    expect(divider.color, const Color(0x59000000));
+  });
+
+  testWidgets('settings security row fits compact 360px layout',
+      (tester) async {
+    tester.view.physicalSize = const Size(360, 760);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final bridge = LanVaultBridge(rustFfi: _FakeLanVaultFfi());
+    addTearDown(bridge.dispose);
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildLanVaultTheme(),
+        home: Scaffold(body: SettingsScreen(bridge: bridge)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('数据完整性定期检查'), findsOneWidget);
+    expect(find.widgetWithText(NeuButton, '立即校验'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
