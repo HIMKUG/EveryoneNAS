@@ -32,7 +32,8 @@ class SettingsScreen extends StatefulWidget {
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
-class _SettingsScreenState extends State<SettingsScreen> {
+class _SettingsScreenState extends State<SettingsScreen>
+    with WidgetsBindingObserver {
   _SettingsSection _desktopSection = _SettingsSection.general;
 
   RoleMode _roleMode = RoleMode.dual;
@@ -42,6 +43,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
   bool _scrubbing = false;
   bool _debugMode = false;
   bool _webPasswordEnabled = false;
+  List<String> _loadFailures = const <String>[];
+  Map<String, bool> _androidPermStates = const <String, bool>{};
 
   PowerNetworkPolicyModel _policy = const PowerNetworkPolicyModel(
     wifiOnly: true,
@@ -58,35 +61,97 @@ class _SettingsScreenState extends State<SettingsScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     unawaited(_loadAll());
   }
 
-  Future<void> _loadAll() async {
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && Platform.isAndroid) {
+      unawaited(_refreshAndroidPermissions());
+    }
+  }
+
+  Future<void> _refreshAndroidPermissions() async {
+    if (!Platform.isAndroid) return;
     try {
-      final role = await widget.bridge.getRoleMode();
-      final autoRec = await widget.bridge.getAutoReconnect();
-      final autostart = await widget.bridge.getAutostartServer();
-      final policy = await widget.bridge.getPowerNetworkPolicy();
-      final scrub = await widget.bridge.getBitRotAutoScrub();
-      final debug = await widget.bridge.getDebugMode();
-      final backupCfg = await widget.bridge.getBackupStorageConfig();
-      final lastCfg = await widget.bridge.getLastServerConfig();
-      final overview = await widget.bridge.getSystemOverview();
+      final states = await widget.bridge.getAndroidPermissionStates();
       if (!mounted) return;
-      setState(() {
-        _roleMode = role;
-        _autoReconnect = autoRec;
-        _autostartServer = autostart;
-        _policy = policy;
-        _bitRotAutoScrub = scrub;
-        _debugMode = debug;
-        _storageConfig = backupCfg;
-        _lastServerConfig = lastCfg;
-        _webPasswordEnabled =
-            lastCfg?.webPassword != null && lastCfg!.webPassword!.isNotEmpty;
-        _overview = overview;
-      });
+      setState(() => _androidPermStates = states);
     } catch (_) {}
+  }
+
+  Future<void> _loadAll() async {
+    final failures = <String>[];
+
+    Future<void> loadItem(String label, Future<void> Function() task) async {
+      try {
+        await task();
+      } catch (_) {
+        failures.add(label);
+      }
+    }
+
+    await Future.wait<void>(<Future<void>>[
+      loadItem('节点模式', () async {
+        final role = await widget.bridge.getRoleMode();
+        if (mounted) setState(() => _roleMode = role);
+      }),
+      loadItem('自动重连', () async {
+        final autoRec = await widget.bridge.getAutoReconnect();
+        if (mounted) setState(() => _autoReconnect = autoRec);
+      }),
+      loadItem('自动启动服务', () async {
+        final autostart = await widget.bridge.getAutostartServer();
+        if (mounted) setState(() => _autostartServer = autostart);
+      }),
+      loadItem('网络与电源策略', () async {
+        final policy = await widget.bridge.getPowerNetworkPolicy();
+        if (mounted) setState(() => _policy = policy);
+      }),
+      loadItem('自动完整性校验', () async {
+        final scrub = await widget.bridge.getBitRotAutoScrub();
+        if (mounted) setState(() => _bitRotAutoScrub = scrub);
+      }),
+      loadItem('调试模式', () async {
+        final debug = await widget.bridge.getDebugMode();
+        if (mounted) setState(() => _debugMode = debug);
+      }),
+      loadItem('存储目录配置', () async {
+        final backupCfg = await widget.bridge.getBackupStorageConfig();
+        if (mounted) setState(() => _storageConfig = backupCfg);
+      }),
+      loadItem('最近服务配置', () async {
+        final lastCfg = await widget.bridge.getLastServerConfig();
+        if (mounted) {
+          setState(() {
+            _lastServerConfig = lastCfg;
+            _webPasswordEnabled = lastCfg?.webPassword != null &&
+                lastCfg!.webPassword!.isNotEmpty;
+          });
+        }
+      }),
+      loadItem('系统概览', () async {
+        final overview = await widget.bridge.getSystemOverview();
+        if (mounted) setState(() => _overview = overview);
+      }),
+      if (Platform.isAndroid) _refreshAndroidPermissions(),
+    ]);
+
+    if (!mounted) return;
+    setState(() => _loadFailures = failures);
+    if (failures.isNotEmpty) {
+      NeuToast.warning(
+        context,
+        '部分设置加载失败：${failures.join('、')}',
+      );
+    }
   }
 
   Future<bool> _savePolicyImmediate(PowerNetworkPolicyModel next) async {
@@ -247,13 +312,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 const SizedBox(width: 8),
                 NeuButton(
                   label: '浏览',
-                  onPressed: () async {
-                    final p = await widget.bridge.pickDirectory(
-                      description: '选择主存储目录',
-                    );
-                    if (ctx.mounted && p != null && p.isNotEmpty)
-                      primaryCtrl.text = p;
-                  },
+                    onPressed: () async {
+                      final p = await widget.bridge.pickDirectory(
+                        description: '选择主存储目录',
+                      );
+                      if (ctx.mounted && p != null && p.isNotEmpty) {
+                        primaryCtrl.text = p;
+                      }
+                    },
                 ),
               ],
             ),
@@ -272,13 +338,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 const SizedBox(width: 8),
                 NeuButton(
                   label: '浏览',
-                  onPressed: () async {
-                    final p = await widget.bridge.pickDirectory(
-                      description: '选择备用存储目录',
-                    );
-                    if (ctx.mounted && p != null && p.isNotEmpty)
-                      fallbackCtrl.text = p;
-                  },
+                    onPressed: () async {
+                      final p = await widget.bridge.pickDirectory(
+                        description: '选择备用存储目录',
+                      );
+                      if (ctx.mounted && p != null && p.isNotEmpty) {
+                        fallbackCtrl.text = p;
+                      }
+                    },
                 ),
               ],
             ),
@@ -637,8 +704,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
               tone: NeuButtonTone.danger,
               onPressed: () async {
                 await widget.bridge.clearDebugLogs();
-                if (ctx.mounted)
+                if (ctx.mounted) {
                   setDialogState(() => logs = const <DebugLogEntryModel>[]);
+                }
                 if (mounted) NeuToast.info(this.context, '调试日志已清空');
               },
             ),
@@ -683,6 +751,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: <Widget>[
+            if (_loadFailures.isNotEmpty) _buildLoadFailureBanner(),
             _buildSectionHeader(context, '常规与节点'),
             _buildGeneralGroup(context),
             _buildSectionHeader(context, '备份与容灾'),
@@ -785,7 +854,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 alignment: Alignment.topLeft,
                 child: ConstrainedBox(
                   constraints: const BoxConstraints(maxWidth: 720),
-                  child: _buildDesktopSectionBody(context),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: <Widget>[
+                      if (_loadFailures.isNotEmpty) _buildLoadFailureBanner(),
+                      _buildDesktopSectionBody(context),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -858,6 +933,37 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Widget _buildLoadFailureBanner() {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 12),
+      child: NeuCard(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        backgroundColor: NeuTokens.folderGoldSoft,
+        child: Row(
+          children: <Widget>[
+            const Icon(
+              Icons.warning_amber_rounded,
+              size: 18,
+              color: NeuTokens.warning,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                '部分配置读取失败（${_loadFailures.join('、')}），请勿在重试前覆盖设置。',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
+            const SizedBox(width: 8),
+            NeuButton(
+              label: '重试',
+              onPressed: () => unawaited(_loadAll()),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildGeneralGroup(BuildContext context) {
     return _SettingsGroupCard(
       children: <Widget>[
@@ -880,7 +986,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             } catch (err) {
               if (!mounted) return;
               setState(() => _autoReconnect = prev);
-              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
             }
           },
         ),
@@ -896,7 +1002,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             } catch (err) {
               if (!mounted) return;
               setState(() => _autostartServer = prev);
-              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
             }
           },
         ),
@@ -1003,7 +1109,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             } catch (err) {
               if (!mounted) return;
               setState(() => _bitRotAutoScrub = prev);
-              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
             }
           },
         ),
@@ -1018,64 +1124,124 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Future<void> _showPermissionSettingsPrompt(String permissionName) async {
+    if (!mounted) return;
+    final openSettings = await showNeuDialog<bool>(
+      context: context,
+      builder: (ctx) => NeuDialog(
+        title: '$permissionName已被拒绝',
+        subtitle: '请在系统应用设置中手动开启权限，开启后返回应用将自动刷新状态。',
+        maxWidth: 380,
+        actions: <Widget>[
+          NeuButton(
+            label: '取消',
+            onPressed: () => Navigator.of(ctx).pop(false),
+          ),
+          NeuButton(
+            label: '打开系统设置',
+            tone: NeuButtonTone.primary,
+            onPressed: () => Navigator.of(ctx).pop(true),
+          ),
+        ],
+        child: const SizedBox.shrink(),
+      ),
+    );
+    if (openSettings == true) {
+      await widget.bridge.openAppSettings();
+    }
+  }
+
+  String _permissionLabel(String key, {String? deniedForeverKey}) {
+    final granted = _androidPermStates[key];
+    if (granted == true) return '已授权';
+    if (deniedForeverKey != null && _androidPermStates[deniedForeverKey] == true) {
+      return '去系统设置';
+    }
+    if (granted == false) return '未授权';
+    return '去授权';
+  }
+
   Widget _buildAndroidPermissionsGroup(BuildContext context) {
     return _SettingsGroupCard(
       children: <Widget>[
         _SettingsValueRow(
           title: '所有文件访问权限',
           subtitle: '用于读写自定义目录与存储池文件',
-          value: '去授权',
+          value: _permissionLabel('storage'),
           icon: Icons.chevron_right_rounded,
           onTap: () async {
             final ok = await widget.bridge.requestStoragePermission();
+            await _refreshAndroidPermissions();
             if (!mounted) return;
             NeuToast.info(
               this.context,
-              ok ? '已获得所有文件访问权限' : '请在系统设置中授予所有文件访问权限',
+              ok ? '已获得所有文件访问权限' : '尚未授予所有文件访问权限，请在系统设置中开启',
             );
           },
         ),
         _SettingsValueRow(
           title: '通知权限',
           subtitle: '保持后台服务常驻与传输进度提醒',
-          value: '去授权',
+          value: _permissionLabel(
+            'notification',
+            deniedForeverKey: 'notificationDeniedForever',
+          ),
           icon: Icons.chevron_right_rounded,
           onTap: () async {
             final ok = await widget.bridge.requestNotificationPermission();
+            await _refreshAndroidPermissions();
             if (!mounted) return;
-            NeuToast.info(
-              this.context,
-              ok ? '已获得通知权限' : '请在系统设置中允许通知权限',
-            );
+            if (ok) {
+              NeuToast.success(this.context, '已获得通知权限');
+            } else if (_androidPermStates['notificationDeniedForever'] == true) {
+              await _showPermissionSettingsPrompt('通知权限');
+            } else {
+              NeuToast.info(this.context, '未获得通知权限，后台保活通知可能不可见');
+            }
           },
         ),
         _SettingsValueRow(
           title: '电池优化白名单',
           subtitle: '防止锁屏后系统休眠中断局域网同步',
-          value: '去设置',
+          value: _androidPermStates['battery'] == true ? '已加入' : '去设置',
           icon: Icons.chevron_right_rounded,
           onTap: () async {
             final ok = await widget.bridge.requestBatteryExemption();
+            await _refreshAndroidPermissions();
             if (!mounted) return;
             NeuToast.info(
               this.context,
-              ok ? '已加入电池优化白名单' : '请在系统电池设置中设为无限制',
+              ok ? '已加入电池优化白名单' : '尚未加入电池优化白名单，请在系统设置中设为无限制',
             );
           },
         ),
         _SettingsValueRow(
           title: 'Wi-Fi 定位权限',
           subtitle: '用于识别当前连接的家庭 Wi-Fi 名称',
-          value: '去授权',
+          value: _permissionLabel(
+            'location',
+            deniedForeverKey: 'locationDeniedForever',
+          ),
           icon: Icons.chevron_right_rounded,
           onTap: () async {
             final ok = await widget.bridge.requestLocationPermission();
+            await _refreshAndroidPermissions();
             if (!mounted) return;
-            NeuToast.info(
-              this.context,
-              ok ? '已获得 Wi-Fi 定位权限' : '请在系统设置中授予位置权限',
-            );
+            if (ok) {
+              NeuToast.success(this.context, '已获得 Wi-Fi 定位权限');
+            } else if (_androidPermStates['locationDeniedForever'] == true) {
+              await _showPermissionSettingsPrompt('Wi-Fi 定位权限');
+            } else {
+              NeuToast.info(this.context, '未授予位置权限，您仍可在“家庭 Wi-Fi”中手动添加名称');
+            }
           },
+        ),
+        _SettingsValueRow(
+          title: '应用系统设置',
+          subtitle: '若系统弹窗不再提示，可直接前往系统应用信息页修改权限',
+          value: '打开设置',
+          icon: Icons.open_in_new_rounded,
+          onTap: () => unawaited(widget.bridge.openAppSettings()),
         ),
       ],
     );
@@ -1112,7 +1278,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
             } catch (err) {
               if (!mounted) return;
               setState(() => _debugMode = prev);
-              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
             }
           },
         ),

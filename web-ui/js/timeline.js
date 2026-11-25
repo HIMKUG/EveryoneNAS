@@ -96,37 +96,9 @@
     }
 
     #bindFilterEvents() {
-      let pressedBtn = null;
-
-      this.filterGroupEl.addEventListener('pointerdown', (event) => {
-        if (event.button !== 0) {
-          pressedBtn = null;
-          return;
-        }
-        pressedBtn = event.target.closest('button[data-tier]');
-      });
-
-      this.filterGroupEl.addEventListener('pointercancel', () => {
-        pressedBtn = null;
-      });
-
-      this.filterGroupEl.addEventListener('pointerleave', () => {
-        pressedBtn = null;
-      });
-
-      this.filterGroupEl.addEventListener('pointerup', (event) => {
-        const btn = event.target.closest('button[data-tier]');
-        const matched = btn && btn === pressedBtn && event.button === 0;
-        pressedBtn = null;
-        if (!matched) return;
-        this.setTier(btn.dataset.tier);
-      });
-
-      this.filterGroupEl.addEventListener('keydown', (event) => {
-        if (event.key !== 'Enter' && event.key !== ' ') return;
-        const btn = event.target.closest('button[data-tier]');
-        if (!btn) return;
-        event.preventDefault();
+      this.filterGroupEl.addEventListener('click', (event) => {
+        const btn = event.target instanceof Element ? event.target.closest('button[data-tier]') : null;
+        if (!btn || btn.disabled) return;
         this.setTier(btn.dataset.tier);
       });
     }

@@ -31,6 +31,8 @@ class _VaultScreenState extends State<VaultScreen> {
   List<VaultSummaryModel> _vaults = const <VaultSummaryModel>[];
   bool _loading = true;
   bool _startingService = false;
+  String? _loadError;
+  int _refreshRequest = 0;
 
   @override
   void initState() {
@@ -51,19 +53,30 @@ class _VaultScreenState extends State<VaultScreen> {
   }
 
   Future<void> _refreshVaults({required bool silent}) async {
-    if (!silent && mounted) setState(() => _loading = true);
+    final request = ++_refreshRequest;
+    if (!silent && mounted) {
+      setState(() {
+        _loading = true;
+        _loadError = null;
+      });
+    }
     try {
       final list = await widget.bridge.listVaults();
-      if (!mounted) return;
+      if (!mounted || request != _refreshRequest) return;
       setState(() {
         _vaults = list;
+        _loadError = null;
         _loading = false;
       });
     } catch (err) {
-      if (!mounted) return;
-      setState(() => _loading = false);
+      if (!mounted || request != _refreshRequest) return;
+      final msg = LanVaultBridge.formatUserError(err);
+      setState(() {
+        _loadError = msg;
+        _loading = false;
+      });
       if (!silent) {
-        NeuToast.error(context, LanVaultBridge.formatUserError(err));
+        NeuToast.error(context, msg);
       }
     }
   }
@@ -390,6 +403,18 @@ class _VaultScreenState extends State<VaultScreen> {
                     padding: EdgeInsets.symmetric(vertical: 48),
                     child: Center(child: CircularProgressIndicator()),
                   )
+                else if (_loadError != null && _vaults.isEmpty)
+                  NeuEmptyState(
+                    icon: Icons.cloud_off_rounded,
+                    title: '加载存储池失败',
+                    subtitle: _loadError!,
+                    action: NeuButton(
+                      label: '重试',
+                      icon: Icons.refresh_rounded,
+                      tone: NeuButtonTone.primary,
+                      onPressed: () => unawaited(_refreshVaults(silent: false)),
+                    ),
+                  )
                 else if (_vaults.isEmpty)
                   NeuEmptyState(
                     icon: Icons.layers_outlined,
@@ -402,36 +427,64 @@ class _VaultScreenState extends State<VaultScreen> {
                       onPressed: _openCreateVaultDialog,
                     ),
                   )
-                else if (isWide)
-                  LayoutBuilder(
-                    builder: (context, constraints) {
-                      final cols = constraints.maxWidth >= 960 ? 3 : 2;
-                      final cardWidth =
-                          (constraints.maxWidth - NeuSpace.md * (cols - 1)) /
-                              cols;
-                      return Wrap(
-                        spacing: NeuSpace.md,
-                        runSpacing: NeuSpace.md,
+                else ...<Widget>[
+                  if (_loadError != null) ...<Widget>[
+                    NeuCard(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 12,
+                      ),
+                      backgroundColor: NeuTokens.folderGoldSoft,
+                      child: Row(
                         children: <Widget>[
-                          for (final vault in _vaults)
-                            SizedBox(
-                              width: cardWidth,
-                              child: _VaultPoolCard(vault: vault),
-                            ),
+                          const Icon(
+                            Icons.warning_amber_rounded,
+                            size: 18,
+                            color: NeuTokens.warning,
+                          ),
+                          const SizedBox(width: 10),
+                          Expanded(child: Text('刷新失败：$_loadError')),
+                          NeuButton(
+                            label: '重试',
+                            onPressed: () =>
+                                unawaited(_refreshVaults(silent: false)),
+                          ),
                         ],
-                      );
-                    },
-                  )
-                else
-                  Column(
-                    children: <Widget>[
-                      for (var i = 0; i < _vaults.length; i++) ...<Widget>[
-                        _VaultPoolCard(vault: _vaults[i]),
-                        if (i < _vaults.length - 1)
-                          const SizedBox(height: NeuSpace.md),
+                      ),
+                    ),
+                    const SizedBox(height: NeuSpace.md),
+                  ],
+                  if (isWide)
+                    LayoutBuilder(
+                      builder: (context, constraints) {
+                        final cols = constraints.maxWidth >= 960 ? 3 : 2;
+                        final cardWidth =
+                            (constraints.maxWidth - NeuSpace.md * (cols - 1)) /
+                                cols;
+                        return Wrap(
+                          spacing: NeuSpace.md,
+                          runSpacing: NeuSpace.md,
+                          children: <Widget>[
+                            for (final vault in _vaults)
+                              SizedBox(
+                                width: cardWidth,
+                                child: _VaultPoolCard(vault: vault),
+                              ),
+                          ],
+                        );
+                      },
+                    )
+                  else
+                    Column(
+                      children: <Widget>[
+                        for (var i = 0; i < _vaults.length; i++) ...<Widget>[
+                          _VaultPoolCard(vault: _vaults[i]),
+                          if (i < _vaults.length - 1)
+                            const SizedBox(height: NeuSpace.md),
+                        ],
                       ],
-                    ],
-                  ),
+                    ),
+                ],
               ],
             ),
           ),

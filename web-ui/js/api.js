@@ -66,10 +66,38 @@
     }
   }
 
-  async function request(method, path, body = undefined, { suppressAuthRedirect = false } = {}) {
+  const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
+
+  async function request(
+    method,
+    path,
+    body = undefined,
+    { suppressAuthRedirect = false, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal = null } = {},
+  ) {
+    const controller = new AbortController();
+    let timedOut = false;
+    let timeoutId = null;
+
+    const onExternalAbort = () => controller.abort(signal?.reason);
+    if (signal) {
+      if (signal.aborted) {
+        controller.abort(signal.reason);
+      } else {
+        signal.addEventListener('abort', onExternalAbort, { once: true });
+      }
+    }
+
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timeoutId = global.setTimeout(() => {
+        timedOut = true;
+        controller.abort(new DOMException('Request timed out', 'TimeoutError'));
+      }, timeoutMs);
+    }
+
     const init = {
       method,
       credentials: 'same-origin',
+      signal: controller.signal,
       headers: {
         Accept: 'application/json',
       },
@@ -80,8 +108,27 @@
       init.body = JSON.stringify(body);
     }
 
-    const response = await fetch(path, init);
-    const data = await parseJsonBoundary(response);
+    let response;
+    let data;
+    try {
+      response = await fetch(path, init);
+      data = await parseJsonBoundary(response);
+    } catch (err) {
+      if (timedOut) {
+        throw new ApiError(0, 'timeout', '请求超时，请检查网络连接后重试');
+      }
+      if (signal?.aborted) {
+        throw new ApiError(0, 'aborted', '请求已取消');
+      }
+      throw new ApiError(0, 'network_error', '无法连接到服务器，请检查网络');
+    } finally {
+      if (timeoutId !== null) {
+        global.clearTimeout(timeoutId);
+      }
+      if (signal) {
+        signal.removeEventListener('abort', onExternalAbort);
+      }
+    }
 
     if (response.status === 429) {
       const headerVal = Number(response.headers.get('Retry-After'));

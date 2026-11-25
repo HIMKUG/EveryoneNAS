@@ -1,34 +1,102 @@
-/* Standards-compliant ISO/IEC 18004 QR Code SVG encoder (extracted from app.js). */
+/* Standards-compliant ISO/IEC 18004 QR Code SVG encoder (Versions 1..10, Byte mode, ECC Level L, Mask 0). */
 (function (global) {
   'use strict';
 
-  function renderPairingQrSvg(uri) {
-    // Standards-compliant ISO/IEC 18004 QR Code encoder (Versions 1..6, Byte mode, ECC Level L, Mask 0)
-    const dataBytes = Array.from(new TextEncoder().encode(uri));
-    const VERSIONS = [
-      null,
-      { size: 21, total: 26, data: 19, ecc: 7, align: [] },
-      { size: 25, total: 44, data: 34, ecc: 10, align: [6, 18] },
-      { size: 29, total: 70, data: 55, ecc: 15, align: [6, 22] },
-      { size: 33, total: 100, data: 80, ecc: 20, align: [6, 26] },
-      { size: 37, total: 134, data: 108, ecc: 26, align: [6, 30] },
-      { size: 41, total: 172, data: 136, ecc: 36, align: [6, 34] },
-    ];
-    let ver = 1;
-    while (ver < VERSIONS.length && dataBytes.length + 2 > VERSIONS[ver].data) ver += 1;
-    const spec = VERSIONS[Math.min(ver, VERSIONS.length - 1)];
-    const payload = dataBytes.slice(0, spec.data - 2);
+  const VERSIONS = [
+    null,
+    { size: 21, total: 26, data: 19, eccPerBlock: 7, blocks: [19], align: [] },
+    { size: 25, total: 44, data: 34, eccPerBlock: 10, blocks: [34], align: [6, 18] },
+    { size: 29, total: 70, data: 55, eccPerBlock: 15, blocks: [55], align: [6, 22] },
+    { size: 33, total: 100, data: 80, eccPerBlock: 20, blocks: [80], align: [6, 26] },
+    { size: 37, total: 134, data: 108, eccPerBlock: 26, blocks: [108], align: [6, 30] },
+    { size: 41, total: 172, data: 136, eccPerBlock: 18, blocks: [68, 68], align: [6, 34] },
+    { size: 45, total: 196, data: 156, eccPerBlock: 20, blocks: [78, 78], align: [6, 22, 38] },
+    { size: 49, total: 242, data: 194, eccPerBlock: 24, blocks: [97, 97], align: [6, 24, 42] },
+    { size: 53, total: 292, data: 232, eccPerBlock: 30, blocks: [116, 116], align: [6, 26, 46] },
+    { size: 57, total: 346, data: 274, eccPerBlock: 18, blocks: [68, 68, 69, 69], align: [6, 28, 50] },
+  ];
 
-    // Bitstream: Mode 0100 (Byte), 8-bit length, payload bytes, terminator, pad bytes 0xEC / 0x11
+  function gfMul(a, b) {
+    let r = 0;
+    for (let i = 0; i < 8; i += 1) {
+      if (b & 1) r ^= a;
+      const hi = a & 0x80;
+      a = (a << 1) & 0xff;
+      if (hi) a ^= 0x1d;
+      b >>>= 1;
+    }
+    return r;
+  }
+
+  function rsGeneratorPoly(eccCount) {
+    let gen = [1];
+    let root = 1;
+    for (let i = 0; i < eccCount; i += 1) {
+      const next = new Array(gen.length + 1).fill(0);
+      for (let j = 0; j < gen.length; j += 1) {
+        next[j] ^= gen[j];
+        next[j + 1] ^= gfMul(gen[j], root);
+      }
+      gen = next;
+      root = gfMul(root, 2);
+    }
+    return gen;
+  }
+
+  function rsEncodeBlock(dataBlock, gen, eccCount) {
+    const ecc = new Array(eccCount).fill(0);
+    for (const b of dataBlock) {
+      const factor = b ^ ecc.shift();
+      ecc.push(0);
+      for (let i = 0; i < eccCount; i += 1) {
+        ecc[i] ^= gfMul(gen[i + 1], factor);
+      }
+    }
+    return ecc;
+  }
+
+  function encodeVersionInfo(ver) {
+    let rem = ver << 12;
+    for (let i = 5; i >= 0; i -= 1) {
+      if ((rem >>> (i + 12)) & 1) {
+        rem ^= 0x1f25 << i;
+      }
+    }
+    return (ver << 12) | rem;
+  }
+
+  function renderPairingQrSvg(uri) {
+    if (typeof uri !== 'string' || uri.length === 0) {
+      throw new Error('配对链接为空，无法生成二维码');
+    }
+    const dataBytes = Array.from(new TextEncoder().encode(uri));
+
+    let ver = 1;
+    while (ver < VERSIONS.length) {
+      const countBits = ver >= 10 ? 16 : 8;
+      if (4 + countBits + dataBytes.length * 8 <= VERSIONS[ver].data * 8) {
+        break;
+      }
+      ver += 1;
+    }
+    if (ver >= VERSIONS.length) {
+      throw new Error(`配对链接长度（${dataBytes.length} 字节）超出二维码最大容量（271 字节）`);
+    }
+
+    const spec = VERSIONS[ver];
+    const countBits = ver >= 10 ? 16 : 8;
+
+    // Bitstream: Mode 0100 (Byte), 8/16-bit length, payload bytes, terminator, pad bytes 0xEC / 0x11
     const bits = [];
     const pushBits = (val, len) => {
       for (let i = len - 1; i >= 0; i -= 1) bits.push((val >>> i) & 1);
     };
     pushBits(0b0100, 4);
-    pushBits(payload.length, 8);
-    for (const b of payload) pushBits(b, 8);
+    pushBits(dataBytes.length, countBits);
+    for (const b of dataBytes) pushBits(b, 8);
     pushBits(0, Math.min(4, spec.data * 8 - bits.length));
     while (bits.length % 8 !== 0) bits.push(0);
+
     const codewords = [];
     for (let i = 0; i < bits.length; i += 8) {
       let byte = 0;
@@ -41,36 +109,30 @@
       padToggle = !padToggle;
     }
 
-    // GF(256) Reed-Solomon ECC (primitive polynomial 0x11D)
-    const gfMul = (a, b) => {
-      let r = 0;
-      for (let i = 0; i < 8; i += 1) {
-        if (b & 1) r ^= a;
-        const hi = a & 0x80;
-        a = (a << 1) & 0xff;
-        if (hi) a ^= 0x1d;
-        b >>>= 1;
-      }
-      return r;
-    };
-    let gen = [1];
-    let root = 1;
-    for (let i = 0; i < spec.ecc; i += 1) {
-      const next = new Array(gen.length + 1).fill(0);
-      for (let j = 0; j < gen.length; j += 1) {
-        next[j] ^= gen[j];
-        next[j + 1] ^= gfMul(gen[j], root);
-      }
-      gen = next;
-      root = gfMul(root, 2);
+    // Split data codewords into ISO/IEC 18004 RS blocks, generate per-block ECC, and interleave
+    const gen = rsGeneratorPoly(spec.eccPerBlock);
+    const dataBlocks = [];
+    const eccBlocks = [];
+    let offset = 0;
+    for (const blockLen of spec.blocks) {
+      const block = codewords.slice(offset, offset + blockLen);
+      offset += blockLen;
+      dataBlocks.push(block);
+      eccBlocks.push(rsEncodeBlock(block, gen, spec.eccPerBlock));
     }
-    const ecc = new Array(spec.ecc).fill(0);
-    for (const b of codewords) {
-      const factor = b ^ ecc.shift();
-      ecc.push(0);
-      for (let i = 0; i < spec.ecc; i += 1) ecc[i] ^= gfMul(gen[i + 1], factor);
+
+    const allCodewords = [];
+    const maxDataLen = Math.max(...spec.blocks);
+    for (let i = 0; i < maxDataLen; i += 1) {
+      for (const block of dataBlocks) {
+        if (i < block.length) allCodewords.push(block[i]);
+      }
     }
-    const allCodewords = codewords.concat(ecc);
+    for (let i = 0; i < spec.eccPerBlock; i += 1) {
+      for (const eccBlock of eccBlocks) {
+        allCodewords.push(eccBlock[i]);
+      }
+    }
 
     const size = spec.size;
     const mat = Array.from({ length: size }, () => Array(size).fill(false));
@@ -99,7 +161,7 @@
     }
     for (const ar of spec.align) {
       for (const ac of spec.align) {
-        if ((ar === 6 && ac === 6) || (ar === 6 && ac === size - 7) || (ar === size - 7 && ac === 6)) continue;
+        if ((ar <= 8 && ac <= 8) || (ar <= 8 && ac >= size - 9) || (ar >= size - 9 && ac <= 8)) continue;
         for (let dr = -2; dr <= 2; dr += 1) {
           for (let dc = -2; dc <= 2; dc += 1) {
             setFunc(ar + dr, ac + dc, Math.max(Math.abs(dr), Math.abs(dc)) !== 1);
@@ -107,6 +169,18 @@
         }
       }
     }
+    // Version info for Version 7+ (two 6x3 BCH(18,6) regions)
+    if (ver >= 7) {
+      const verBits = encodeVersionInfo(ver);
+      for (let i = 0; i < 18; i += 1) {
+        const dark = ((verBits >>> i) & 1) === 1;
+        const a = Math.floor(i / 3);
+        const b = size - 11 + (i % 3);
+        setFunc(a, b, dark);
+        setFunc(b, a, dark);
+      }
+    }
+
     // Format info for ECC Level L (01) + Mask 0 (000) -> 0b01000 -> BCH(15,5) XOR 0x5412 = 0x77C4
     const fmt = 0x77c4;
     for (let i = 0; i <= 5; i += 1) setFunc(8, i, ((fmt >>> (14 - i)) & 1) === 1);
@@ -151,4 +225,4 @@
 
   global.LanVault = global.LanVault || {};
   global.LanVault.qr = { renderPairingQrSvg };
-})(window);
+})(typeof window !== 'undefined' ? window : globalThis);

@@ -111,10 +111,13 @@
     }
 
     async #probeAuthBeforeReconnect() {
+      const controller = new AbortController();
+      const timeoutId = global.setTimeout(() => controller.abort(), 5000);
       try {
         const response = await fetch('/api/system/status', {
           method: 'GET',
           credentials: 'same-origin',
+          signal: controller.signal,
           headers: { Accept: 'application/json' },
         });
         if (!this.shouldReconnect) return;
@@ -127,6 +130,8 @@
         }
       } catch {
         // Server unreachable or restarting; continue with backoff reconnect.
+      } finally {
+        global.clearTimeout(timeoutId);
       }
 
       if (!this.shouldReconnect) return;

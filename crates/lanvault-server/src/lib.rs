@@ -322,6 +322,7 @@ pub async fn serve_with_shutdown_and_state(
         pending_pair_lock: std::sync::Mutex::new(()),
         pending_pair_requests: DashMap::new(),
         renew_challenges: DashMap::new(),
+        renew_rate_limits: DashMap::new(),
         transfer_budget_lock: std::sync::Mutex::new(()),
         transfer_locks: std::array::from_fn(|_| Arc::new(tokio::sync::RwLock::new(()))),
         online_peers: DashMap::new(),
@@ -522,11 +523,17 @@ fn recover_index_from_volumes(db: &Database, vault_root: &Path) -> Result<bool> 
     let mut processed_manifests = HashSet::new();
     let mut complete = true;
     for vault in db.list_vaults()? {
+        let mut online_volumes = 0usize;
+        let mut offline_volumes = 0usize;
         for volume in db.list_vault_volumes(&vault.vault_id)? {
             if !volume.is_online {
-                complete = false;
+                offline_volumes += 1;
+                if vault.pool_mode != PoolMode::MirrorRaid1 {
+                    complete = false;
+                }
                 continue;
             }
+            online_volumes += 1;
             let root = PathBuf::from(&volume.mount_path);
             let chunks_root = root.join("chunks");
             if let Ok(buckets) = std::fs::read_dir(&chunks_root) {
@@ -688,6 +695,17 @@ fn recover_index_from_volumes(db: &Database, vault_root: &Path) -> Result<bool> 
                 db.insert_snapshot_with_chunks(&record, &hashes)?;
             }
         }
+        if vault.pool_mode == PoolMode::MirrorRaid1 && offline_volumes > 0 {
+            if online_volumes == 0 {
+                complete = false;
+            } else {
+                warn!(
+                    vault_id = %vault.vault_id,
+                    offline_volumes,
+                    "mirror_raid1 recovery completed with degraded redundancy (offline mirror volume)"
+                );
+            }
+        }
         let actual_bytes = db
             .list_all_chunks(&vault.vault_id)?
             .iter()
@@ -752,4 +770,103 @@ fn detect_lan_ipv4() -> Ipv4Addr {
         }
     }
     Ipv4Addr::LOCALHOST
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lanvault_core::VolumeRole;
+
+    #[test]
+    fn mirror_recovery_is_complete_when_online_mirror_has_all_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "lanvault_mirror_recovery_test_{}_{}",
+            std::process::id(),
+            unix_timestamp_secs()
+        ));
+        let online_root = dir.join("disk_a");
+        let offline_root = dir.join("disk_b_missing");
+        std::fs::create_dir_all(online_root.join("chunks").join("00")).unwrap();
+        std::fs::create_dir_all(online_root.join("manifests")).unwrap();
+
+        let chunk_data = b"hello mirror chunk";
+        let chunk_hash = blake3_hash(chunk_data);
+        let chunk_hex = hex::encode(chunk_hash);
+        std::fs::write(
+            online_root.join("chunks").join(&chunk_hex[..2]).join(&chunk_hex),
+            chunk_data,
+        )
+        .or_else(|_| {
+            let bucket = online_root.join("chunks").join(&chunk_hex[..2]);
+            std::fs::create_dir_all(&bucket)?;
+            std::fs::write(bucket.join(&chunk_hex), chunk_data)
+        })
+        .unwrap();
+
+        let rel_path = "doc.txt";
+        let mut canonical = Vec::new();
+        canonical.extend_from_slice(rel_path.as_bytes());
+        canonical.push(0);
+        canonical.extend_from_slice(&(chunk_data.len() as u64).to_le_bytes());
+        canonical.extend_from_slice(&0i64.to_le_bytes());
+        canonical.extend_from_slice(&chunk_hash);
+        let root_hash_hex = hex::encode(blake3_hash(&canonical));
+
+        let manifest_json = serde_json::json!({
+            "snapshot_id": "snap-mirror-1",
+            "vault_id": "v-mirror",
+            "rule_id": "rule-1",
+            "device_id": "lv-dev1",
+            "root_tree_hash_hex": root_hash_hex,
+            "created_at": 1_700_000_000i64,
+            "files": [{
+                "rel_path": rel_path,
+                "size": chunk_data.len(),
+                "mtime_ns": 0,
+                "chunk_hashes_hex": [chunk_hex],
+            }]
+        });
+        std::fs::write(
+            online_root.join("manifests").join("snap-mirror-1.json"),
+            serde_json::to_vec(&manifest_json).unwrap(),
+        )
+        .unwrap();
+
+        let db = Database::open(&dir.join("index.db")).unwrap();
+        db.insert_vault(
+            &VaultRecord {
+                vault_id: "v-mirror".to_string(),
+                name: "Mirror".to_string(),
+                pool_mode: PoolMode::MirrorRaid1,
+                quota_bytes: 1024 * 1024,
+                used_bytes: 0,
+                e2ee_enabled: false,
+                created_at: 1_700_000_000,
+            },
+            &[
+                VaultVolumeRecord {
+                    volume_id: "vol-1".to_string(),
+                    vault_id: "v-mirror".to_string(),
+                    mount_path: online_root.to_string_lossy().into_owned(),
+                    volume_guid: None,
+                    role: VolumeRole::Primary,
+                    is_online: true,
+                },
+                VaultVolumeRecord {
+                    volume_id: "vol-2".to_string(),
+                    vault_id: "v-mirror".to_string(),
+                    mount_path: offline_root.to_string_lossy().into_owned(),
+                    volume_guid: None,
+                    role: VolumeRole::Mirror,
+                    is_online: false,
+                },
+            ],
+        )
+        .unwrap();
+
+        let complete = recover_index_from_volumes(&db, &dir).unwrap();
+        assert!(complete);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

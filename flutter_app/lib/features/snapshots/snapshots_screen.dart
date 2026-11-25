@@ -71,12 +71,14 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
   bool _hasMoreCatalog = false;
 
   String _selectedVaultId = _allVaultsSentinel;
+  String _loadedVaultId = _allVaultsSentinel;
   String? _selectedSnapshotId;
   BitRotScrubResultModel? _lastScrubResult;
 
   bool _loading = true;
   bool _scrubbing = false;
   bool _restoring = false;
+  int _dataRequest = 0;
 
   @override
   void initState() {
@@ -85,16 +87,22 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
   }
 
   Future<void> _loadData() async {
+    final request = ++_dataRequest;
+    final requestedVaultId = _selectedVaultId;
     setState(() => _loading = true);
     try {
       final vaultFilter =
-          _selectedVaultId == _allVaultsSentinel ? null : _selectedVaultId;
+          requestedVaultId == _allVaultsSentinel ? null : requestedVaultId;
       final results = await Future.wait<Object>(<Future<Object>>[
         widget.bridge.listVaults(),
         widget.bridge.listSnapshots(vaultId: vaultFilter),
         widget.bridge.listGroupRules(),
       ]);
-      if (!mounted) return;
+      if (!mounted ||
+          request != _dataRequest ||
+          requestedVaultId != _selectedVaultId) {
+        return;
+      }
       final vaults = results[0] as List<VaultSummaryModel>;
       final snapshots = results[1] as List<SnapshotSummaryModel>;
       final groupRules = results[2] as List<GroupRuleViewModel>;
@@ -115,6 +123,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
       setState(() {
         _vaults = vaults;
         _snapshots = snapshots;
+        _loadedVaultId = requestedVaultId;
         _bindingOptions = bindings;
         _selectedBindingId = nextBindingId;
         if (snapshots.isNotEmpty &&
@@ -129,15 +138,21 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
 
       if (nextBindingId != null) {
         await _loadCatalogEntries(reset: true);
-      } else if (mounted) {
+      } else if (mounted && request == _dataRequest) {
         setState(() {
           _catalogEntries = const <CatalogEntryModel>[];
           _hasMoreCatalog = false;
         });
       }
     } catch (err) {
-      if (!mounted) return;
-      setState(() => _loading = false);
+      if (!mounted || request != _dataRequest) return;
+      setState(() {
+        _loading = false;
+        if (_selectedVaultId != _loadedVaultId) {
+          _snapshots = const <SnapshotSummaryModel>[];
+          _selectedSnapshotId = null;
+        }
+      });
       NeuToast.error(
         context,
         '加载快照列表失败：${LanVaultBridge.formatUserError(err)}',

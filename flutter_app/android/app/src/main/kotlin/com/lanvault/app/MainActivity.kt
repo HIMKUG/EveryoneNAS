@@ -22,6 +22,7 @@ import android.provider.OpenableColumns
 import java.io.File
 import java.io.FileOutputStream
 import android.provider.Settings
+import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.lanvault.app.privilege.KeepAliveLevel
 import com.lanvault.app.privilege.KeepAliveService
@@ -42,12 +43,21 @@ class MainActivity : FlutterActivity() {
         private const val NOTIFICATION_PERMISSION_REQUEST = 7844
         private const val PICK_DIRECTORY_REQUEST = 7845
         private const val PICK_FILE_REQUEST = 7846
+        private const val BATTERY_EXEMPTION_REQUEST = 7847
+        private const val ALL_FILES_ACCESS_REQUEST = 7848
+        private const val PERM_PREFS_NAME = "lanvault_permission_prefs"
+        private const val KEY_LOCATION_DENIED_FOREVER = "location_denied_forever"
+        private const val KEY_NOTIFICATION_DENIED_FOREVER = "notification_denied_forever"
     }
 
     private val backgroundExecutor: ExecutorService = Executors.newCachedThreadPool()
     private val mainHandler = Handler(Looper.getMainLooper())
     private var pendingDirectoryResult: MethodChannel.Result? = null
     private var pendingFileResult: MethodChannel.Result? = null
+    private var pendingBatteryResult: MethodChannel.Result? = null
+    private var pendingStorageResult: MethodChannel.Result? = null
+    private var pendingLocationResult: MethodChannel.Result? = null
+    private var pendingNotificationResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -62,12 +72,70 @@ class MainActivity : FlutterActivity() {
         pendingDirectoryResult = null
         pendingFileResult?.success(null)
         pendingFileResult = null
+        pendingBatteryResult?.success(false)
+        pendingBatteryResult = null
+        pendingStorageResult?.success(false)
+        pendingStorageResult = null
+        pendingLocationResult?.success(false)
+        pendingLocationResult = null
+        pendingNotificationResult?.success(false)
+        pendingNotificationResult = null
         backgroundExecutor.shutdown()
         super.onDestroy()
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray,
+    ) {
+        if (requestCode == LOCATION_PERMISSION_REQUEST) {
+            val pending = pendingLocationResult
+            pendingLocationResult = null
+            val granted = isLocationGranted()
+            setPermissionDeniedForever(
+                KEY_LOCATION_DENIED_FOREVER,
+                !granted && !ActivityCompat.shouldShowRequestPermissionRationale(
+                    this,
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                ),
+            )
+            pending?.success(granted)
+            return
+        }
+        if (requestCode == NOTIFICATION_PERMISSION_REQUEST) {
+            val pending = pendingNotificationResult
+            pendingNotificationResult = null
+            val granted = isNotificationGranted()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                setPermissionDeniedForever(
+                    KEY_NOTIFICATION_DENIED_FOREVER,
+                    !granted && !ActivityCompat.shouldShowRequestPermissionRationale(
+                        this,
+                        Manifest.permission.POST_NOTIFICATIONS,
+                    ),
+                )
+            }
+            pending?.success(granted)
+            return
+        }
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+    }
+
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == BATTERY_EXEMPTION_REQUEST) {
+            val pending = pendingBatteryResult
+            pendingBatteryResult = null
+            pending?.success(isBatteryExempted())
+            return
+        }
+        if (requestCode == ALL_FILES_ACCESS_REQUEST) {
+            val pending = pendingStorageResult
+            pendingStorageResult = null
+            pending?.success(isAllFilesGranted())
+            return
+        }
         if (requestCode == PICK_DIRECTORY_REQUEST) {
             val pending = pendingDirectoryResult
             pendingDirectoryResult = null
@@ -153,31 +221,66 @@ class MainActivity : FlutterActivity() {
 
             "requestBatteryExemption" -> {
                 try {
-                    result.success(requestBatteryOptimizationExemption())
+                    requestBatteryOptimizationExemption(result)
                 } catch (t: Throwable) {
+                    pendingBatteryResult = null
                     result.error("KEEP_ALIVE_ERROR", t.message ?: t.javaClass.simpleName, null)
                 }
             }
 
             "requestStoragePermission" -> {
                 try {
-                    result.success(requestAllFilesAccessPermission())
+                    requestAllFilesAccessPermission(result)
                 } catch (t: Throwable) {
+                    pendingStorageResult = null
                     result.error("KEEP_ALIVE_ERROR", t.message ?: t.javaClass.simpleName, null)
                 }
             }
 
             "requestLocationPermission" -> {
                 try {
-                    result.success(requestLocationPermissions())
+                    requestLocationPermissions(result)
                 } catch (t: Throwable) {
+                    pendingLocationResult = null
                     result.error("KEEP_ALIVE_ERROR", t.message ?: t.javaClass.simpleName, null)
                 }
             }
 
             "requestNotificationPermission" -> {
                 try {
-                    result.success(requestPostNotificationsPermission())
+                    requestPostNotificationsPermission(result)
+                } catch (t: Throwable) {
+                    pendingNotificationResult = null
+                    result.error("KEEP_ALIVE_ERROR", t.message ?: t.javaClass.simpleName, null)
+                }
+            }
+
+            "getPermissionStates" -> {
+                try {
+                    val locationGranted = isLocationGranted()
+                    val notificationGranted = isNotificationGranted()
+                    result.success(
+                        mapOf(
+                            "battery" to isBatteryExempted(),
+                            "storage" to isAllFilesGranted(),
+                            "location" to locationGranted,
+                            "notification" to notificationGranted,
+                            "locationDeniedForever" to (!locationGranted && isPermissionDeniedForever(KEY_LOCATION_DENIED_FOREVER)),
+                            "notificationDeniedForever" to (!notificationGranted && isPermissionDeniedForever(KEY_NOTIFICATION_DENIED_FOREVER)),
+                        ),
+                    )
+                } catch (t: Throwable) {
+                    result.error("KEEP_ALIVE_ERROR", t.message ?: t.javaClass.simpleName, null)
+                }
+            }
+
+            "openAppSettings" -> {
+                try {
+                    val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                    result.success(null)
                 } catch (t: Throwable) {
                     result.error("KEEP_ALIVE_ERROR", t.message ?: t.javaClass.simpleName, null)
                 }
@@ -299,7 +402,7 @@ class MainActivity : FlutterActivity() {
                 )
             }
             KeepAliveLevel.LEVEL_0_FOREGROUND -> {
-                KeepAliveService.start(
+                KeepAliveService.startAndAwait(
                     applicationContext,
                     vaultPath,
                     quotaGb,
@@ -307,7 +410,6 @@ class MainActivity : FlutterActivity() {
                     webPassword,
                     skipNativeStart,
                 )
-                true
             }
         }
     }
@@ -319,7 +421,6 @@ class MainActivity : FlutterActivity() {
             KeepAliveLevel.LEVEL_1_SHIZUKU -> ShizukuBridge.gracefulRestart(applicationContext)
             KeepAliveLevel.LEVEL_0_FOREGROUND -> {
                 KeepAliveService.requestGracefulRestart(applicationContext)
-                true
             }
         }
     }
@@ -342,40 +443,79 @@ class MainActivity : FlutterActivity() {
         }
     }
 
-    private fun requestBatteryOptimizationExemption(): Boolean {
+    private fun isBatteryExempted(): Boolean {
         val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-        if (powerManager.isIgnoringBatteryOptimizations(packageName)) {
-            return true
-        }
-        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-            data = Uri.parse("package:$packageName")
-        }
-        startActivity(intent)
-        return false
+        return powerManager.isIgnoringBatteryOptimizations(packageName)
     }
 
-    private fun requestAllFilesAccessPermission(): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            return true
-        }
-        if (Environment.isExternalStorageManager()) {
-            return true
-        }
-        val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-            data = Uri.parse("package:$packageName")
-        }
-        startActivity(intent)
-        return false
+    private fun isAllFilesGranted(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.R ||
+            Environment.isExternalStorageManager()
     }
 
-    private fun requestLocationPermissions(): Boolean {
-        val fineGranted = ContextCompat.checkSelfPermission(
+    private fun isLocationGranted(): Boolean {
+        return ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.ACCESS_FINE_LOCATION,
         ) == PackageManager.PERMISSION_GRANTED
-        if (fineGranted) {
-            return true
+    }
+
+    private fun isNotificationGranted(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun isPermissionDeniedForever(key: String): Boolean {
+        return getSharedPreferences(PERM_PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(key, false)
+    }
+
+    private fun setPermissionDeniedForever(key: String, deniedForever: Boolean) {
+        getSharedPreferences(PERM_PREFS_NAME, MODE_PRIVATE)
+            .edit()
+            .putBoolean(key, deniedForever)
+            .apply()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun requestBatteryOptimizationExemption(result: MethodChannel.Result) {
+        if (isBatteryExempted()) {
+            result.success(true)
+            return
         }
+        pendingBatteryResult?.success(false)
+        pendingBatteryResult = result
+        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+            data = Uri.parse("package:$packageName")
+        }
+        startActivityForResult(intent, BATTERY_EXEMPTION_REQUEST)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun requestAllFilesAccessPermission(result: MethodChannel.Result) {
+        if (isAllFilesGranted()) {
+            result.success(true)
+            return
+        }
+        pendingStorageResult?.success(false)
+        pendingStorageResult = result
+        val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+            data = Uri.parse("package:$packageName")
+        }
+        startActivityForResult(intent, ALL_FILES_ACCESS_REQUEST)
+    }
+
+    private fun requestLocationPermissions(result: MethodChannel.Result) {
+        if (isLocationGranted()) {
+            setPermissionDeniedForever(KEY_LOCATION_DENIED_FOREVER, false)
+            result.success(true)
+            return
+        }
+        pendingLocationResult?.success(false)
+        pendingLocationResult = result
         requestPermissions(
             arrayOf(
                 Manifest.permission.ACCESS_FINE_LOCATION,
@@ -383,25 +523,20 @@ class MainActivity : FlutterActivity() {
             ),
             LOCATION_PERMISSION_REQUEST,
         )
-        return false
     }
 
-    private fun requestPostNotificationsPermission(): Boolean {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-            return true
+    private fun requestPostNotificationsPermission(result: MethodChannel.Result) {
+        if (isNotificationGranted()) {
+            setPermissionDeniedForever(KEY_NOTIFICATION_DENIED_FOREVER, false)
+            result.success(true)
+            return
         }
-        val granted = ContextCompat.checkSelfPermission(
-            this,
-            Manifest.permission.POST_NOTIFICATIONS,
-        ) == PackageManager.PERMISSION_GRANTED
-        if (granted) {
-            return true
-        }
+        pendingNotificationResult?.success(false)
+        pendingNotificationResult = result
         requestPermissions(
             arrayOf(Manifest.permission.POST_NOTIFICATIONS),
             NOTIFICATION_PERMISSION_REQUEST,
         )
-        return false
     }
 
     @Suppress("DEPRECATION")

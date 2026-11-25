@@ -10,6 +10,7 @@ import 'package:lanvault_app/bridge/system_env_helper.dart';
 import 'package:lanvault_app/bridge/window_chrome.dart';
 import 'package:lanvault_app/features/backup/backup_screen.dart';
 import 'package:lanvault_app/features/settings/settings_screen.dart';
+import 'package:lanvault_app/features/snapshots/snapshots_screen.dart';
 import 'package:lanvault_app/features/vault/vault_screen.dart';
 import 'package:lanvault_app/main.dart';
 import 'package:lanvault_app/theme/neu_theme.dart';
@@ -892,4 +893,175 @@ void main() {
     NeuToast.dismiss();
     await tester.pump(const Duration(milliseconds: 50));
   });
+
+  testWidgets('LanVaultShell keeps dialog open and reports error when reject fails',
+      (tester) async {
+    final ffi = _ThrowingPairRejectFfi();
+    final bridge = LanVaultBridge(rustFfi: ffi);
+    addTearDown(bridge.dispose);
+
+    await tester.pumpWidget(LanVaultApp(bridge: bridge));
+    await tester.pumpAndSettle();
+
+    bridge.pendingPairRequestsNotifier.value = const <PendingPairRequestModel>[
+      PendingPairRequestModel(
+        requestId: 'req-fail-1',
+        deviceId: 'phone-2',
+        deviceName: 'Pixel 9',
+        osType: 'Android',
+        fingerprint: 'ef56ab78',
+        remoteIp: '192.168.1.99',
+        createdAt: 1700000000,
+        expiresAt: 1700000120,
+      ),
+    ];
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('拒绝'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('收到设备配对请求'), findsOneWidget);
+    expect(find.textContaining('已拒绝 Pixel 9'), findsNothing);
+    NeuToast.dismiss();
+    await tester.pump(const Duration(milliseconds: 50));
+  });
+
+  testWidgets('VaultScreen displays error state instead of empty state when load fails',
+      (tester) async {
+    final ffi = _FailingVaultFfi();
+    final bridge = LanVaultBridge(rustFfi: ffi);
+    addTearDown(bridge.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildLanVaultTheme(),
+        home: Scaffold(body: VaultScreen(bridge: bridge)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('加载存储池失败'), findsOneWidget);
+    expect(find.text('还没有存储池'), findsNothing);
+    expect(find.widgetWithText(NeuButton, '重试'), findsOneWidget);
+    NeuToast.dismiss();
+    await tester.pump(const Duration(milliseconds: 50));
+  });
+
+  testWidgets('SettingsScreen retains succeeded fields when one setting fails to load',
+      (tester) async {
+    final ffi = _PartialFailSettingsFfi();
+    final bridge = LanVaultBridge(rustFfi: ffi);
+    addTearDown(bridge.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildLanVaultTheme(),
+        home: Scaffold(body: SettingsScreen(bridge: bridge)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('仅客户端'), findsOneWidget);
+    expect(find.textContaining('部分配置读取失败'), findsOneWidget);
+    NeuToast.dismiss();
+    await tester.pump(const Duration(milliseconds: 50));
+  });
+
+  testWidgets('SnapshotsScreen ignores stale _loadData response from earlier filter',
+      (tester) async {
+    final ffi = _DelayedSnapshotsFfi();
+    final bridge = LanVaultBridge(rustFfi: ffi);
+    addTearDown(bridge.dispose);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildLanVaultTheme(),
+        home: Scaffold(body: SnapshotsScreen(bridge: bridge)),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('全部存储池'), findsOneWidget);
+    await tester.tap(find.text('全部存储池'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Vault B').last);
+    await tester.pump();
+
+    ffi.completeVaultB(<SnapshotSummaryModel>[
+      const SnapshotSummaryModel(
+        snapshotId: 'snap-b-latest',
+        vaultId: 'v-b',
+        deviceId: 'dev-1',
+        retentionTier: 'daily',
+        fileCount: 2,
+        totalBytes: 2048,
+        createdAt: '2026-11-25 10:00',
+      ),
+    ]);
+    await tester.pumpAndSettle();
+    expect(find.text('snap-b-latest'), findsOneWidget);
+    NeuToast.dismiss();
+    await tester.pump(const Duration(milliseconds: 50));
+  });
+}
+
+class _ThrowingPairRejectFfi extends _FakeLanVaultFfi {
+  _ThrowingPairRejectFfi() : super(serverRunning: true);
+
+  @override
+  Future<bool> respondPairRequest({
+    required String requestId,
+    required bool accept,
+  }) async {
+    throw StateError('network timeout');
+  }
+}
+
+class _FailingVaultFfi extends _FakeLanVaultFfi {
+  @override
+  Future<List<VaultSummaryModel>> listVaults() async {
+    throw StateError('database unavailable');
+  }
+}
+
+class _PartialFailSettingsFfi extends _FakeLanVaultFfi {
+  @override
+  Future<RoleMode> getRoleMode() async => RoleMode.clientOnly;
+
+  @override
+  Future<PowerNetworkPolicyModel> getPowerNetworkPolicy() async {
+    throw StateError('policy read failed');
+  }
+}
+
+class _DelayedSnapshotsFfi extends _FakeLanVaultFfi {
+  final Completer<List<SnapshotSummaryModel>> _vaultBCompleter =
+      Completer<List<SnapshotSummaryModel>>();
+
+  void completeVaultB(List<SnapshotSummaryModel> list) {
+    if (!_vaultBCompleter.isCompleted) {
+      _vaultBCompleter.complete(list);
+    }
+  }
+
+  @override
+  Future<List<VaultSummaryModel>> listVaults() async => const <VaultSummaryModel>[
+        VaultSummaryModel(
+          vaultId: 'v-b',
+          name: 'Vault B',
+          poolMode: 'single',
+          quotaBytes: 1024 * 1024 * 1024,
+          usedBytes: 1024,
+          e2eeEnabled: true,
+          volumes: <VaultVolumeModel>[],
+        ),
+      ];
+
+  @override
+  Future<List<SnapshotSummaryModel>> listSnapshots({String? vaultId}) {
+    if (vaultId == 'v-b') {
+      return _vaultBCompleter.future;
+    }
+    return Future<List<SnapshotSummaryModel>>.value(const <SnapshotSummaryModel>[]);
+  }
 }

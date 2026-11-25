@@ -594,7 +594,6 @@ class _DashboardScreenState extends State<DashboardScreen> {
     final used = overview?.vaultUsedBytes ?? 0;
     final quota = overview?.vaultQuotaBytes ?? 0;
     final ratio = quota > 0 ? (used / quota).clamp(0.0, 1.0) : 0.0;
-    final pct = (ratio * 100).round();
 
     return NeuCard(
       padding: const EdgeInsets.all(20),

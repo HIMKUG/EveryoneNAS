@@ -703,13 +703,16 @@ class _MessageBubbleRow extends StatelessWidget {
         ? item.content!
         : item.title;
 
-    return InkWell(
-      onTap: () {
-        Clipboard.setData(ClipboardData(text: text));
-        NeuToast.success(context, '已复制到剪贴板');
-      },
-      borderRadius: const BorderRadius.all(Radius.circular(18)),
-      child: Container(
+    return Semantics(
+      button: true,
+      onTapHint: '复制消息',
+      child: InkWell(
+        onTap: () {
+          Clipboard.setData(ClipboardData(text: text));
+          NeuToast.success(context, '已复制到剪贴板');
+        },
+        borderRadius: const BorderRadius.all(Radius.circular(18)),
+        child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
         decoration: BoxDecoration(
           color: incoming ? NeuTokens.surface : NeuTokens.accent,
@@ -717,12 +720,13 @@ class _MessageBubbleRow extends StatelessWidget {
           border: incoming ? Border.all(color: NeuTokens.hairlineBorder) : null,
           boxShadow: NeuTokens.controlShadows,
         ),
-        child: Text(
-          text,
-          style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: incoming ? NeuTokens.textPrimary : Colors.white,
-                height: 1.4,
-              ),
+          child: Text(
+            text,
+            style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                  color: incoming ? NeuTokens.textPrimary : Colors.white,
+                  height: 1.4,
+                ),
+          ),
         ),
       ),
     );
@@ -749,29 +753,35 @@ class _RoundActionButton extends StatelessWidget {
       message: tooltip,
       child: InkWell(
         onTap: onPressed,
-        borderRadius: const BorderRadius.all(Radius.circular(NeuRadius.pill)),
-        child: Container(
-          width: 42,
-          height: 42,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            color: primary
-                ? (enabled
-                    ? NeuTokens.accent
-                    : NeuTokens.accent.withValues(alpha: 0.35))
-                : NeuTokens.surface,
-            border:
-                primary ? null : Border.all(color: NeuTokens.hairlineBorder),
-            boxShadow: NeuTokens.controlShadows,
-          ),
-          child: Icon(
-            icon,
-            size: 20,
-            color: primary
-                ? Colors.white
-                : (enabled
-                    ? NeuTokens.textPrimary
-                    : NeuTokens.textSecondary.withValues(alpha: 0.4)),
+        customBorder: const CircleBorder(),
+        child: SizedBox(
+          width: 48,
+          height: 48,
+          child: Center(
+            child: Container(
+              width: 42,
+              height: 42,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: primary
+                    ? (enabled
+                        ? NeuTokens.accent
+                        : NeuTokens.accent.withValues(alpha: 0.35))
+                    : NeuTokens.surface,
+                border:
+                    primary ? null : Border.all(color: NeuTokens.hairlineBorder),
+                boxShadow: NeuTokens.controlShadows,
+              ),
+              child: Icon(
+                icon,
+                size: 20,
+                color: primary
+                    ? Colors.white
+                    : (enabled
+                        ? NeuTokens.textPrimary
+                        : NeuTokens.textSecondary.withValues(alpha: 0.4)),
+              ),
+            ),
           ),
         ),
       ),

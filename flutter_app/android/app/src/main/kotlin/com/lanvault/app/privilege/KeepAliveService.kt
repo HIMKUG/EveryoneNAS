@@ -30,7 +30,10 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.lanvault.app.MainActivity
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Level 0 标准非特权保活前台服务：
@@ -56,6 +59,10 @@ class KeepAliveService : Service() {
         private const val WORK_NAME = "lanvault_level0_periodic_recovery"
         private const val PREFS_NAME = "lanvault_keep_alive_prefs"
         private const val KEY_USER_STOPPED = "user_stopped"
+        private const val EXTRA_START_TOKEN = "start_token"
+        private const val START_AWAIT_TIMEOUT_SECS = 10L
+        private val nextStartToken = AtomicLong(1L)
+        private val pendingStartCallbacks = ConcurrentHashMap<Long, CompletableFuture<Boolean>>()
 
         data class LastConfig(
             val vaultPath: String,
@@ -87,6 +94,59 @@ class KeepAliveService : Service() {
             webPassword: String,
             skipNativeStart: Boolean = false,
         ) {
+            startInternal(
+                context,
+                vaultPath,
+                quotaGb,
+                port,
+                webPassword,
+                skipNativeStart,
+                token = 0L,
+            )
+        }
+
+        fun startAndAwait(
+            context: Context,
+            vaultPath: String,
+            quotaGb: Long,
+            port: Int,
+            webPassword: String,
+            skipNativeStart: Boolean = false,
+        ): Boolean {
+            val token = nextStartToken.getAndIncrement()
+            val future = CompletableFuture<Boolean>()
+            pendingStartCallbacks[token] = future
+            val launched = startInternal(
+                context,
+                vaultPath,
+                quotaGb,
+                port,
+                webPassword,
+                skipNativeStart,
+                token = token,
+            )
+            if (!launched) {
+                pendingStartCallbacks.remove(token)
+                return false
+            }
+            return try {
+                future.get(START_AWAIT_TIMEOUT_SECS, TimeUnit.SECONDS)
+            } catch (t: Throwable) {
+                pendingStartCallbacks.remove(token)
+                Log.w(TAG, "Timed out or interrupted waiting for KeepAliveService start: ${t.message}")
+                false
+            }
+        }
+
+        private fun startInternal(
+            context: Context,
+            vaultPath: String,
+            quotaGb: Long,
+            port: Int,
+            webPassword: String,
+            skipNativeStart: Boolean,
+            token: Long,
+        ): Boolean {
             setUserStopped(context, false)
             saveLastConfig(context, vaultPath, quotaGb, port, webPassword)
             val intent = Intent(context, KeepAliveService::class.java).apply {
@@ -96,9 +156,18 @@ class KeepAliveService : Service() {
                 putExtra(EXTRA_PORT, port)
                 putExtra(EXTRA_WEB_PASSWORD, webPassword)
                 putExtra(EXTRA_SKIP_NATIVE_START, skipNativeStart)
+                if (token > 0L) {
+                    putExtra(EXTRA_START_TOKEN, token)
+                }
             }
-            ContextCompat.startForegroundService(context, intent)
-            scheduleRecoveryWork(context)
+            return try {
+                ContextCompat.startForegroundService(context, intent)
+                scheduleRecoveryWork(context)
+                true
+            } catch (t: Throwable) {
+                Log.w(TAG, "startForegroundService failed: ${t.message}")
+                false
+            }
         }
 
         fun rememberConfig(
@@ -132,11 +201,32 @@ class KeepAliveService : Service() {
                 .apply()
         }
 
-        fun requestGracefulRestart(context: Context) {
+        fun requestGracefulRestart(context: Context): Boolean {
+            val token = nextStartToken.getAndIncrement()
+            val future = CompletableFuture<Boolean>()
+            pendingStartCallbacks[token] = future
             val intent = Intent(context, KeepAliveService::class.java).apply {
                 action = ACTION_GRACEFUL_RESTART
+                putExtra(EXTRA_START_TOKEN, token)
             }
-            ContextCompat.startForegroundService(context, intent)
+            val launched = try {
+                ContextCompat.startForegroundService(context, intent)
+                true
+            } catch (t: Throwable) {
+                Log.w(TAG, "requestGracefulRestart failed: ${t.message}")
+                false
+            }
+            if (!launched) {
+                pendingStartCallbacks.remove(token)
+                return false
+            }
+            return try {
+                future.get(START_AWAIT_TIMEOUT_SECS, TimeUnit.SECONDS)
+            } catch (t: Throwable) {
+                pendingStartCallbacks.remove(token)
+                Log.w(TAG, "Timed out waiting for KeepAliveService restart: ${t.message}")
+                false
+            }
         }
 
         fun notifyTransferStart(context: Context) {
@@ -154,12 +244,12 @@ class KeepAliveService : Service() {
         }
 
         /**
-         * 通过 WorkManager 周期性检查同步与服务状态（仅 Wi-Fi 约束），
+         * 通过 WorkManager 周期性检查同步与服务状态（要求任一可用网络连接），
          * 避免在 Android 15 BOOT_COMPLETED 广播中直接启动 dataSync 前台服务。
          */
         fun scheduleRecoveryWork(context: Context) {
             val constraints = Constraints.Builder()
-                .setRequiredNetworkType(NetworkType.UNMETERED)
+                .setRequiredNetworkType(NetworkType.CONNECTED)
                 .build()
 
             val request = PeriodicWorkRequestBuilder<KeepAliveRecoveryWorker>(
@@ -217,25 +307,40 @@ class KeepAliveService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val startToken = intent?.getLongExtra(EXTRA_START_TOKEN, 0L) ?: 0L
         when (intent?.action ?: ACTION_START) {
             ACTION_GRACEFUL_RESTART -> {
-                performGracefulRestart()
+                if (startToken > 0L && !pendingStartCallbacks.containsKey(startToken)) {
+                    stopForegroundAndSelf(startId)
+                    return START_NOT_STICKY
+                }
+                performGracefulRestart(startToken, startId)
                 return START_STICKY
             }
 
             ACTION_TRANSFER_START -> {
-                promoteToForeground("增量传输中 · 端口 $activePort (Level 0)")
+                if (!promoteToForegroundSafely("增量传输中 · 端口 $activePort (Level 0)")) {
+                    stopForegroundAndSelf(startId)
+                    return START_NOT_STICKY
+                }
                 acquireTransferLocks()
                 return START_STICKY
             }
 
             ACTION_TRANSFER_STOP -> {
                 releaseTransferLocks()
-                promoteToForeground("运行中 · 端口 $activePort (Level 0)")
+                if (!promoteToForegroundSafely("运行中 · 端口 $activePort (Level 0)")) {
+                    stopForegroundAndSelf(startId)
+                    return START_NOT_STICKY
+                }
                 return START_STICKY
             }
 
             else -> {
+                if (startToken > 0L && !pendingStartCallbacks.containsKey(startToken)) {
+                    stopForegroundAndSelf(startId)
+                    return START_NOT_STICKY
+                }
                 val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 activeVaultPath = intent?.getStringExtra(EXTRA_VAULT_PATH)
                     ?: prefs.getString(EXTRA_VAULT_PATH, activeVaultPath)!!
@@ -254,8 +359,13 @@ class KeepAliveService : Service() {
                     activePort,
                     activeWebPassword,
                 )
-                promoteToForeground("运行中 · 端口 $activePort (Level 0)")
+                if (!promoteToForegroundSafely("运行中 · 端口 $activePort (Level 0)")) {
+                    completeStartToken(startToken, false)
+                    stopForegroundAndSelf(startId)
+                    return START_NOT_STICKY
+                }
                 if (skipNativeStart) {
+                    completeStartToken(startToken, true)
                     return START_STICKY
                 }
                 val vaultPath = activeVaultPath
@@ -263,8 +373,17 @@ class KeepAliveService : Service() {
                 val port = activePort
                 val webPassword = activeWebPassword
                 Thread {
-                    if (!nativeStartKeepAliveServer(vaultPath, quotaGb, port, webPassword)) {
-                        stopSelf(startId)
+                    val started = try {
+                        nativeStartKeepAliveServer(vaultPath, quotaGb, port, webPassword)
+                    } catch (t: Throwable) {
+                        Log.e(TAG, "nativeStartKeepAliveServer threw", t)
+                        false
+                    }
+                    completeStartToken(startToken, started)
+                    if (!started) {
+                        mainHandler.post {
+                            stopForegroundAndSelf(startId)
+                        }
                     }
                 }.start()
                 return START_STICKY
@@ -333,13 +452,14 @@ class KeepAliveService : Service() {
         }
     }
 
-    private fun performGracefulRestart() {
+    private fun performGracefulRestart(startToken: Long = 0L, startId: Int? = null) {
         releaseTransferLocks()
         if (activeWebPassword.isBlank()) {
             val saved = loadLastConfig(this)
             if (saved == null) {
                 Log.w(TAG, "Cannot graceful-restart Level 0 service: no persisted config found.")
-                stopSelf()
+                completeStartToken(startToken, false)
+                stopForegroundAndSelf(startId)
                 return
             }
             activeVaultPath = saved.vaultPath
@@ -347,23 +467,62 @@ class KeepAliveService : Service() {
             activePort = saved.port
             activeWebPassword = saved.webPassword
         }
-        promoteToForeground("正在执行优雅重启（WAL 刷盘）…")
+        if (!promoteToForegroundSafely("正在执行优雅重启（WAL 刷盘）…")) {
+            completeStartToken(startToken, false)
+            stopForegroundAndSelf(startId)
+            return
+        }
         val vaultPath = activeVaultPath
         val quotaGb = activeQuotaGb
         val port = activePort
         val webPassword = activeWebPassword
         Thread {
-            val stopped = nativeGracefulRestartKeepAliveServer()
-            val restarted =
+            val restarted = try {
+                val stopped = nativeGracefulRestartKeepAliveServer()
                 stopped && nativeStartKeepAliveServer(vaultPath, quotaGb, port, webPassword)
-            if (restarted) {
-                mainHandler.post {
-                    promoteToForeground("运行中 · 端口 $port (Level 0)")
+            } catch (t: Throwable) {
+                Log.e(TAG, "Graceful restart native call threw", t)
+                false
+            }
+            completeStartToken(startToken, restarted)
+            mainHandler.post {
+                if (restarted) {
+                    promoteToForegroundSafely("运行中 · 端口 $port (Level 0)")
+                } else {
+                    stopForegroundAndSelf(startId)
                 }
-            } else {
-                stopSelf()
             }
         }.start()
+    }
+
+    private fun completeStartToken(token: Long, succeeded: Boolean) {
+        if (token <= 0L) return
+        pendingStartCallbacks.remove(token)?.complete(succeeded)
+    }
+
+    private fun promoteToForegroundSafely(contentText: String): Boolean {
+        return try {
+            promoteToForeground(contentText)
+            true
+        } catch (t: Throwable) {
+            Log.e(TAG, "promoteToForeground failed: ${t.message}", t)
+            false
+        }
+    }
+
+    private fun stopForegroundAndSelf(startId: Int?) {
+        releaseTransferLocks()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
+        }
+        if (startId != null) {
+            stopSelf(startId)
+        } else {
+            stopSelf()
+        }
     }
 
     private fun promoteToForeground(contentText: String) {
@@ -483,31 +642,14 @@ class KeepAliveRecoveryWorker(
                 if (config == null) {
                     Result.failure()
                 } else {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        try {
-                            KeepAliveService.start(
-                                applicationContext,
-                                config.vaultPath,
-                                config.quotaGb,
-                                config.port,
-                                config.webPassword,
-                            )
-                        } catch (e: ForegroundServiceStartNotAllowedException) {
-                            Log.w(
-                                TAG,
-                                "Background Level 0 FGS recovery skipped on API ${Build.VERSION.SDK_INT}: ${e.message}",
-                            )
-                        }
-                    } else {
-                        KeepAliveService.start(
-                            applicationContext,
-                            config.vaultPath,
-                            config.quotaGb,
-                            config.port,
-                            config.webPassword,
-                        )
-                    }
-                    Result.success()
+                    val started = KeepAliveService.startAndAwait(
+                        applicationContext,
+                        config.vaultPath,
+                        config.quotaGb,
+                        config.port,
+                        config.webPassword,
+                    )
+                    if (started) Result.success() else Result.retry()
                 }
             }
         }

@@ -25,9 +25,10 @@
 
 1. `POST /api/auth/login`（公开，防爆破）
    - Request: `{ "password": string }`
-   - 200 OK: `Set-Cookie: lv_session=<64-hex>; HttpOnly; SameSite=Strict; Path=/` + `{ "authenticated": true, "expires_in_secs": 86400 }`
+   - 200 OK: `Set-Cookie: lv_session=<payload_hex>.<signature_hex>; HttpOnly; SameSite=Strict; Path=/` + `{ "authenticated": true, "expires_in_secs": 86400 }`
    - 401 Unauthorized: `{ "error": "invalid_password", "remaining_attempts": number }` (连续错 1~2 次)
    - 429 Too Many Requests: Header `Retry-After: <secs>` + `{ "error": "locked_out", "retry_after_secs": number }` (连续错 3 次立即锁定该 IP 60 秒)
+   - 说明：已配对设备持有长期 Ed25519 私钥，可通过公开的 `/api/peers/session/challenge`（按 IP 与 `device_id` 限流，超限返回 `429`）和 `/api/peers/session` 签名换取 24 小时 peer 会话；管理员吊销设备后，设备立即失去续期与访问权限。
 2. `POST /api/auth/logout`（Cookie）
    - 200 OK: 清除 Cookie + `{ "authenticated": false }`
 3. `GET /api/system/status`（Cookie）

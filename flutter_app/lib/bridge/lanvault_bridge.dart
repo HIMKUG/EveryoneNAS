@@ -694,6 +694,39 @@ class AndroidKeepAliveChannel {
     return granted;
   }
 
+  Future<Map<String, bool>> getPermissionStates() async {
+    if (!Platform.isAndroid) {
+      return const <String, bool>{
+        'battery': true,
+        'storage': true,
+        'location': true,
+        'notification': true,
+        'locationDeniedForever': false,
+        'notificationDeniedForever': false,
+      };
+    }
+    final raw = await _channel.invokeMapMethod<String, Object?>(
+      'getPermissionStates',
+    );
+    if (raw == null) {
+      throw StateError('getPermissionStates returned null.');
+    }
+    return <String, bool>{
+      'battery': raw['battery'] as bool? ?? false,
+      'storage': raw['storage'] as bool? ?? false,
+      'location': raw['location'] as bool? ?? false,
+      'notification': raw['notification'] as bool? ?? false,
+      'locationDeniedForever': raw['locationDeniedForever'] as bool? ?? false,
+      'notificationDeniedForever':
+          raw['notificationDeniedForever'] as bool? ?? false,
+    };
+  }
+
+  Future<void> openAppSettings() async {
+    if (!Platform.isAndroid) return;
+    await _channel.invokeMethod<void>('openAppSettings');
+  }
+
   Future<String?> pickDirectory() async {
     if (!Platform.isAndroid) return null;
     final picked = await _channel.invokeMethod<String>('pickDirectory');
@@ -3249,8 +3282,9 @@ class LanVaultBridge {
     if (lower.contains('ssid')) return '已暂停 · 未连接到允许的家庭网络';
     if (lower.contains('paused')) return '已暂停自动备份';
     if (lower.contains('blocked')) return '已暂停 · 等待网络或电源条件满足';
-    if (lower.contains('error') || lower.contains('fail'))
+    if (lower.contains('error') || lower.contains('fail')) {
       return '同步遇到异常，正在等待重试';
+    }
     if (lower.contains('running') ||
         lower.contains('uploading') ||
         lower.contains('syncing')) {
@@ -3624,9 +3658,13 @@ class LanVaultBridge {
 
   Future<LastServerConfig?> getLastServerConfig() async {
     if (Platform.isAndroid) {
-      final androidSaved = await _keepAliveChannel.getLastServerConfig();
-      if (androidSaved != null) {
-        return androidSaved;
+      try {
+        final androidSaved = await _keepAliveChannel.getLastServerConfig();
+        if (androidSaved != null) {
+          return androidSaved;
+        }
+      } catch (_) {
+        // 原生配置读取失败时回退至 Rust 持久化配置。
       }
     }
     return _ffi.getLastServerConfig();
@@ -3690,13 +3728,19 @@ class LanVaultBridge {
         webPassword: webPassword,
         port: port,
       );
-      await _keepAliveChannel.startKeepAliveServer(
+      final keepAliveStarted = await _keepAliveChannel.startKeepAliveServer(
         vaultPath: trimmedPath,
         quotaGb: quotaGb,
         port: boundPort,
         webPassword: webPassword,
         skipNativeStart: true,
       );
+      if (!keepAliveStarted) {
+        try {
+          await _ffi.prepareGracefulRestart();
+        } catch (_) {}
+        throw StateError('Android 前台保活服务启动失败，请确认通知权限与后台权限已开启');
+      }
       _lastServerConfig = (
         vaultPath: trimmedPath,
         quotaGb: quotaGb,
@@ -4030,13 +4074,19 @@ class LanVaultBridge {
       port: config.port,
     );
     if (Platform.isAndroid) {
-      await _keepAliveChannel.startKeepAliveServer(
+      final keepAliveStarted = await _keepAliveChannel.startKeepAliveServer(
         vaultPath: config.vaultPath,
         quotaGb: config.quotaGb,
         port: boundPort,
         webPassword: config.webPassword,
         skipNativeStart: true,
       );
+      if (!keepAliveStarted) {
+        try {
+          await _ffi.prepareGracefulRestart();
+        } catch (_) {}
+        throw StateError('Android 前台保活服务重启失败');
+      }
     }
     _lastServerConfig = (
       vaultPath: config.vaultPath,
@@ -4063,6 +4113,11 @@ class LanVaultBridge {
 
   Future<bool> requestNotificationPermission() =>
       _keepAliveChannel.requestNotificationPermission();
+
+  Future<Map<String, bool>> getAndroidPermissionStates() =>
+      _keepAliveChannel.getPermissionStates();
+
+  Future<void> openAppSettings() => _keepAliveChannel.openAppSettings();
 
   Future<String?> pickDirectory({String description = '选择文件夹'}) =>
       SystemEnvHelper.pickDirectory(description: description);

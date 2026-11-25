@@ -259,7 +259,8 @@ EveryoneNAS 假定：**局域网是不可信的**。同网段的任何设备都�
 | 机制 | 实现 |
 | :--- | :--- |
 | 密码存储 | Argon2id（`argon2` crate，带随机盐） |
-| 会话 Cookie | `lv_session`，64 位 hex 随机令牌，`HttpOnly; SameSite=Strict; Path=/` |
+| 会话 Cookie | `lv_session`，Ed25519 签名载荷令牌（`<payload_hex>.<signature_hex>`），`HttpOnly; SameSite=Strict; Path=/` |
+| 凭证边界 | 已配对设备 Ed25519 私钥为长期身份凭证，可通过 challenge/renew 续期 24h `lv_session`；吊销设备可立即终止其会话与续期权限 |
 | 会话上限 | 256 条，LRU 淘汰——防止长时间运行内存泄漏 |
 | 防暴力破解 | 连续 3 次失败锁定该 IP **60 秒** |
 | 锁定表上限 | 4 096 条，防扫描器撑爆内存 |

@@ -12,6 +12,7 @@ use debug_routes::*;
 use groups_routes::*;
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::path::{Component, Path as StdPath, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
@@ -67,6 +68,12 @@ pub const MAX_PENDING_PAIR_REQUESTS: usize = 16;
 pub const MAX_PENDING_PAIR_REQUESTS_PER_IP: usize = 2;
 pub const RENEW_CHALLENGE_TTL_SECS: u64 = 60;
 const MAX_RENEW_CHALLENGES: usize = 256;
+const RENEW_CHALLENGE_WINDOW_SECS: u64 = 60;
+const MAX_RENEW_CHALLENGES_PER_IP: u32 = 20;
+const MAX_RENEW_CHALLENGES_PER_DEVICE: u32 = 8;
+const MAX_RENEW_CHALLENGES_ACTIVE_PER_DEVICE: usize = 4;
+const MAX_RENEW_REQUESTS_PER_IP: u32 = 30;
+const MAX_RENEW_RATE_ENTRIES: usize = 4096;
 pub const MAX_TRANSFER_FILE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub const MAX_ACTIVE_TRANSFERS_PER_DEVICE: usize = 8;
 pub const MAX_ACTIVE_TRANSFERS_GLOBAL: usize = 32;
@@ -213,6 +220,7 @@ pub struct AppState {
     pub pending_pair_lock: StdMutex<()>,
     pub pending_pair_requests: DashMap<String, PendingPairEntry>,
     pub renew_challenges: DashMap<String, RenewChallengeEntry>,
+    pub renew_rate_limits: DashMap<String, (Instant, u32)>,
     pub transfer_budget_lock: StdMutex<()>,
     pub(crate) transfer_locks: [Arc<tokio::sync::RwLock<()>>; TRANSFER_LOCK_COUNT],
     /// WebSocket 在线连接计数（按 device_id 聚合）。
@@ -2318,12 +2326,63 @@ impl AppState {
         Ok(())
     }
 
+    fn check_renew_rate_limit(
+        &self,
+        key: &str,
+        max_per_window: u32,
+    ) -> Result<(), LanVaultError> {
+        let now = Instant::now();
+        let window = Duration::from_secs(RENEW_CHALLENGE_WINDOW_SECS);
+        if self.renew_rate_limits.len() >= MAX_RENEW_RATE_ENTRIES {
+            self.renew_rate_limits
+                .retain(|_, (started_at, _)| now.saturating_duration_since(*started_at) < window);
+            if self.renew_rate_limits.len() >= MAX_RENEW_RATE_ENTRIES {
+                return Err(LanVaultError::RateLimited {
+                    retry_after_secs: RENEW_CHALLENGE_WINDOW_SECS,
+                });
+            }
+        }
+        match self.renew_rate_limits.entry(key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let (started_at, count) = entry.get_mut();
+                let elapsed = now.saturating_duration_since(*started_at);
+                if elapsed >= window {
+                    *started_at = now;
+                    *count = 1;
+                    Ok(())
+                } else if *count >= max_per_window {
+                    let retry_after_secs =
+                        RENEW_CHALLENGE_WINDOW_SECS.saturating_sub(elapsed.as_secs()).max(1);
+                    Err(LanVaultError::RateLimited { retry_after_secs })
+                } else {
+                    *count += 1;
+                    Ok(())
+                }
+            }
+            dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                vacant.insert((now, 1));
+                Ok(())
+            }
+        }
+    }
+
     pub fn issue_renew_challenge(&self, device_id: &str) -> Result<String, LanVaultError> {
+        self.issue_renew_challenge_from_ip(None, device_id)
+    }
+
+    pub fn issue_renew_challenge_from_ip(
+        &self,
+        client_ip: Option<IpAddr>,
+        device_id: &str,
+    ) -> Result<String, LanVaultError> {
         let trimmed = device_id.trim();
         if trimmed.is_empty() {
             return Err(LanVaultError::InvalidInput(
                 "device_id must not be empty".to_string(),
             ));
+        }
+        if let Some(ip) = client_ip {
+            self.check_renew_rate_limit(&format!("chal_ip:{ip}"), MAX_RENEW_CHALLENGES_PER_IP)?;
         }
         if !self.auth.validate_session_device_active(trimmed) {
             return Err(LanVaultError::Auth("device is revoked".to_string()));
@@ -2334,19 +2393,22 @@ impl AppState {
         if peer.revoked_at.is_some() {
             return Err(LanVaultError::Auth("device is revoked".to_string()));
         }
+        self.check_renew_rate_limit(&format!("chal_dev:{trimmed}"), MAX_RENEW_CHALLENGES_PER_DEVICE)?;
 
         let now = Instant::now();
         self.renew_challenges
             .retain(|_, entry| entry.expires_at > now);
-        if self.renew_challenges.len() >= MAX_RENEW_CHALLENGES {
-            if let Some(oldest_key) = self
-                .renew_challenges
-                .iter()
-                .min_by_key(|e| e.value().expires_at)
-                .map(|e| e.key().clone())
-            {
-                self.renew_challenges.remove(&oldest_key);
-            }
+        let active_for_device = self
+            .renew_challenges
+            .iter()
+            .filter(|e| e.value().device_id == trimmed)
+            .count();
+        if active_for_device >= MAX_RENEW_CHALLENGES_ACTIVE_PER_DEVICE
+            || self.renew_challenges.len() >= MAX_RENEW_CHALLENGES
+        {
+            return Err(LanVaultError::RateLimited {
+                retry_after_secs: RENEW_CHALLENGE_TTL_SECS,
+            });
         }
 
         let mut raw = [0u8; 32];
@@ -2859,14 +2921,31 @@ fn heartbeat_response(state: &AppState, ack_device_id: Option<String>) -> Respon
 /// 若让心跳把 401 当成"被解绑"，就会误删一份合法的配对。这里用设备自己的签名
 /// 换取新会话，让两端状态机在服务端重启后依然收敛（对齐 Tailscale 的
 /// "long-lived key re-authorization" 做法）。
+fn rate_limited_response(retry_after_secs: u64) -> Response {
+    let mut resp = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(serde_json::json!({
+            "error": "rate_limited",
+            "retry_after_secs": retry_after_secs,
+        })),
+    )
+        .into_response();
+    if let Ok(val) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        resp.headers_mut()
+            .insert(HeaderName::from_static("retry-after"), val);
+    }
+    resp
+}
+
 async fn handle_peer_session_challenge(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(LanConnectionInfo { addr, .. }): ConnectInfo<LanConnectionInfo>,
     Json(req): Json<PeerSessionChallengeRequest>,
 ) -> Response {
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
     }
-    match state.issue_renew_challenge(&req.device_id) {
+    match state.issue_renew_challenge_from_ip(Some(addr.ip()), &req.device_id) {
         Ok(challenge) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -2876,6 +2955,9 @@ async fn handle_peer_session_challenge(
             })),
         )
             .into_response(),
+        Err(LanVaultError::RateLimited { retry_after_secs }) => {
+            rate_limited_response(retry_after_secs)
+        }
         Err(LanVaultError::Auth(_)) => unauthorized_response(),
         Err(err) => map_domain_error(err),
     }
@@ -2889,6 +2971,11 @@ async fn handle_peer_session_renew(
 ) -> Response {
     if let Err(resp) = require_accepting_tasks(&state) {
         return resp;
+    }
+    if let Err(LanVaultError::RateLimited { retry_after_secs }) =
+        state.check_renew_rate_limit(&format!("renew_ip:{}", addr.ip()), MAX_RENEW_REQUESTS_PER_IP)
+    {
+        return rate_limited_response(retry_after_secs);
     }
     let challenge = req.nonce.trim();
     if challenge.is_empty() || req.device_id.trim().is_empty() {
@@ -4200,6 +4287,7 @@ mod batch_security_tests {
             pending_pair_lock: StdMutex::new(()),
             pending_pair_requests: DashMap::new(),
             renew_challenges: DashMap::new(),
+            renew_rate_limits: DashMap::new(),
             transfer_budget_lock: StdMutex::new(()),
             transfer_locks: std::array::from_fn(|_| Arc::new(tokio::sync::RwLock::new(()))),
             online_peers: DashMap::new(),
@@ -4777,6 +4865,34 @@ mod batch_security_tests {
             .list_snapshots_filtered_paginated(Some(&vault_id), None, 10, 0)
             .expect("admin all");
         assert_eq!(admin_all.len(), 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renew_challenge_rate_limits_and_does_not_evict_other_devices() {
+        let (state, dir) = make_test_state();
+        insert_fixture_peer(&state, "lv-peer-victim");
+        insert_fixture_peer(&state, "lv-peer-flood");
+        let ip: IpAddr = "192.168.1.99".parse().unwrap();
+
+        let victim_chal = state
+            .issue_renew_challenge_from_ip(Some(ip), "lv-peer-victim")
+            .expect("victim challenge");
+
+        // Per-device active cap rejects excessive challenges without evicting victim
+        for _ in 0..MAX_RENEW_CHALLENGES_ACTIVE_PER_DEVICE {
+            state
+                .issue_renew_challenge_from_ip(Some(ip), "lv-peer-flood")
+                .expect("flood within active cap");
+        }
+        let err = state
+            .issue_renew_challenge_from_ip(Some(ip), "lv-peer-flood")
+            .expect_err("must rate limit above active cap");
+        assert!(matches!(err, LanVaultError::RateLimited { .. }));
+
+        // Victim challenge remains intact
+        assert!(state.consume_renew_challenge(&victim_chal, "lv-peer-victim"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

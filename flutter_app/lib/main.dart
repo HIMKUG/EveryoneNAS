@@ -366,6 +366,7 @@ class _LanVaultShellState extends State<LanVaultShell> {
   Future<void> _showIncomingPairDialog(PendingPairRequestModel request) async {
     var submitting = false;
     var resolved = false;
+    var hasError = false;
     try {
       await showNeuDialog<void>(
         context: context,
@@ -377,6 +378,18 @@ class _LanVaultShellState extends State<LanVaultShell> {
                 title: '收到设备配对请求',
                 subtitle: '确认后对方设备将自动完成安全配对，无需手动输入配对码',
                 actions: <Widget>[
+                  if (hasError)
+                    NeuButton(
+                      label: '关闭',
+                      tone: NeuButtonTone.neutral,
+                      onPressed: submitting
+                          ? null
+                          : () {
+                              if (dialogContext.mounted) {
+                                Navigator.of(dialogContext).pop();
+                              }
+                            },
+                    ),
                   NeuButton(
                     label: '拒绝',
                     tone: NeuButtonTone.neutral,
@@ -384,22 +397,35 @@ class _LanVaultShellState extends State<LanVaultShell> {
                         ? null
                         : () async {
                             setDialogState(() => submitting = true);
-                            resolved = true;
-                            _handledPairRequestIds.add(request.requestId);
                             try {
                               await widget.bridge.respondPairRequest(
                                 requestId: request.requestId,
                                 accept: false,
                               );
-                            } catch (_) {}
-                            if (dialogContext.mounted) {
-                              Navigator.of(dialogContext).pop();
-                            }
-                            if (mounted) {
-                              NeuToast.info(
-                                this.context,
-                                '已拒绝 ${request.deviceName} 的配对请求',
-                              );
+                              resolved = true;
+                              _handledPairRequestIds.add(request.requestId);
+                              if (dialogContext.mounted) {
+                                Navigator.of(dialogContext).pop();
+                              }
+                              if (mounted) {
+                                NeuToast.info(
+                                  this.context,
+                                  '已拒绝 ${request.deviceName} 的配对请求',
+                                );
+                              }
+                            } catch (error) {
+                              if (dialogContext.mounted) {
+                                setDialogState(() {
+                                  submitting = false;
+                                  hasError = true;
+                                });
+                              }
+                              if (mounted) {
+                                NeuToast.error(
+                                  this.context,
+                                  LanVaultBridge.formatUserError(error),
+                                );
+                              }
                             }
                           },
                   ),
@@ -412,13 +438,13 @@ class _LanVaultShellState extends State<LanVaultShell> {
                         ? null
                         : () async {
                             setDialogState(() => submitting = true);
-                            resolved = true;
-                            _handledPairRequestIds.add(request.requestId);
                             try {
                               await widget.bridge.respondPairRequest(
                                 requestId: request.requestId,
                                 accept: true,
                               );
+                              resolved = true;
+                              _handledPairRequestIds.add(request.requestId);
                               if (dialogContext.mounted) {
                                 Navigator.of(dialogContext).pop();
                               }
@@ -430,7 +456,10 @@ class _LanVaultShellState extends State<LanVaultShell> {
                               }
                             } catch (error) {
                               if (dialogContext.mounted) {
-                                Navigator.of(dialogContext).pop();
+                                setDialogState(() {
+                                  submitting = false;
+                                  hasError = true;
+                                });
                               }
                               if (mounted) {
                                 NeuToast.error(

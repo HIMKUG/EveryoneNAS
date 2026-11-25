@@ -123,18 +123,24 @@
     // v2 Device Groups, Rules & Catalog browser state
     capabilities: null,
     groups: [],
+    groupsLoadError: null,
     selectedGroupId: '',
     groupMembers: [],
     groupRules: [],
     ruleBindingsMap: new Map(),
+    groupDetailsRequestSeq: 0,
+    snapshotsRequestSeq: 0,
     selectedBindingId: '',
     selectedBindingLabel: '',
     catalogEntries: [],
     catalogNextCursor: null,
     catalogSelectedPathKey: '',
     catalogVersions: [],
+    catalogVersionsBindingId: '',
     versionsNextArchivedAt: null,
     versionsNextVersionId: null,
+    catalogRequestSeq: 0,
+    versionsRequestSeq: 0,
   };
 
   const el = {
@@ -334,32 +340,9 @@
   }
 
   function bindPressAction(button, handler) {
-    let pressed = false;
-
-    button.addEventListener('pointerdown', (event) => {
-      pressed = event.button === 0 && !button.disabled;
-    });
-
-    button.addEventListener('pointercancel', () => {
-      pressed = false;
-    });
-
-    button.addEventListener('pointerleave', () => {
-      pressed = false;
-    });
-
-    button.addEventListener('pointerup', (event) => {
-      const shouldFire = pressed && event.button === 0 && !button.disabled;
-      pressed = false;
-      if (!shouldFire) return;
+    button.addEventListener('click', (event) => {
+      if (button.disabled) return;
       handler(event);
-    });
-
-    button.addEventListener('keydown', (event) => {
-      if ((event.key === 'Enter' || event.key === ' ') && !button.disabled) {
-        event.preventDefault();
-        handler(event);
-      }
     });
   }
 
@@ -585,6 +568,7 @@
     mountInput.type = 'text';
     mountInput.className = 'neu-input mono';
     mountInput.placeholder = '附加卷挂载路径';
+    mountInput.setAttribute('aria-label', '附加卷挂载路径');
     mountInput.required = true;
     mountInput.dataset.field = 'mount_path';
 
@@ -592,10 +576,12 @@
     guidInput.type = 'text';
     guidInput.className = 'neu-input mono';
     guidInput.placeholder = 'Volume GUID（可选）';
+    guidInput.setAttribute('aria-label', '附加卷 Volume GUID（可选）');
     guidInput.dataset.field = 'volume_guid';
 
     const roleSelect = document.createElement('select');
     roleSelect.className = 'neu-select';
+    roleSelect.setAttribute('aria-label', '附加卷角色');
     roleSelect.dataset.field = 'role';
     roleSelect.innerHTML = '<option value="mirror">镜像盘 (mirror)</option><option value="pool_ext">串联盘 (pool_ext)</option>';
     roleSelect.value = defaultRole;
@@ -682,7 +668,11 @@
 
     el.pairingPin.textContent = data.pairing_pin;
     el.pairingUri.textContent = data.pairing_qr_uri;
-    el.pairingQr.innerHTML = renderPairingQrSvg(data.pairing_qr_uri);
+    try {
+      el.pairingQr.innerHTML = renderPairingQrSvg(data.pairing_qr_uri);
+    } catch (err) {
+      el.pairingQr.textContent = err instanceof Error ? err.message : '二维码生成失败';
+    }
 
     const prevClipTarget = el.clipTarget.value;
     el.peerList.textContent = '';
@@ -756,16 +746,28 @@
   function renderCapabilities(caps) {
     state.capabilities = caps;
     if (!caps) {
-      el.v2CapabilitiesBadge.textContent = 'v2';
+      el.v2CapabilitiesBadge.className = 'status-badge status-badge--warn mono';
+      el.v2CapabilitiesBadge.textContent = '能力状态未知';
       return;
     }
     const ver = caps.protocol_version || 2;
     const featCount = Array.isArray(caps.features) ? caps.features.length : 0;
+    el.v2CapabilitiesBadge.className = 'status-badge status-badge--neutral mono';
     el.v2CapabilitiesBadge.textContent = featCount > 0 ? `协议 v${ver} · ${featCount} 项能力` : `协议 v${ver}`;
   }
 
   function renderGroupsList() {
     el.groupsList.textContent = '';
+
+    if (state.groupsLoadError) {
+      const errNode = document.createElement('p');
+      errNode.className = 'empty-state status-danger';
+      errNode.textContent = `设备组加载失败：${state.groupsLoadError}`;
+      el.groupsList.appendChild(errNode);
+      el.groupDetailPanel.hidden = true;
+      closeCatalogBrowser();
+      return;
+    }
 
     if (state.groups.length === 0) {
       const empty = document.createElement('p');
@@ -969,12 +971,15 @@
   }
 
   function closeCatalogBrowser() {
+    state.catalogRequestSeq += 1;
+    state.versionsRequestSeq += 1;
     state.selectedBindingId = '';
     state.selectedBindingLabel = '';
     state.catalogEntries = [];
     state.catalogNextCursor = null;
     state.catalogSelectedPathKey = '';
     state.catalogVersions = [];
+    state.catalogVersionsBindingId = '';
     state.versionsNextArchivedAt = null;
     state.versionsNextVersionId = null;
     el.catalogBrowserPanel.hidden = true;
@@ -983,16 +988,23 @@
   }
 
   async function openBindingCatalog(binding, rule) {
+    state.catalogRequestSeq += 1;
+    state.versionsRequestSeq += 1;
     state.selectedBindingId = binding.binding_id;
     const targetName = resolveDeviceName(binding.target_device_id);
     state.selectedBindingLabel = `${rule.name || rule.rule_id} → ${targetName}`;
+    state.catalogEntries = [];
+    state.catalogNextCursor = null;
     state.catalogSelectedPathKey = '';
     state.catalogVersions = [];
+    state.catalogVersionsBindingId = '';
     state.versionsNextArchivedAt = null;
     state.versionsNextVersionId = null;
 
     el.catalogBindingTitle.textContent = `目录与历史版本：${state.selectedBindingLabel}`;
     el.catalogBrowserPanel.hidden = false;
+    el.catalogEntriesList.innerHTML = '<p class="empty-state">正在加载目录条目…</p>';
+    el.btnCatalogLoadMore.hidden = true;
     el.catalogVersionsTitle.textContent = '历史归档版本';
     el.catalogVersionsList.innerHTML = '<p class="empty-state">点击左侧目录条目的“查看版本”以浏览历史版本</p>';
     el.btnVersionsLoadMore.hidden = true;
@@ -1002,12 +1014,21 @@
   }
 
   async function loadBindingCatalogEntries(reset = false) {
-    if (!state.selectedBindingId) return;
+    const bindingId = state.selectedBindingId;
+    if (!bindingId) return;
+    const reqSeq = ++state.catalogRequestSeq;
     const afterPathKey = reset ? null : state.catalogNextCursor;
     const sourceDeletedOnly = el.catalogDeletedOnly.checked;
 
     try {
-      const res = await listBindingCatalog(state.selectedBindingId, afterPathKey, 100, sourceDeletedOnly);
+      const res = await listBindingCatalog(bindingId, afterPathKey, 100, sourceDeletedOnly);
+      if (
+        reqSeq !== state.catalogRequestSeq ||
+        bindingId !== state.selectedBindingId ||
+        sourceDeletedOnly !== el.catalogDeletedOnly.checked
+      ) {
+        return;
+      }
       const entries = Array.isArray(res.entries) ? res.entries : [];
       state.catalogEntries = reset ? entries : state.catalogEntries.concat(entries);
       state.catalogNextCursor = entries.length >= 100 ? (res.next_cursor || null) : null;
@@ -1018,6 +1039,9 @@
         'status-ok',
       );
     } catch (err) {
+      if (reqSeq !== state.catalogRequestSeq || bindingId !== state.selectedBindingId) {
+        return;
+      }
       setFeedback(el.catalogFeedback, err.message, 'status-danger');
     }
   }
@@ -1085,24 +1109,37 @@
   }
 
   async function loadBindingVersions(pathKey, reset = false) {
-    if (!state.selectedBindingId) return;
+    const bindingId = state.selectedBindingId;
+    if (!bindingId) return;
+    const reqSeq = ++state.versionsRequestSeq;
     const afterArchivedAt = reset ? null : state.versionsNextArchivedAt;
     const afterVersionId = reset ? null : state.versionsNextVersionId;
 
     try {
       const res = await listBindingVersions(
-        state.selectedBindingId,
+        bindingId,
         pathKey || null,
         afterArchivedAt,
         afterVersionId,
         50,
       );
+      if (
+        reqSeq !== state.versionsRequestSeq ||
+        bindingId !== state.selectedBindingId ||
+        pathKey !== state.catalogSelectedPathKey
+      ) {
+        return;
+      }
       const versions = Array.isArray(res.versions) ? res.versions : [];
       state.catalogVersions = reset ? versions : state.catalogVersions.concat(versions);
+      state.catalogVersionsBindingId = bindingId;
       state.versionsNextArchivedAt = versions.length >= 50 ? (res.next_after_archived_at ?? null) : null;
       state.versionsNextVersionId = versions.length >= 50 ? (res.next_after_version_id || null) : null;
       renderCatalogVersions();
     } catch (err) {
+      if (reqSeq !== state.versionsRequestSeq || bindingId !== state.selectedBindingId) {
+        return;
+      }
       setFeedback(el.catalogFeedback, err.message, 'status-danger');
     }
   }
@@ -1116,6 +1153,11 @@
       empty.className = 'empty-state';
       empty.textContent = '该路径暂无归档历史版本';
       el.catalogVersionsList.appendChild(empty);
+      return;
+    }
+
+    const bindingId = state.catalogVersionsBindingId;
+    if (!bindingId || bindingId !== state.selectedBindingId) {
       return;
     }
 
@@ -1146,7 +1188,7 @@
       } else {
         const downloadLink = document.createElement('a');
         downloadLink.className = 'neu-btn neu-btn--compact';
-        downloadLink.href = buildVersionDownloadUrl(state.selectedBindingId, ver.version_id);
+        downloadLink.href = buildVersionDownloadUrl(bindingId, ver.version_id);
         downloadLink.setAttribute('download', '');
         downloadLink.setAttribute('rel', 'noopener noreferrer');
         downloadLink.setAttribute('aria-label', `下载历史版本 ${ver.display_path}`);
@@ -1162,22 +1204,27 @@
   async function loadSelectedGroupDetails() {
     if (!state.selectedGroupId) return;
     const groupId = state.selectedGroupId;
+    const reqSeq = ++state.groupDetailsRequestSeq;
     const [membersRes, rulesRes] = await Promise.all([
       listGroupMembers(groupId),
       listGroupRules(groupId),
     ]);
-    if (state.selectedGroupId !== groupId) return;
+    if (reqSeq !== state.groupDetailsRequestSeq || state.selectedGroupId !== groupId) return;
 
     state.groupMembers = Array.isArray(membersRes.members) ? membersRes.members : [];
     state.groupRules = Array.isArray(rulesRes.rules) ? rulesRes.rules : [];
 
+    let failedBindings = 0;
     const bindingsResults = await Promise.all(
       state.groupRules.map((rule) =>
         listRuleBindings(rule.rule_id)
           .then((res) => ({ ruleId: rule.rule_id, bindings: Array.isArray(res.bindings) ? res.bindings : [] }))
-          .catch(() => ({ ruleId: rule.rule_id, bindings: [] }))),
+          .catch(() => {
+            failedBindings += 1;
+            return { ruleId: rule.rule_id, bindings: [] };
+          })),
     );
-    if (state.selectedGroupId !== groupId) return;
+    if (reqSeq !== state.groupDetailsRequestSeq || state.selectedGroupId !== groupId) return;
 
     state.ruleBindingsMap = new Map();
     for (const item of bindingsResults) {
@@ -1186,16 +1233,24 @@
 
     renderGroupMembers();
     renderGroupRules();
+    if (failedBindings > 0) {
+      setFeedback(el.groupFeedback, `${failedBindings} 条同步规则的目标绑定加载失败，请点击刷新重试`, 'status-warn');
+    }
   }
 
   async function refreshGroups() {
     const res = await listGroups();
+    state.groupsLoadError = null;
     state.groups = Array.isArray(res.groups) ? res.groups : [];
+    const prevSelected = state.selectedGroupId;
     if (state.groups.length > 0) {
       const stillExists = state.groups.some((g) => g.group_id === state.selectedGroupId);
       state.selectedGroupId = stillExists ? state.selectedGroupId : state.groups[0].group_id;
     } else {
       state.selectedGroupId = '';
+    }
+    if (state.selectedGroupId !== prevSelected) {
+      closeCatalogBrowser();
     }
     renderGroupsList();
     if (state.selectedGroupId) {
@@ -1619,10 +1674,16 @@
 
   async function refreshSnapshotsForSelectedVault() {
     if (!state.selectedVaultId) {
+      state.snapshotsRequestSeq += 1;
       timeline.setSnapshots([]);
       return;
     }
-    const res = await listSnapshots(state.selectedVaultId);
+    const vaultId = state.selectedVaultId;
+    const reqSeq = ++state.snapshotsRequestSeq;
+    const res = await listSnapshots(vaultId);
+    if (reqSeq !== state.snapshotsRequestSeq || vaultId !== state.selectedVaultId) {
+      return;
+    }
     timeline.setSnapshots(res.snapshots);
   }
 
@@ -1642,32 +1703,71 @@
     mergeClipboardHistory(historyRes);
   }
 
-  async function loadAllDashboardData() {
-    const [status, vaultRes, peerRes, capsRes, groupsRes, historyRes] = await Promise.all([
-      getSystemStatus(),
-      listVaults(),
-      listPeers(),
-      getCapabilities().catch(() => null),
-      listGroups().catch(() => ({ groups: [] })),
-      getClipboardHistory(50).catch(() => null),
-    ]);
-    applySystemStatus(status);
-    renderVaults(vaultRes.vaults);
-    renderPeers(peerRes);
-    renderCapabilities(capsRes);
+  async function loadAllDashboardData({ initialStatus = null } = {}) {
+    const [statusResult, vaultResult, peerResult, capsResult, groupsResult, historyResult] =
+      await Promise.allSettled([
+        initialStatus ? Promise.resolve(initialStatus) : getSystemStatus(),
+        listVaults(),
+        listPeers(),
+        getCapabilities(),
+        listGroups(),
+        getClipboardHistory(50),
+      ]);
 
-    state.groups = Array.isArray(groupsRes.groups) ? groupsRes.groups : [];
-    state.selectedGroupId = state.groups.length > 0 ? state.groups[0].group_id : '';
-    renderGroupsList();
-
-    if (historyRes) {
-      mergeClipboardHistory(historyRes);
+    if (statusResult.status === 'fulfilled') {
+      applySystemStatus(statusResult.value);
+    } else {
+      setFeedback(el.svcFeedback, `系统状态加载失败：${statusResult.reason.message}`, 'status-danger');
     }
 
-    await Promise.all([
-      refreshSnapshotsForSelectedVault(),
-      state.selectedGroupId ? loadSelectedGroupDetails().catch(() => {}) : Promise.resolve(),
-    ]);
+    if (vaultResult.status === 'fulfilled') {
+      renderVaults(vaultResult.value.vaults);
+      try {
+        await refreshSnapshotsForSelectedVault();
+      } catch (err) {
+        setFeedback(el.timelineFeedback, `快照加载失败：${err.message}`, 'status-danger');
+      }
+    } else {
+      setFeedback(el.vaultFeedback, `存储空间加载失败：${vaultResult.reason.message}`, 'status-danger');
+    }
+
+    if (peerResult.status === 'fulfilled') {
+      renderPeers(peerResult.value);
+    } else {
+      setFeedback(el.peerFeedback, `设备列表加载失败：${peerResult.reason.message}`, 'status-danger');
+    }
+
+    if (capsResult.status === 'fulfilled') {
+      renderCapabilities(capsResult.value);
+    } else {
+      renderCapabilities(null);
+    }
+
+    if (groupsResult.status === 'fulfilled') {
+      state.groupsLoadError = null;
+      state.groups = Array.isArray(groupsResult.value.groups) ? groupsResult.value.groups : [];
+      state.selectedGroupId = state.groups.length > 0 ? state.groups[0].group_id : '';
+      renderGroupsList();
+      if (state.selectedGroupId) {
+        try {
+          await loadSelectedGroupDetails();
+        } catch (err) {
+          setFeedback(el.groupFeedback, `设备组详情加载失败：${err.message}`, 'status-danger');
+        }
+      }
+    } else {
+      state.groupsLoadError = groupsResult.reason.message;
+      state.groups = [];
+      state.selectedGroupId = '';
+      renderGroupsList();
+      setFeedback(el.groupFeedback, `设备组加载失败：${groupsResult.reason.message}`, 'status-danger');
+    }
+
+    if (historyResult.status === 'fulfilled' && historyResult.value) {
+      mergeClipboardHistory(historyResult.value);
+    } else if (historyResult.status === 'rejected') {
+      setFeedback(el.clipFeedback, `快传历史加载失败：${historyResult.reason.message}`, 'status-danger');
+    }
   }
 
   /* Event Bindings */
@@ -1685,9 +1785,11 @@
 
       try {
         await login(password);
+        el.loginSubmit.disabled = false;
+        el.loginPassword.value = '';
         showDashboard();
-        await loadAllDashboardData();
         socket.connect();
+        await loadAllDashboardData();
       } catch (err) {
         el.loginError.textContent = err.message;
         if (!(err instanceof ApiError && err.status === 429)) {
@@ -1951,10 +2053,16 @@
     });
 
     bindPressAction(el.btnLogout, async () => {
+      el.btnLogout.disabled = true;
       try {
         await logout();
-      } finally {
         showLockScreen();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : '未知错误';
+        setFeedback(el.clipFeedback, `安全登出失败（服务端会话可能仍有效）：${msg}`, 'status-danger');
+        showBanner(`安全登出失败（服务端会话可能仍有效）：${msg}，请重试`, 'danger');
+      } finally {
+        el.btnLogout.disabled = false;
       }
     });
 
@@ -2027,9 +2135,10 @@
     syncLockoutCountdown();
 
     try {
-      await loadAllDashboardData();
+      const status = await getSystemStatus();
       showDashboard();
       socket.connect();
+      await loadAllDashboardData({ initialStatus: status });
     } catch (err) {
       if (err instanceof ApiError && (err.status === 401 || err.status === 429)) {
         showLockScreen();
