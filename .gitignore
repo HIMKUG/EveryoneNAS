@@ -4,6 +4,7 @@
 /flutter_app/build/
 /flutter_app/.dart_tool/
 /flutter_app/keystore/
+!/release-signing/
 /flutter_app/android/local.properties
 /flutter_app/android/key.properties
 /flutter_app/android/.gradle/
@@ -11,6 +12,7 @@
 /flutter_app/android/app/src/main/jniLibs/
 **/*.jks
 **/*.keystore
+!/release-signing/everyonas-release.jks
 /*-source.zip
 __pycache__/
 *.pyc

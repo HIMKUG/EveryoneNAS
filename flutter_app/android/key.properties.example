@@ -1,6 +1,6 @@
 # Copy to `flutter_app/android/key.properties` and fill with your release keystore credentials.
-# Never commit `key.properties` or `.jks` files to version control.
-storePassword=CHANGE_ME
-keyPassword=CHANGE_ME
-keyAlias=lanvault-release
-storeFile=../keystore/lanvault-release.jks
+# This file is ignored by Git. The shared release keystore lives in release-signing/.
+storePassword=EveryoneNAS-Release-2026
+keyPassword=EveryoneNAS-Release-2026
+keyAlias=everyonas-release
+storeFile=../../release-signing/everyonas-release.jks
