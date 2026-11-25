@@ -224,23 +224,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Widget _buildAndroidKeepAliveTip(BuildContext context) {
+      final neu = NeuTheme.of(context);
     return NeuCard(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-      backgroundColor: NeuTokens.accentSoft,
-      borderColor: NeuTokens.accent.withValues(alpha: 0.2),
+        backgroundColor: neu.accentSoft,
+        borderColor: neu.accent.withValues(alpha: 0.2),
       child: Row(
         children: <Widget>[
-          const Icon(
+            Icon(
             Icons.battery_saver_rounded,
             size: 18,
-            color: NeuTokens.accent,
+              color: neu.accent,
           ),
           const SizedBox(width: 10),
           Expanded(
             child: Text(
               '开启电池白名单可防止锁屏后后台服务休眠',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                    color: NeuTokens.textPrimary,
+                      color: neu.textPrimary,
                   ),
             ),
           ),
@@ -265,6 +266,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     required int onlineCount,
     required int totalPeers,
   }) {
+      final neu = NeuTheme.of(context);
     final running = overview?.serverRunning ?? false;
     final portText = overview?.serverPort != null
         ? '端口 :${overview!.serverPort}'
@@ -279,10 +281,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
         Expanded(
           child: NeuCard(
             padding: const EdgeInsets.all(18),
-            backgroundColor: running ? NeuTokens.healthySoft : NeuTokens.surface,
+              backgroundColor: running ? neu.healthySoft : neu.surface,
             borderColor: running
-                ? NeuTokens.healthy.withValues(alpha: 0.25)
-                : NeuTokens.hairlineBorder,
+                  ? neu.healthy.withValues(alpha: 0.25)
+                  : neu.hairlineBorder,
             onTap: widget.onOpenSettings,
             child: Row(
               children: <Widget>[
@@ -290,10 +292,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   icon: running
                       ? Icons.verified_user_rounded
                       : Icons.pause_circle_outline_rounded,
-                  color: running ? NeuTokens.healthy : NeuTokens.warning,
+                    color: running ? neu.healthy : neu.warning,
                   backgroundColor: running
-                      ? NeuTokens.healthy.withValues(alpha: 0.14)
-                      : NeuTokens.folderGoldSoft,
+                        ? neu.healthy.withValues(alpha: 0.14)
+                        : neu.folderGoldSoft,
                   size: 44,
                   iconSize: 22,
                 ),
@@ -329,10 +331,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
             onTap: widget.onOpenPairing,
             child: Row(
               children: <Widget>[
-                const NeuIconBadge(
+                  NeuIconBadge(
                   icon: Icons.devices_rounded,
-                  color: NeuTokens.accent,
-                  backgroundColor: NeuTokens.accentSoft,
+                    color: neu.accent,
+                    backgroundColor: neu.accentSoft,
                   size: 44,
                   iconSize: 22,
                 ),
@@ -366,10 +368,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
             onTap: widget.onOpenSnapshots,
             child: Row(
               children: <Widget>[
-                const NeuIconBadge(
+                  NeuIconBadge(
                   icon: Icons.cloud_done_rounded,
-                  color: NeuTokens.chartIndigo,
-                  backgroundColor: NeuTokens.chartIndigoSoft,
+                    color: neu.chartIndigo,
+                    backgroundColor: neu.chartIndigoSoft,
                   size: 44,
                   iconSize: 22,
                 ),
@@ -408,6 +410,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     required int onlineCount,
     required int totalPeers,
   }) {
+      final neu = NeuTheme.of(context);
     final running = overview?.serverRunning ?? false;
     final portText = overview?.serverPort != null
         ? '端口 :${overview!.serverPort}'
@@ -417,10 +420,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
       children: <Widget>[
         NeuCard(
           padding: const EdgeInsets.all(16),
-          backgroundColor: running ? NeuTokens.healthySoft : NeuTokens.surface,
+            backgroundColor: running ? neu.healthySoft : neu.surface,
           borderColor: running
-              ? NeuTokens.healthy.withValues(alpha: 0.25)
-              : NeuTokens.hairlineBorder,
+                ? neu.healthy.withValues(alpha: 0.25)
+                : neu.hairlineBorder,
           onTap: widget.onOpenSettings,
           child: Row(
             children: <Widget>[
@@ -428,10 +431,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 icon: running
                     ? Icons.verified_user_rounded
                     : Icons.pause_circle_outline_rounded,
-                color: running ? NeuTokens.healthy : NeuTokens.warning,
+                  color: running ? neu.healthy : neu.warning,
                 backgroundColor: running
-                    ? NeuTokens.healthy.withValues(alpha: 0.14)
-                    : NeuTokens.folderGoldSoft,
+                      ? neu.healthy.withValues(alpha: 0.14)
+                      : neu.folderGoldSoft,
                 size: 42,
                 iconSize: 21,
               ),
@@ -466,10 +469,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 onTap: widget.onOpenPairing,
                 child: Row(
                   children: <Widget>[
-                    const NeuIconBadge(
+                      NeuIconBadge(
                       icon: Icons.devices_rounded,
-                      color: NeuTokens.accent,
-                      backgroundColor: NeuTokens.accentSoft,
+                        color: neu.accent,
+                        backgroundColor: neu.accentSoft,
                       size: 36,
                       iconSize: 18,
                     ),
@@ -503,10 +506,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 onTap: widget.onOpenSnapshots,
                 child: Row(
                   children: <Widget>[
-                    const NeuIconBadge(
+                      NeuIconBadge(
                       icon: Icons.cloud_sync_rounded,
-                      color: NeuTokens.chartIndigo,
-                      backgroundColor: NeuTokens.chartIndigoSoft,
+                        color: neu.chartIndigo,
+                        backgroundColor: neu.chartIndigoSoft,
                       size: 36,
                       iconSize: 18,
                     ),
@@ -540,6 +543,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   Widget _buildActiveSyncBanner(BuildContext context, SyncProgressEvent sync) {
+    final neu = NeuTheme.of(context);
     final fileName = sync.filePath.isNotEmpty
         ? SystemEnvHelper.folderDisplayName(sync.filePath)
         : sync.ruleId;
@@ -552,17 +556,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
     return NeuCard(
       padding: const EdgeInsets.all(14),
-      backgroundColor: NeuTokens.accentSoft,
-      borderColor: NeuTokens.accent.withValues(alpha: 0.25),
+      backgroundColor: neu.accentSoft,
+      borderColor: neu.accent.withValues(alpha: 0.25),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
           Row(
             children: <Widget>[
-              const Icon(
+              Icon(
                 Icons.sync_rounded,
                 size: 16,
-                color: NeuTokens.accent,
+                color: neu.accent,
               ),
               const SizedBox(width: 8),
               Expanded(
@@ -571,7 +575,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                        color: NeuTokens.accent,
+                        color: neu.accent,
                         fontWeight: FontWeight.w600,
                       ),
                 ),
@@ -591,6 +595,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     BuildContext context,
     SystemOverviewModel? overview,
   ) {
+    final neu = NeuTheme.of(context);
     final used = overview?.vaultUsedBytes ?? 0;
     final quota = overview?.vaultQuotaBytes ?? 0;
     final ratio = quota > 0 ? (used / quota).clamp(0.0, 1.0) : 0.0;
@@ -608,7 +613,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               Text(
                 '${SystemEnvHelper.formatBytes(used)} / ${SystemEnvHelper.formatBytes(quota)}',
                 style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                      color: NeuTokens.textSecondary,
+                      color: neu.textSecondary,
                     ),
               ),
             ],
@@ -639,8 +644,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                                   decoration: BoxDecoration(
                                     shape: BoxShape.circle,
                                     color: i == 0
-                                        ? NeuTokens.accent
-                                        : NeuTokens.chartSky,
+                                        ? neu.accent
+                                        : neu.chartSky,
                                   ),
                                 ),
                                 const SizedBox(width: 8),
@@ -679,6 +684,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     BuildContext context,
     SystemOverviewModel? overview,
   ) {
+    final neu = NeuTheme.of(context);
     final corrupted = overview?.corruptedChunks ?? 0;
     final healthy = corrupted == 0;
 
@@ -691,9 +697,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
             icon: healthy
                 ? Icons.health_and_safety_rounded
                 : Icons.warning_amber_rounded,
-            color: healthy ? NeuTokens.healthy : NeuTokens.warning,
+            color: healthy ? neu.healthy : neu.warning,
             backgroundColor:
-                healthy ? NeuTokens.healthySoft : NeuTokens.folderGoldSoft,
+                healthy ? neu.healthySoft : neu.folderGoldSoft,
             size: 38,
             iconSize: 20,
           ),
@@ -716,9 +722,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ],
             ),
           ),
-          const Icon(
+          Icon(
             Icons.chevron_right_rounded,
-            color: NeuTokens.textSecondary,
+            color: neu.textSecondary,
           ),
         ],
       ),
@@ -729,6 +735,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     BuildContext context,
     SystemOverviewModel? overview,
   ) {
+    final neu = NeuTheme.of(context);
     final activities = overview?.recentActivities ?? const <RecentActivityModel>[];
 
     return NeuCard(
@@ -743,7 +750,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               Text(
                 '${activities.length} 条记录',
                 style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                      color: NeuTokens.textSecondary,
+                      color: neu.textSecondary,
                     ),
               ),
             ],
@@ -761,8 +768,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 children: <Widget>[
                   NeuIconBadge(
                     icon: _iconForActivity(activities[i].kind),
-                    color: NeuTokens.accent,
-                    backgroundColor: NeuTokens.accentSoft,
+                    color: neu.accent,
+                    backgroundColor: neu.accentSoft,
                     size: 36,
                     iconSize: 18,
                   ),
@@ -793,7 +800,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   Text(
                     LanVaultBridge.formatRelativeTime(activities[i].timestamp),
                     style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                          color: NeuTokens.textSecondary,
+                          color: neu.textSecondary,
                         ),
                   ),
                 ],

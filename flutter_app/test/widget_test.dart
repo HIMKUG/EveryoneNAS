@@ -5,6 +5,10 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:material_ui/material_ui.dart';
 
+import 'package:lanvault_app/theme/appearance_controller.dart';
+import 'package:lanvault_app/theme/motion_slide.dart';
+import 'package:lanvault_app/theme/skins.dart';
+
 import 'package:lanvault_app/bridge/lanvault_bridge.dart';
 import 'package:lanvault_app/bridge/system_env_helper.dart';
 import 'package:lanvault_app/bridge/window_chrome.dart';
@@ -622,7 +626,10 @@ void main() {
       ),
     );
     final decoration = container.decoration as BoxDecoration;
-    expect(decoration.color, NeuTokens.disabledDarkSurface);
+    expect(
+        decoration.color,
+        NeuTheme.of(tester.element(find.byType(NeuButton).first))
+            .disabledDarkSurface);
     expect(decoration.gradient, isNull);
 
     await tester.tap(find.text('新建存储池').first);
@@ -763,7 +770,7 @@ void main() {
     await tester.pump();
     expect(
       (navSurface(devices).decoration as BoxDecoration).color,
-      NeuTokens.insetSurface,
+      NeuTheme.of(tester.element(find.byType(NavRailItem).first)).insetSurface,
     );
 
     await mouse.moveTo(tester.getCenter(backup));
@@ -771,7 +778,7 @@ void main() {
     expect((navSurface(devices).decoration as BoxDecoration).color, isNull);
     expect(
       (navSurface(backup).decoration as BoxDecoration).color,
-      NeuTokens.insetSurface,
+      NeuTheme.of(tester.element(find.byType(NavRailItem).first)).insetSurface,
     );
     await mouse.removePointer();
     await tester.pump();
@@ -789,14 +796,14 @@ void main() {
     await tester.pumpWidget(LanVaultApp(bridge: bridge));
     await tester.pumpAndSettle();
 
-    await tester.tap(find.text('设置'));
+    await tester.tap(find.text('设置').first);
     await tester.pumpAndSettle();
     expect(
       find.descendant(
         of: find.byType(SettingsScreen),
         matching: find.byType(NavRailItem),
       ),
-      findsNWidgets(5),
+      findsNWidgets(6),
     );
 
     await tester.tap(find.text('Web 访问与安全').first);
@@ -835,7 +842,10 @@ void main() {
           )
           .first,
     );
-    expect(divider.color, const Color(0x59000000));
+    expect(
+      divider.color,
+      NeuTheme.of(tester.element(find.byType(SettingsScreen))).dividerSubtle,
+    );
   });
 
   testWidgets('settings security row fits compact 360px layout',
@@ -894,7 +904,8 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
   });
 
-  testWidgets('LanVaultShell keeps dialog open and reports error when reject fails',
+  testWidgets(
+      'LanVaultShell keeps dialog open and reports error when reject fails',
       (tester) async {
     final ffi = _ThrowingPairRejectFfi();
     final bridge = LanVaultBridge(rustFfi: ffi);
@@ -926,7 +937,8 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
   });
 
-  testWidgets('VaultScreen displays error state instead of empty state when load fails',
+  testWidgets(
+      'VaultScreen displays error state instead of empty state when load fails',
       (tester) async {
     final ffi = _FailingVaultFfi();
     final bridge = LanVaultBridge(rustFfi: ffi);
@@ -947,7 +959,8 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
   });
 
-  testWidgets('SettingsScreen retains succeeded fields when one setting fails to load',
+  testWidgets(
+      'SettingsScreen retains succeeded fields when one setting fails to load',
       (tester) async {
     final ffi = _PartialFailSettingsFfi();
     final bridge = LanVaultBridge(rustFfi: ffi);
@@ -967,7 +980,8 @@ void main() {
     await tester.pump(const Duration(milliseconds: 50));
   });
 
-  testWidgets('SnapshotsScreen ignores stale _loadData response from earlier filter',
+  testWidgets(
+      'SnapshotsScreen ignores stale _loadData response from earlier filter',
       (tester) async {
     final ffi = _DelayedSnapshotsFfi();
     final bridge = LanVaultBridge(rustFfi: ffi);
@@ -1002,6 +1016,128 @@ void main() {
     expect(find.text('snap-b-latest'), findsOneWidget);
     NeuToast.dismiss();
     await tester.pump(const Duration(milliseconds: 50));
+  });
+
+  testWidgets('appearance mode and skin update semantic theme tokens',
+      (tester) async {
+    final controller = AppearanceController.memory(
+      themeMode: ThemeModePreference.light,
+      observeSystem: false,
+    );
+    addTearDown(controller.dispose);
+    final light = controller.themeData.extension<NeuTheme>()!;
+    expect(light.brightness, Brightness.light);
+    expect(light.skinId, defaultSkinId);
+
+    controller.setThemeMode(ThemeModePreference.dark);
+    controller.setSkin(terracottaSkin);
+    final dark = controller.themeData.extension<NeuTheme>()!;
+    expect(dark.brightness, Brightness.dark);
+    expect(dark.skinId, terracottaSkin.id);
+    expect(dark.canvas, terracottaSkin.dark.canvas);
+    expect(dark.surface, terracottaSkin.dark.surface);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: controller.themeData,
+        home: Builder(
+          builder: (context) => Scaffold(
+            backgroundColor: NeuTheme.of(context).canvas,
+          ),
+        ),
+      ),
+    );
+    expect(
+      tester.widget<Scaffold>(find.byType(Scaffold)).backgroundColor,
+      terracottaSkin.dark.canvas,
+    );
+    expect(tester.takeException(), isNull);
+  });
+  test('built-in skin primary actions meet WCAG AA contrast', () {
+    for (final skin in builtInSkins) {
+      for (final palette in <SkinPalette>[skin.light, skin.dark]) {
+        expect(
+          contrastRatio(palette.onAccent, palette.accent),
+          greaterThanOrEqualTo(4.5),
+          reason: '${skin.name} ${palette == skin.dark ? 'dark' : 'light'}',
+        );
+      }
+    }
+  });
+
+  testWidgets('slide viewport settles on the latest rapid selection',
+      (tester) async {
+    var selectedIndex = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildLanVaultTheme(),
+        home: StatefulBuilder(
+          builder: (context, setState) => Scaffold(
+            body: SlideSwitchViewport(
+              index: selectedIndex,
+              children: const <Widget>[
+                Text('page zero'),
+                Text('page one'),
+                Text('page two'),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+    final state = tester.state<State<StatefulBuilder>>(
+      find.byType(StatefulBuilder),
+    );
+    (state as dynamic).setState(() => selectedIndex = 1);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 30));
+    (state as dynamic).setState(() => selectedIndex = 2);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 30));
+    await tester.pumpAndSettle();
+    final viewport = tester.widget<SlideSwitchViewport>(
+      find.byType(SlideSwitchViewport),
+    );
+    expect(viewport.index, 2);
+    expect(find.text('page two'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('reduced motion removes slide displacement', (tester) async {
+    var selectedIndex = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        theme: buildLanVaultTheme(),
+        home: MediaQuery(
+          data: const MediaQueryData(disableAnimations: true),
+          child: StatefulBuilder(
+            builder: (context, setState) {
+              return Scaffold(
+                body: SlideSwitchViewport(
+                  index: selectedIndex,
+                  children: const <Widget>[
+                    Text('first'),
+                    Text('second'),
+                  ],
+                ),
+              );
+            },
+          ),
+        ),
+      ),
+    );
+    final state = tester.state<State<StatefulBuilder>>(
+      find.byType(StatefulBuilder),
+    );
+    (state as dynamic).setState(() => selectedIndex = 1);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 100));
+    expect(find.text('second'), findsOneWidget);
+    final viewport = tester.widget<SlideSwitchViewport>(
+      find.byType(SlideSwitchViewport),
+    );
+    expect(viewport.index, 1);
+    expect(tester.takeException(), isNull);
   });
 }
 
@@ -1045,7 +1181,8 @@ class _DelayedSnapshotsFfi extends _FakeLanVaultFfi {
   }
 
   @override
-  Future<List<VaultSummaryModel>> listVaults() async => const <VaultSummaryModel>[
+  Future<List<VaultSummaryModel>> listVaults() async =>
+      const <VaultSummaryModel>[
         VaultSummaryModel(
           vaultId: 'v-b',
           name: 'Vault B',
@@ -1062,6 +1199,7 @@ class _DelayedSnapshotsFfi extends _FakeLanVaultFfi {
     if (vaultId == 'v-b') {
       return _vaultBCompleter.future;
     }
-    return Future<List<SnapshotSummaryModel>>.value(const <SnapshotSummaryModel>[]);
+    return Future<List<SnapshotSummaryModel>>.value(
+        const <SnapshotSummaryModel>[]);
   }
 }

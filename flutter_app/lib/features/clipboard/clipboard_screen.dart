@@ -287,12 +287,13 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
     List<PairedPeerModel> peers,
     PairedPeerModel? activePeer,
   ) {
+    final neu = NeuTheme.of(context);
     return Container(
       width: 244,
-      decoration: const BoxDecoration(
-        color: Color(0xFFFAFBFD),
+      decoration: BoxDecoration(
+        color: neu.chromeSurface,
         border: Border(
-          right: BorderSide(color: NeuTokens.hairlineBorder, width: 1),
+          right: BorderSide(color: neu.hairlineBorder, width: 1),
         ),
       ),
       child: Column(
@@ -353,7 +354,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                           ),
                           decoration: BoxDecoration(
                             color: selected
-                                ? NeuTokens.accentSoft
+                                ? neu.accentSoft
                                 : Colors.transparent,
                             borderRadius:
                                 const BorderRadius.all(Radius.circular(12)),
@@ -367,9 +368,9 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                                     ? Icons.phone_android_rounded
                                     : Icons.desktop_windows_rounded,
                                 color: selected
-                                    ? NeuTokens.accent
-                                    : NeuTokens.slateMuted,
-                                backgroundColor: NeuTokens.surface,
+                                    ? neu.accent
+                                    : neu.slateMuted,
+                                backgroundColor: neu.surface,
                                 size: 34,
                                 iconSize: 17,
                               ),
@@ -399,8 +400,8 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                                           .labelSmall
                                           ?.copyWith(
                                             color: peer.online
-                                                ? NeuTokens.healthy
-                                                : NeuTokens.textSecondary,
+                                                ? neu.healthy
+                                                : neu.textSecondary,
                                           ),
                                     ),
                                   ],
@@ -424,15 +425,16 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
     required List<_ChatMessage> items,
     required bool isWide,
   }) {
+    final neu = NeuTheme.of(context);
     return Column(
       children: <Widget>[
         if (isWide && activePeer != null)
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-            decoration: const BoxDecoration(
-              color: NeuTokens.surface,
+            decoration: BoxDecoration(
+              color: neu.surface,
               border: Border(
-                bottom: BorderSide(color: NeuTokens.hairlineBorder),
+                bottom: BorderSide(color: neu.hairlineBorder),
               ),
             ),
             child: Row(
@@ -513,12 +515,13 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
   }
 
   Widget _buildInputBar(BuildContext context, {required bool enabled}) {
+    final neu = NeuTheme.of(context);
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-      decoration: const BoxDecoration(
-        color: NeuTokens.canvas,
+      decoration: BoxDecoration(
+        color: neu.canvas,
         border: Border(
-          top: BorderSide(color: NeuTokens.hairlineBorder),
+          top: BorderSide(color: neu.hairlineBorder),
         ),
       ),
       child: Row(
@@ -541,9 +544,9 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
               constraints: const BoxConstraints(minHeight: 42, maxHeight: 110),
               padding: const EdgeInsets.symmetric(horizontal: 14),
               decoration: BoxDecoration(
-                color: NeuTokens.surface,
+                color: neu.surface,
                 borderRadius: const BorderRadius.all(Radius.circular(22)),
-                border: Border.all(color: NeuTokens.hairlineBorder),
+                border: Border.all(color: neu.hairlineBorder),
               ),
               child: TextField(
                 controller: _inputController,
@@ -604,6 +607,7 @@ class _MessageBubbleRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     final incoming = item.isIncoming;
     final timeStr = item.createdAtSecs > 0
         ? LanVaultBridge.formatRelativeTime('${item.createdAtSecs}')
@@ -622,7 +626,7 @@ class _MessageBubbleRow extends StatelessWidget {
                 child: Text(
                   timeStr,
                   style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        color: NeuTokens.textSecondary,
+                        color: neu.textSecondary,
                       ),
                 ),
               ),
@@ -650,21 +654,22 @@ class _MessageBubbleRow extends StatelessWidget {
   }
 
   Widget _buildFileBubble(BuildContext context, bool incoming) {
+    final neu = NeuTheme.of(context);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
       decoration: BoxDecoration(
-        color: NeuTokens.surface,
+        color: neu.surface,
         borderRadius: const BorderRadius.all(Radius.circular(18)),
-        border: Border.all(color: NeuTokens.hairlineBorder),
-        boxShadow: NeuTokens.controlShadows,
+        border: Border.all(color: neu.hairlineBorder),
+        boxShadow: neu.controlShadows,
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: <Widget>[
           NeuIconBadge(
             icon: Icons.insert_drive_file_rounded,
-            color: NeuTokens.accent,
-            backgroundColor: NeuTokens.accentSoft,
+            color: neu.accent,
+            backgroundColor: neu.accentSoft,
             size: 40,
             iconSize: 20,
           ),
@@ -687,7 +692,7 @@ class _MessageBubbleRow extends StatelessWidget {
                       ? SystemEnvHelper.formatBytes(item.sizeBytes)
                       : (incoming ? '已接收文件' : '已发送文件'),
                   style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                        color: NeuTokens.textSecondary,
+                        color: neu.textSecondary,
                       ),
                 ),
               ],
@@ -699,6 +704,7 @@ class _MessageBubbleRow extends StatelessWidget {
   }
 
   Widget _buildTextBubble(BuildContext context, bool incoming) {
+    final neu = NeuTheme.of(context);
     final text = (item.content != null && item.content!.isNotEmpty)
         ? item.content!
         : item.title;
@@ -715,15 +721,15 @@ class _MessageBubbleRow extends StatelessWidget {
         child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
         decoration: BoxDecoration(
-          color: incoming ? NeuTokens.surface : NeuTokens.accent,
+          color: incoming ? neu.surface : neu.accent,
           borderRadius: const BorderRadius.all(Radius.circular(18)),
-          border: incoming ? Border.all(color: NeuTokens.hairlineBorder) : null,
-          boxShadow: NeuTokens.controlShadows,
+          border: incoming ? Border.all(color: neu.hairlineBorder) : null,
+          boxShadow: neu.controlShadows,
         ),
           child: Text(
             text,
             style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                  color: incoming ? NeuTokens.textPrimary : Colors.white,
+                  color: incoming ? neu.textPrimary : neu.onAccent,
                   height: 1.4,
                 ),
           ),
@@ -748,6 +754,7 @@ class _RoundActionButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     final enabled = onPressed != null;
     return Tooltip(
       message: tooltip,
@@ -765,21 +772,21 @@ class _RoundActionButton extends StatelessWidget {
                 shape: BoxShape.circle,
                 color: primary
                     ? (enabled
-                        ? NeuTokens.accent
-                        : NeuTokens.accent.withValues(alpha: 0.35))
-                    : NeuTokens.surface,
+                        ? neu.accent
+                        : neu.accent.withValues(alpha: 0.35))
+                    : neu.surface,
                 border:
-                    primary ? null : Border.all(color: NeuTokens.hairlineBorder),
-                boxShadow: NeuTokens.controlShadows,
+                    primary ? null : Border.all(color: neu.hairlineBorder),
+                boxShadow: neu.controlShadows,
               ),
               child: Icon(
                 icon,
                 size: 20,
                 color: primary
-                    ? Colors.white
+                    ? neu.onAccent
                     : (enabled
-                        ? NeuTokens.textPrimary
-                        : NeuTokens.textSecondary.withValues(alpha: 0.4)),
+                        ? neu.textPrimary
+                        : neu.textSecondary.withValues(alpha: 0.4)),
               ),
             ),
           ),

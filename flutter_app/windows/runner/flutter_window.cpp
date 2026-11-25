@@ -257,6 +257,16 @@ bool FlutterWindow::OnCreate() {
               window != nullptr && IsZoomed(window) != FALSE));
           return;
         }
+        if (method == "setDarkMode") {
+          const auto* dark = std::get_if<bool>(call.arguments());
+          if (dark == nullptr) {
+            result->Error("INVALID_ARGS", "dark must be a bool");
+            return;
+          }
+          ApplyDarkMode(*dark);
+          result->Success();
+          return;
+        }
         if (method == "setCaptionMetrics") {
           ApplyShortcutMetrics(call.arguments());
           result->Success();
@@ -360,6 +370,18 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
         NotifyMaximizeState(hwnd);
       }
       break;
+
+      case WM_SETTINGCHANGE:
+        if (wparam == 0 && lparam != 0 &&
+            wcscmp(reinterpret_cast<LPCWSTR>(lparam),
+                   L"ImmersiveColorSet") == 0) {
+          if (window_channel_ != nullptr) {
+            window_channel_->InvokeMethod(
+                "systemThemeChanged",
+                std::make_unique<flutter::EncodableValue>());
+          }
+        }
+        break;
   }
 
   return Win32Window::MessageHandler(hwnd, message, wparam, lparam);

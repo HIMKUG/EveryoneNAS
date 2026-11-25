@@ -306,6 +306,7 @@ class _VaultScreenState extends State<VaultScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     final isWide =
         MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
 
@@ -339,7 +340,7 @@ class _VaultScreenState extends State<VaultScreen> {
                           '${SystemEnvHelper.formatBytes(totalUsed)} / ${SystemEnvHelper.formatBytes(totalQuota)}',
                           style:
                               Theme.of(context).textTheme.bodyMedium?.copyWith(
-                                    color: NeuTokens.textSecondary,
+                                    color: neu.textSecondary,
                                     fontWeight: FontWeight.w600,
                                   ),
                         ),
@@ -375,13 +376,13 @@ class _VaultScreenState extends State<VaultScreen> {
                       horizontal: 14,
                       vertical: 12,
                     ),
-                    backgroundColor: NeuTokens.folderGoldSoft,
+                    backgroundColor: neu.folderGoldSoft,
                     child: Row(
                       children: <Widget>[
-                        const Icon(
+                        Icon(
                           Icons.info_outline_rounded,
                           size: 18,
-                          color: NeuTokens.warning,
+                          color: neu.warning,
                         ),
                         const SizedBox(width: 10),
                         const Expanded(
@@ -434,13 +435,13 @@ class _VaultScreenState extends State<VaultScreen> {
                         horizontal: 14,
                         vertical: 12,
                       ),
-                      backgroundColor: NeuTokens.folderGoldSoft,
+                      backgroundColor: neu.folderGoldSoft,
                       child: Row(
                         children: <Widget>[
-                          const Icon(
+                          Icon(
                             Icons.warning_amber_rounded,
                             size: 18,
-                            color: NeuTokens.warning,
+                            color: neu.warning,
                           ),
                           const SizedBox(width: 10),
                           Expanded(child: Text('刷新失败：$_loadError')),
@@ -501,6 +502,7 @@ class _VaultPoolCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     final ratio = vault.quotaBytes > 0
         ? (vault.usedBytes / vault.quotaBytes).clamp(0.0, 1.0)
         : 0.0;
@@ -518,10 +520,10 @@ class _VaultPoolCard extends StatelessWidget {
         children: <Widget>[
           Row(
             children: <Widget>[
-              const NeuIconBadge(
+              NeuIconBadge(
                 icon: Icons.layers_rounded,
-                color: NeuTokens.accent,
-                backgroundColor: NeuTokens.accentSoft,
+                color: neu.accent,
+                backgroundColor: neu.accentSoft,
                 size: 38,
                 iconSize: 20,
               ),
@@ -555,7 +557,7 @@ class _VaultPoolCard extends StatelessWidget {
               Text(
                 '${(ratio * 100).round()}%',
                 style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                      color: NeuTokens.accent,
+                      color: neu.accent,
                       fontWeight: FontWeight.w700,
                     ),
               ),
@@ -569,7 +571,7 @@ class _VaultPoolCard extends StatelessWidget {
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: NeuTokens.textSecondary,
+                  color: neu.textSecondary,
                 ),
           ),
         ],

@@ -128,37 +128,37 @@ class _NeuToastOverlayState extends State<_NeuToastOverlay>
     super.dispose();
   }
 
-  (IconData, Color, Color) _resolveVisual() {
+  (IconData, Color, Color) _resolveVisual(NeuTheme neu) {
     return switch (widget.tone) {
       NeuToastTone.info => (
           Icons.info_outline_rounded,
-          NeuTokens.accent,
-          NeuTokens.accentSoft,
+          neu.accent,
+          neu.accentSoft,
         ),
       NeuToastTone.success => (
           Icons.check_circle_rounded,
-          NeuTokens.healthy,
-          NeuTokens.healthySoft,
+          neu.healthy,
+          neu.healthySoft,
         ),
       NeuToastTone.warning => (
           Icons.warning_amber_rounded,
-          NeuTokens.warning,
-          NeuTokens.folderGoldSoft,
+          neu.warning,
+          neu.folderGoldSoft,
         ),
       NeuToastTone.error => (
           Icons.error_outline_rounded,
-          NeuTokens.danger,
-          NeuTokens.dangerSoft,
+          neu.danger,
+          neu.dangerSoft,
         ),
     };
   }
 
   @override
   Widget build(BuildContext context) {
-    final isWide =
-        MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
+    final isWide = MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
+    final neu = NeuTheme.of(context);
     final reduced = NeuMotion.isReduced(context);
-    final (icon, accentColor, badgeBg) = _resolveVisual();
+    final (icon, accentColor, badgeBg) = _resolveVisual(neu);
 
     final toastCard = Semantics(
       liveRegion: true,
@@ -167,31 +167,20 @@ class _NeuToastOverlayState extends State<_NeuToastOverlay>
       child: GestureDetector(
         onTap: widget.onDismiss,
         child: Material(
-          color: Colors.transparent,
+          color: neu.transparent,
           child: Container(
             constraints: const BoxConstraints(maxWidth: 420),
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 11),
             decoration: BoxDecoration(
-              color: NeuTokens.surface,
+              color: neu.surface,
               borderRadius: const BorderRadius.all(
                 Radius.circular(NeuRadius.group),
               ),
               border: Border.all(
-                color: NeuTokens.hairlineBorder,
+                color: neu.hairlineBorder,
                 width: 1,
               ),
-              boxShadow: const <BoxShadow>[
-                BoxShadow(
-                  color: Color(0x1A0F172A),
-                  offset: Offset(0, 10),
-                  blurRadius: 24,
-                ),
-                BoxShadow(
-                  color: Color(0x122563EB),
-                  offset: Offset(0, 2),
-                  blurRadius: 8,
-                ),
-              ],
+              boxShadow: neu.extrudedShadows,
             ),
             child: Row(
               mainAxisSize: MainAxisSize.min,
@@ -210,7 +199,7 @@ class _NeuToastOverlayState extends State<_NeuToastOverlay>
                   child: Text(
                     widget.message,
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                          color: NeuTokens.textPrimary,
+                          color: neu.textPrimary,
                           fontWeight: FontWeight.w500,
                         ),
                   ),

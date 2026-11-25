@@ -6,6 +6,7 @@ import 'package:material_ui/material_ui.dart';
 import '../../bridge/lanvault_bridge.dart';
 import '../../theme/neu_theme.dart';
 import '../../theme/neu_toast.dart';
+import '../../theme/motion_slide.dart';
 
 enum _DeviceTab { paired, discovered }
 
@@ -492,26 +493,27 @@ class _PairingScreenState extends State<PairingScreen> {
     return deviceId;
   }
 
-  (IconData, Color, Color) _deviceIcon(String osType) {
+  (IconData, Color, Color) _deviceIcon(BuildContext context, String osType) {
+    final neu = NeuTheme.of(context);
     final lower = osType.toLowerCase();
     if (lower.contains('android')) {
       return (
         Icons.android_rounded,
-        NeuTokens.healthy,
-        NeuTokens.healthySoft,
+        neu.healthy,
+        neu.healthySoft,
       );
     }
     if (lower.contains('windows') || lower.contains('win')) {
       return (
         Icons.window_rounded,
-        NeuTokens.accent,
-        NeuTokens.accentSoft,
+        neu.accent,
+        neu.accentSoft,
       );
     }
     return (
       Icons.laptop_mac_rounded,
-      NeuTokens.slateMuted,
-      NeuTokens.insetSurface,
+      neu.slateMuted,
+      neu.insetSurface,
     );
   }
 
@@ -615,10 +617,14 @@ class _PairingScreenState extends State<PairingScreen> {
                 ],
               ],
               const SizedBox(height: NeuSpace.md),
-              if (_activeTab == _DeviceTab.paired)
-                _buildPairedListCard(context, pairedPeers)
-              else
-                _buildDiscoveredListCard(context, discoveredList),
+              SlideSwitchViewport(
+                index: _activeTab.index,
+                axis: Axis.horizontal,
+                children: <Widget>[
+                  _buildPairedListCard(context, pairedPeers),
+                  _buildDiscoveredListCard(context, discoveredList),
+                ],
+              ),
               const SizedBox(height: NeuSpace.lg),
               _buildDeviceGroupsSection(context, pairedPeers, isWide),
             ],
@@ -735,6 +741,7 @@ class _PairingScreenState extends State<PairingScreen> {
     bool isWide,
   ) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     final group = groupView.group;
     final activeMembers = groupView.activeMembers;
 
@@ -757,10 +764,10 @@ class _PairingScreenState extends State<PairingScreen> {
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: <Widget>[
-                    const NeuIconBadge(
+                    NeuIconBadge(
                       icon: Icons.workspaces_rounded,
-                      color: NeuTokens.accent,
-                      backgroundColor: NeuTokens.accentSoft,
+                      color: neu.accent,
+                      backgroundColor: neu.accentSoft,
                       size: 38,
                       iconSize: 20,
                     ),
@@ -857,8 +864,8 @@ class _PairingScreenState extends State<PairingScreen> {
                                     : Icons.devices_rounded,
                                 size: 18,
                                 color: member.isCoordinator
-                                    ? NeuTokens.warning
-                                    : NeuTokens.accent,
+                                    ? neu.warning
+                                    : neu.accent,
                               ),
                               const SizedBox(width: 10),
                               Expanded(
@@ -916,6 +923,7 @@ class _PairingScreenState extends State<PairingScreen> {
     List<PairedPeerModel> peers,
   ) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     if (_loadingPaired && peers.isEmpty) {
       return NeuCard(
         padding: const EdgeInsets.all(24),
@@ -941,7 +949,7 @@ class _PairingScreenState extends State<PairingScreen> {
               key: ValueKey<String>('paired_${peers[i].deviceId}'),
               builder: (context) {
                 final peer = peers[i];
-                final (icon, fg, bg) = _deviceIcon(peer.osType);
+                final (icon, fg, bg) = _deviceIcon(context, peer.osType);
                 final hasIp = peer.ip != null && peer.ip!.isNotEmpty;
                 return InkWell(
                   onTap: () {
@@ -997,17 +1005,16 @@ class _PairingScreenState extends State<PairingScreen> {
                         const SizedBox(width: 4),
                         PopupMenuButton<String>(
                           tooltip: '设备操作',
-                          icon: const Icon(
+                          icon: Icon(
                             Icons.more_horiz_rounded,
-                            color: NeuTokens.textSecondary,
+                            color: neu.textSecondary,
                           ),
                           onSelected: (value) {
                             if (value == 'revoke') {
                               _revokePeer(peer);
                             }
                           },
-                          itemBuilder: (context) =>
-                              const <PopupMenuEntry<String>>[
+                          itemBuilder: (context) => <PopupMenuEntry<String>>[
                             PopupMenuItem<String>(
                               value: 'revoke',
                               child: Row(
@@ -1015,12 +1022,12 @@ class _PairingScreenState extends State<PairingScreen> {
                                   Icon(
                                     Icons.link_off_rounded,
                                     size: 18,
-                                    color: NeuTokens.danger,
+                                    color: neu.danger,
                                   ),
                                   SizedBox(width: 8),
                                   Text(
                                     '解绑设备',
-                                    style: TextStyle(color: NeuTokens.danger),
+                                    style: TextStyle(color: neu.danger),
                                   ),
                                 ],
                               ),
@@ -1064,7 +1071,7 @@ class _PairingScreenState extends State<PairingScreen> {
               key: ValueKey<String>('discovered_${peers[i].deviceId}'),
               builder: (context) {
                 final peer = peers[i];
-                final (icon, fg, bg) = _deviceIcon(peer.osType);
+                final (icon, fg, bg) = _deviceIcon(context, peer.osType);
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 12),
                   child: Row(
@@ -1248,6 +1255,7 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     final info = _localInfo;
     final localFingerprint =
         Uri.tryParse(info?.pairingQrUri ?? '')?.queryParameters['fp'];
@@ -1305,7 +1313,7 @@ class _PairNewDeviceDialogState extends State<_PairNewDeviceDialog> {
                                   ? '------'
                                   : info.pairingPin.split('').join(' '),
                               style: textTheme.headlineSmall?.copyWith(
-                                color: NeuTokens.accent,
+                                color: neu.accent,
                                 letterSpacing: 3,
                                 fontFeatures: const <FontFeature>[
                                   FontFeature.tabularFigures(),

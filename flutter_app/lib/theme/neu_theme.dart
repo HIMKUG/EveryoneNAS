@@ -5,20 +5,44 @@
 
 import 'dart:math' as math;
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
+import 'skins.dart';
+
+enum MotionSpeed {
+  fast(1.0, '极速'),
+  balanced(1.46, '均衡'),
+  elegant(1.7, '优雅');
+
+  const MotionSpeed(this.scale, this.label);
+
+  final double scale;
+  final String label;
+}
+
 /// 统一动效 Token。
 abstract final class NeuMotion {
-  static const Duration pressDuration = Duration(milliseconds: 220);
-  static const Curve pressCurve = Curves.linearToEaseOut;
+  static const Curve enterCurve = Cubic(0.16, 1.0, 0.3, 1.0);
+  static const Curve exitCurve = Cubic(0.4, 0.0, 1.0, 1.0);
+  static const Curve appleSheetCurve = Cubic(0.32, 0.72, 0.0, 1.0);
+  static const Curve revealCurve = Cubic(0.22, 1.0, 0.36, 1.0);
 
-  static const Duration stateDuration = Duration(milliseconds: 280);
-  static const Curve stateCurve = Curves.linearToEaseOut;
+  static const Duration pressDuration = Duration(milliseconds: 180);
+  static const Duration pageEnterDuration = Duration(milliseconds: 220);
+  static const Duration pageExitDuration = Duration(milliseconds: 140);
+  static const Duration modalDuration = Duration(milliseconds: 240);
+  static const Duration revealDuration = Duration(milliseconds: 280);
+  static const Duration sheetDuration = Duration(milliseconds: 420);
 
-  static const Duration reducedDuration = Duration(milliseconds: 120);
+  static const Curve pressCurve = enterCurve;
+  static const Duration stateDuration = pageEnterDuration;
+  static const Curve stateCurve = enterCurve;
+
+  static const Duration reducedDuration = Duration(milliseconds: 100);
   static const Curve reducedCurve = Curves.easeOut;
+
+  static MotionSpeed speed = MotionSpeed.balanced;
 
   static const double pressedScale = 0.968;
   static const double cardPressedScale = 0.985;
@@ -27,12 +51,71 @@ abstract final class NeuMotion {
     return MediaQuery.maybeDisableAnimationsOf(context) ?? false;
   }
 
+  static MotionSpeed resolveSpeed(BuildContext context) {
+    return Theme.of(context).extension<NeuTheme>()?.motionSpeed ?? speed;
+  }
+
+  static Duration scaleDuration(
+    Duration duration,
+    MotionSpeed speed, {
+    bool reduced = false,
+  }) {
+    if (reduced) return reducedDuration;
+    return Duration(
+      microseconds: (duration.inMicroseconds * speed.scale).round(),
+    );
+  }
+
   static Duration resolvePress(BuildContext context) {
-    return isReduced(context) ? reducedDuration : pressDuration;
+    return scaleDuration(
+      pressDuration,
+      resolveSpeed(context),
+      reduced: isReduced(context),
+    );
+  }
+
+  static Duration resolvePageEnter(BuildContext context) {
+    return scaleDuration(
+      pageEnterDuration,
+      resolveSpeed(context),
+      reduced: isReduced(context),
+    );
+  }
+
+  static Duration resolvePageExit(BuildContext context) {
+    return scaleDuration(
+      pageExitDuration,
+      resolveSpeed(context),
+      reduced: isReduced(context),
+    );
+  }
+
+  static Duration resolveModal(BuildContext context) {
+    return scaleDuration(
+      modalDuration,
+      resolveSpeed(context),
+      reduced: isReduced(context),
+    );
+  }
+
+  static Duration resolveReveal(BuildContext context) {
+    return scaleDuration(
+      revealDuration,
+      resolveSpeed(context),
+      reduced: isReduced(context),
+    );
+  }
+
+  static Duration resolveSheet(BuildContext context) {
+    return scaleDuration(
+      sheetDuration,
+      resolveSpeed(context),
+      reduced: isReduced(context),
+    );
   }
 
   static Duration resolveState(BuildContext context) {
-    return isReduced(context) ? reducedDuration : stateDuration;
+    return resolvePageEnter(context);
   }
 
   static Curve resolvePressCurve(BuildContext context) {
@@ -41,6 +124,18 @@ abstract final class NeuMotion {
 
   static Curve resolveStateCurve(BuildContext context) {
     return isReduced(context) ? reducedCurve : stateCurve;
+  }
+
+  static Curve resolveExitCurve(BuildContext context) {
+    return isReduced(context) ? reducedCurve : exitCurve;
+  }
+
+  static Curve resolveSheetCurve(BuildContext context) {
+    return isReduced(context) ? reducedCurve : appleSheetCurve;
+  }
+
+  static Curve resolveRevealCurve(BuildContext context) {
+    return isReduced(context) ? reducedCurve : revealCurve;
   }
 }
 
@@ -66,76 +161,8 @@ abstract final class NeuSpace {
   static const double xl = 32.0;
 }
 
-/// EveryoneNAS 柔冰蓝 / 纯白轻拟态玻璃卡片设计 Token。
+/// 布局与平台 Token；组件颜色统一从 [NeuTheme] 读取。
 abstract final class NeuTokens {
-  /// 全局页面画布底色：清透冰蓝白 `#F3F6FC`。
-  static const Color canvas = Color(0xFFF3F6FC);
-
-  /// 卡片与浮层表面：纯白 `#FFFFFF`。
-  static const Color surface = Color(0xFFFFFFFF);
-
-  /// 凹陷槽位底色：`#EEF3FA`。
-  static const Color insetSurface = Color(0xFFEEF3FA);
-
-  /// 悬停微冷蓝表面。
-  static const Color hoverSurface = Color(0xFFF6F9FF);
-
-  /// 亮阴影与冷蓝阴影。
-  static const Color lightShadow = Color(0xFFFFFFFF);
-  static const Color darkShadow = Color(0x142563EB);
-
-  /// 1px 细腻冷蓝边框：`#E6ECF5`。
-  static const Color hairlineBorder = Color(0xFFE6ECF5);
-
-  /// 控件清晰轮廓色。
-  static const Color controlOutline = Color(0xFFCBD5E1);
-
-  /// 文字层级：主文字 `#0F172A`，次级文字 `#64748B`。
-  static const Color textPrimary = Color(0xFF0F172A);
-  static const Color textSecondary = Color(0xFF64748B);
-
-  /// 明快科技蓝主强调色渐变 `#2563EB` -> `#3B82F6`。
-  static const Color accent = Color(0xFF2563EB);
-  static const Color accentLight = Color(0xFF3B82F6);
-  static const Color accentPressed = Color(0xFF1D4ED8);
-  static const Color accentSoft = Color(0xFFEFF6FF);
-
-  /// 健康绿 `#10B981` + 浅绿底 `#ECFDF5`。
-  static const Color healthy = Color(0xFF10B981);
-  static const Color healthyAlt = Color(0xFF059669);
-  static const Color healthyButton = Color(0xFF047857);
-  static const Color healthySoft = Color(0xFFECFDF5);
-
-  /// 未就绪 / 禁用态深色按钮配色（高对比暗炭黑）。
-  static const Color disabledDarkSurface = Color(0xFF1E293B);
-  static const Color disabledDarkBorder = Color(0xFF334155);
-  static const Color disabledDarkForeground = Color(0xFFCBD5E1);
-
-  /// 文件夹暖金 `#F59E0B` + 浅金底 `#FEF3C7`。
-  static const Color folderGold = Color(0xFFF59E0B);
-  static const Color folderGoldSoft = Color(0xFFFEF3C7);
-
-  /// 警告与危险语义色。
-  static const Color warning = Color(0xFFD97706);
-  static const Color danger = Color(0xFFEF4444);
-  static const Color dangerSoft = Color(0xFFFEF2F2);
-
-  /// 图表与时间线辅助语义色（全端统一收敛）。
-  static const Color chartSky = Color(0xFF38BDF8);
-  static const Color chartIndigo = Color(0xFF6366F1);
-  static const Color chartIndigoSoft = Color(0xFFEEF2FF);
-  static const Color slateMuted = Color(0xFF475569);
-  static const Color timelineInactive = Color(0xFFCBD5E1);
-  static const Color timelineHalo = Color(0xFFBFDBFE);
-  static const Color timelineLine = Color(0xFFD6E2F5);
-
-  /// 标准蓝渐变（导航激活胶囊、主按钮）。
-  static const LinearGradient primaryGradient = LinearGradient(
-    begin: Alignment.centerLeft,
-    end: Alignment.centerRight,
-    colors: <Color>[accent, accentLight],
-  );
-
   static const String appFontFamily = 'SourceHanSansSC';
   static const double breakpointWide = 840.0;
 
@@ -146,47 +173,6 @@ abstract final class NeuTokens {
   static const double spaceSm = NeuSpace.sm;
   static const double spaceMd = NeuSpace.md;
   static const double spaceLg = NeuSpace.lg;
-
-  /// 纯白轻拟态卡片柔和冷蓝阴影。
-  static const List<BoxShadow> extrudedShadows = <BoxShadow>[
-    BoxShadow(
-      color: Color(0x0D1E3A8A),
-      offset: Offset(0, 6),
-      blurRadius: 20,
-      spreadRadius: -2,
-    ),
-    BoxShadow(
-      color: Color(0x080F172A),
-      offset: Offset(0, 2),
-      blurRadius: 6,
-    ),
-  ];
-
-  static const List<BoxShadow> controlShadows = <BoxShadow>[
-    BoxShadow(
-      color: Color(0x101E3A8A),
-      offset: Offset(0, 3),
-      blurRadius: 10,
-      spreadRadius: -1,
-    ),
-  ];
-
-  static const List<BoxShadow> primaryButtonShadows = <BoxShadow>[
-    BoxShadow(
-      color: Color(0x332563EB),
-      offset: Offset(0, 6),
-      blurRadius: 14,
-      spreadRadius: -2,
-    ),
-  ];
-
-  static const List<BoxShadow> pressedShadows = <BoxShadow>[
-    BoxShadow(
-      color: Color(0x0A1E3A8A),
-      offset: Offset(0, 1),
-      blurRadius: 3,
-    ),
-  ];
 
   static double resolveMinTouchTarget(BuildContext context) {
     final platform = Theme.of(context).platform;
@@ -199,38 +185,111 @@ abstract final class NeuTokens {
 @immutable
 class NeuTheme extends ThemeExtension<NeuTheme> {
   const NeuTheme({
-    this.surfaceColor = NeuTokens.surface,
-    this.insetColor = NeuTokens.insetSurface,
-    this.extrudedShadows = NeuTokens.extrudedShadows,
-    this.pressedShadows = NeuTokens.pressedShadows,
+    this.palette = defaultLightPalette,
+    this.brightness = Brightness.light,
+    this.skinId = defaultSkinId,
+    this.motionSpeed = MotionSpeed.balanced,
     this.borderRadius = NeuRadius.card,
   });
 
-  final Color surfaceColor;
-  final Color insetColor;
-  final List<BoxShadow> extrudedShadows;
-  final List<BoxShadow> pressedShadows;
+  final SkinPalette palette;
+  final Brightness brightness;
+  final String skinId;
+  final MotionSpeed motionSpeed;
   final double borderRadius;
 
   static NeuTheme of(BuildContext context) {
     final ext = Theme.of(context).extension<NeuTheme>();
-    assert(ext != null, 'NeuTheme extension must be registered on ThemeData.');
-    return ext!;
+    final platformBrightness = Theme.of(context).brightness;
+    return ext ??
+        NeuTheme(
+          palette: platformBrightness == Brightness.dark
+              ? defaultDarkPalette
+              : defaultLightPalette,
+          brightness: platformBrightness,
+        );
   }
+
+  Color get canvas => palette.canvas;
+  Color get surface => palette.surface;
+  Color get surfaceColor => palette.surface;
+  Color get insetSurface => palette.insetSurface;
+  Color get insetColor => palette.insetSurface;
+  Color get hoverSurface => palette.hoverSurface;
+  Color get chromeSurface => palette.chromeSurface;
+  Color get surfacePressed => palette.surfacePressed;
+  Color get hairlineBorder => palette.hairlineBorder;
+  Color get controlOutline => palette.controlOutline;
+  Color get dividerSubtle => palette.dividerSubtle;
+  Color get textPrimary => palette.textPrimary;
+  Color get textSecondary => palette.textSecondary;
+  Color get slateMuted => palette.slateMuted;
+  Color get accent => palette.accent;
+  Color get accentLight => palette.accentLight;
+  Color get accentPressed => palette.accentPressed;
+  Color get accentSoft => palette.accentSoft;
+  Color get onAccent => palette.onAccent;
+  Color get healthy => palette.healthy;
+  Color get healthyAlt => palette.healthyAlt;
+  Color get healthyButton => palette.healthyButton;
+  Color get healthySoft => palette.healthySoft;
+  Color get folderGold => palette.folderGold;
+  Color get folderGoldSoft => palette.folderGoldSoft;
+  Color get warning => palette.warning;
+  Color get danger => palette.danger;
+  Color get dangerSoft => palette.dangerSoft;
+  Color get disabledDarkSurface => palette.disabledDarkSurface;
+  Color get disabledDarkBorder => palette.disabledDarkBorder;
+  Color get disabledDarkForeground => palette.disabledDarkForeground;
+  Color get chartSky => palette.chartSky;
+  Color get chartIndigo => palette.chartIndigo;
+  Color get chartIndigoSoft => palette.chartIndigoSoft;
+  Color get timelineInactive => palette.timelineInactive;
+  Color get timelineHalo => palette.timelineHalo;
+  Color get timelineLine => palette.timelineLine;
+  Color get dialogBarrier => palette.dialogBarrier;
+  Color get switchTrackDisabled => palette.switchTrackDisabled;
+  Color get switchTrackOff => palette.switchTrackOff;
+  List<BoxShadow> get extrudedShadows => palette.extrudedShadows;
+  List<BoxShadow> get controlShadows => palette.controlShadows;
+  List<BoxShadow> get primaryButtonShadows => palette.primaryButtonShadows;
+  List<BoxShadow> get pressedShadows => palette.pressedShadows;
+  Color get transparent => palette.transparent;
+
+  LinearGradient get primaryGradient => LinearGradient(
+        begin: Alignment.centerLeft,
+        end: Alignment.centerRight,
+        colors: <Color>[accent, accentLight],
+      );
+
+  LinearGradient get pressedGradient => LinearGradient(
+        begin: Alignment.centerLeft,
+        end: Alignment.centerRight,
+        colors: <Color>[accentPressed, accent],
+      );
+
+  SweepGradient get chartGradient => SweepGradient(
+        startAngle: -math.pi / 2,
+        endAngle: math.pi * 1.5,
+        colors: <Color>[chartSky, accent, chartIndigo, chartSky],
+        stops: const <double>[0.0, 0.45, 0.8, 1.0],
+      );
+
+  bool get isDark => brightness == Brightness.dark;
 
   @override
   NeuTheme copyWith({
-    Color? surfaceColor,
-    Color? insetColor,
-    List<BoxShadow>? extrudedShadows,
-    List<BoxShadow>? pressedShadows,
+    SkinPalette? palette,
+    Brightness? brightness,
+    String? skinId,
+    MotionSpeed? motionSpeed,
     double? borderRadius,
   }) {
     return NeuTheme(
-      surfaceColor: surfaceColor ?? this.surfaceColor,
-      insetColor: insetColor ?? this.insetColor,
-      extrudedShadows: extrudedShadows ?? this.extrudedShadows,
-      pressedShadows: pressedShadows ?? this.pressedShadows,
+      palette: palette ?? this.palette,
+      brightness: brightness ?? this.brightness,
+      skinId: skinId ?? this.skinId,
+      motionSpeed: motionSpeed ?? this.motionSpeed,
       borderRadius: borderRadius ?? this.borderRadius,
     );
   }
@@ -238,13 +297,12 @@ class NeuTheme extends ThemeExtension<NeuTheme> {
   @override
   NeuTheme lerp(ThemeExtension<NeuTheme>? other, double t) {
     if (other is! NeuTheme) return this;
+    final nextBrightness = t < 0.5 ? brightness : other.brightness;
     return NeuTheme(
-      surfaceColor: Color.lerp(surfaceColor, other.surfaceColor, t)!,
-      insetColor: Color.lerp(insetColor, other.insetColor, t)!,
-      extrudedShadows:
-          BoxShadow.lerpList(extrudedShadows, other.extrudedShadows, t)!,
-      pressedShadows:
-          BoxShadow.lerpList(pressedShadows, other.pressedShadows, t)!,
+      palette: palette.lerp(other.palette, t),
+      brightness: nextBrightness,
+      skinId: t < 0.5 ? skinId : other.skinId,
+      motionSpeed: t < 0.5 ? motionSpeed : other.motionSpeed,
       borderRadius: borderRadius + (other.borderRadius - borderRadius) * t,
     );
   }
@@ -253,86 +311,116 @@ class NeuTheme extends ThemeExtension<NeuTheme> {
   bool operator ==(Object other) {
     if (identical(this, other)) return true;
     return other is NeuTheme &&
-        other.surfaceColor == surfaceColor &&
-        other.insetColor == insetColor &&
-        listEquals(other.extrudedShadows, extrudedShadows) &&
-        listEquals(other.pressedShadows, pressedShadows) &&
+        other.palette == palette &&
+        other.brightness == brightness &&
+        other.skinId == skinId &&
+        other.motionSpeed == motionSpeed &&
         other.borderRadius == borderRadius;
   }
 
   @override
   int get hashCode => Object.hash(
-        surfaceColor,
-        insetColor,
-        Object.hashAll(extrudedShadows),
-        Object.hashAll(pressedShadows),
+        palette,
+        brightness,
+        skinId,
+        motionSpeed,
         borderRadius,
       );
 }
 
-ThemeData buildLanVaultTheme() {
-  const colorScheme = ColorScheme.light(
-    surface: NeuTokens.surface,
-    primary: NeuTokens.accent,
-    onPrimary: Colors.white,
-    secondary: NeuTokens.healthy,
-    onSecondary: Colors.white,
-    error: NeuTokens.danger,
-    onError: Colors.white,
-    onSurface: NeuTokens.textPrimary,
-    onSurfaceVariant: NeuTokens.textSecondary,
-    outline: NeuTokens.hairlineBorder,
+ThemeData buildLanVaultTheme({
+  SkinPalette? palette,
+  Brightness brightness = Brightness.light,
+  String skinId = defaultSkinId,
+  MotionSpeed motionSpeed = MotionSpeed.balanced,
+}) {
+  final activePalette = palette ??
+      (brightness == Brightness.dark
+          ? defaultDarkPalette
+          : defaultLightPalette);
+  final colorScheme = brightness == Brightness.dark
+      ? ColorScheme.dark(
+          surface: activePalette.surface,
+          primary: activePalette.accent,
+          onPrimary: activePalette.onAccent,
+          secondary: activePalette.healthy,
+          onSecondary: pickContrastInk(activePalette.healthy),
+          error: activePalette.danger,
+          onError: pickContrastInk(activePalette.danger),
+          onSurface: activePalette.textPrimary,
+          onSurfaceVariant: activePalette.textSecondary,
+          outline: activePalette.hairlineBorder,
+        )
+      : ColorScheme.light(
+          surface: activePalette.surface,
+          primary: activePalette.accent,
+          onPrimary: activePalette.onAccent,
+          secondary: activePalette.healthy,
+          onSecondary: pickContrastInk(activePalette.healthy),
+          error: activePalette.danger,
+          onError: pickContrastInk(activePalette.danger),
+          onSurface: activePalette.textPrimary,
+          onSurfaceVariant: activePalette.textSecondary,
+          outline: activePalette.hairlineBorder,
+        );
+  final neu = NeuTheme(
+    palette: activePalette,
+    brightness: brightness,
+    skinId: skinId,
+    motionSpeed: motionSpeed,
   );
 
   return ThemeData(
     useMaterial3: true,
     fontFamily: NeuTokens.appFontFamily,
     colorScheme: colorScheme,
-    scaffoldBackgroundColor: NeuTokens.canvas,
-    canvasColor: NeuTokens.canvas,
-    dividerColor: NeuTokens.hairlineBorder,
-    textTheme: const TextTheme(
+    scaffoldBackgroundColor: activePalette.canvas,
+    canvasColor: activePalette.canvas,
+    dividerColor: activePalette.dividerSubtle,
+    dialogTheme: DialogThemeData(
+      backgroundColor: activePalette.surface,
+      barrierColor: activePalette.dialogBarrier,
+    ),
+    textTheme: TextTheme(
       headlineSmall: TextStyle(
-        color: NeuTokens.textPrimary,
+        color: activePalette.textPrimary,
         fontSize: 24,
         fontWeight: FontWeight.w700,
         letterSpacing: -0.4,
       ),
       titleMedium: TextStyle(
-        color: NeuTokens.textPrimary,
+        color: activePalette.textPrimary,
         fontSize: 16,
         fontWeight: FontWeight.w600,
         letterSpacing: -0.2,
       ),
       titleSmall: TextStyle(
-        color: NeuTokens.textPrimary,
+        color: activePalette.textPrimary,
         fontSize: 14,
         fontWeight: FontWeight.w600,
       ),
       bodyMedium: TextStyle(
-        color: NeuTokens.textPrimary,
+        color: activePalette.textPrimary,
         fontSize: 14,
         height: 1.45,
       ),
       bodySmall: TextStyle(
-        color: NeuTokens.textSecondary,
+        color: activePalette.textSecondary,
         fontSize: 13,
         height: 1.4,
       ),
       labelLarge: TextStyle(
-        color: NeuTokens.textPrimary,
+        color: activePalette.textPrimary,
         fontSize: 14,
         fontWeight: FontWeight.w600,
       ),
       labelMedium: TextStyle(
-        color: NeuTokens.textSecondary,
+        color: activePalette.textSecondary,
         fontSize: 12,
         fontWeight: FontWeight.w600,
       ),
     ),
-    extensions: const <ThemeExtension<dynamic>>[
-      NeuTheme(),
-    ],
+    extensions: <ThemeExtension<dynamic>>[neu],
   );
 }
 
@@ -399,6 +487,7 @@ class StorageDonutRing extends StatelessWidget {
     final clamped = ratio.clamp(0.0, 1.0);
     final percent = (clamped * 100).round();
     final isCompact = size < 84;
+    final neu = NeuTheme.of(context);
 
     return RepaintBoundary(
       child: Semantics(
@@ -415,6 +504,7 @@ class StorageDonutRing extends StatelessWidget {
                 painter: _StorageDonutPainter(
                   progress: animatedValue,
                   strokeWidth: strokeWidth,
+                  palette: neu.palette,
                 ),
                 child: Center(
                   child: Column(
@@ -423,7 +513,7 @@ class StorageDonutRing extends StatelessWidget {
                       Text(
                         '${(animatedValue * 100).round()}%',
                         style: TextStyle(
-                          color: NeuTokens.textPrimary,
+                          color: neu.textPrimary,
                           fontSize: isCompact ? 15 : 22,
                           fontWeight: FontWeight.w700,
                           letterSpacing: -0.5,
@@ -436,7 +526,7 @@ class StorageDonutRing extends StatelessWidget {
                         Text(
                           centerLabel,
                           style: TextStyle(
-                            color: NeuTokens.textSecondary,
+                            color: neu.textSecondary,
                             fontSize: isCompact ? 10 : 11.5,
                             fontWeight: FontWeight.w500,
                           ),
@@ -457,10 +547,12 @@ class _StorageDonutPainter extends CustomPainter {
   const _StorageDonutPainter({
     required this.progress,
     required this.strokeWidth,
+    required this.palette,
   });
 
   final double progress;
   final double strokeWidth;
+  final SkinPalette palette;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -469,7 +561,7 @@ class _StorageDonutPainter extends CustomPainter {
     if (radius <= 0) return;
 
     final trackPaint = Paint()
-      ..color = const Color(0xFFE6EEF9)
+      ..color = palette.timelineInactive
       ..style = PaintingStyle.stroke
       ..strokeWidth = strokeWidth
       ..strokeCap = StrokeCap.round;
@@ -478,14 +570,14 @@ class _StorageDonutPainter extends CustomPainter {
     if (progress <= 0.001) return;
 
     final rect = Rect.fromCircle(center: center, radius: radius);
-    const sweepGradient = SweepGradient(
+    final sweepGradient = SweepGradient(
       startAngle: -math.pi / 2,
       endAngle: math.pi * 1.5,
       colors: <Color>[
-        NeuTokens.chartSky,
-        NeuTokens.accent,
-        NeuTokens.chartIndigo,
-        NeuTokens.chartSky,
+        palette.chartSky,
+        palette.accent,
+        palette.chartIndigo,
+        palette.chartSky,
       ],
       stops: <double>[0.0, 0.45, 0.8, 1.0],
     );
@@ -508,7 +600,8 @@ class _StorageDonutPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _StorageDonutPainter oldDelegate) {
     return oldDelegate.progress != progress ||
-        oldDelegate.strokeWidth != strokeWidth;
+        oldDelegate.strokeWidth != strokeWidth ||
+        oldDelegate.palette != palette;
   }
 }
 
@@ -527,19 +620,19 @@ class NeuStatusBadge extends StatelessWidget {
   final NeuStatusTone tone;
   final bool showDot;
 
-  (Color fg, Color bg) _resolveColors() {
+  (Color fg, Color bg) _resolveColors(NeuTheme neu) {
     return switch (tone) {
-      NeuStatusTone.neutral => (NeuTokens.textSecondary, NeuTokens.insetSurface),
-      NeuStatusTone.accent => (NeuTokens.accent, NeuTokens.accentSoft),
-      NeuStatusTone.healthy => (NeuTokens.healthyAlt, NeuTokens.healthySoft),
-      NeuStatusTone.warning => (NeuTokens.warning, NeuTokens.folderGoldSoft),
-      NeuStatusTone.danger => (NeuTokens.danger, NeuTokens.dangerSoft),
+      NeuStatusTone.neutral => (neu.textSecondary, neu.insetSurface),
+      NeuStatusTone.accent => (neu.accent, neu.accentSoft),
+      NeuStatusTone.healthy => (neu.healthyAlt, neu.healthySoft),
+      NeuStatusTone.warning => (neu.warning, neu.folderGoldSoft),
+      NeuStatusTone.danger => (neu.danger, neu.dangerSoft),
     };
   }
 
   @override
   Widget build(BuildContext context) {
-    final (fg, bg) = _resolveColors();
+    final (fg, bg) = _resolveColors(NeuTheme.of(context));
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
@@ -638,13 +731,13 @@ class _NeuCardState extends State<NeuCard> {
     final resolvedBg = widget.backgroundColor ??
         (widget.inset
             ? neu.insetColor
-            : (_hovered && interactive ? NeuTokens.hoverSurface : neu.surfaceColor));
+            : (_hovered && interactive ? neu.hoverSurface : neu.surfaceColor));
     final resolvedBorder = widget.borderColor ??
         (widget.inset
-            ? const Color(0xFFE0E8F4)
+            ? neu.hairlineBorder
             : ((_hovered || _focused) && interactive
-                ? NeuTokens.accent.withValues(alpha: _focused ? 0.55 : 0.35)
-                : NeuTokens.hairlineBorder));
+                ? neu.accent.withValues(alpha: _focused ? 0.55 : 0.35)
+                : neu.hairlineBorder));
     final resolvedShadows = widget.inset
         ? null
         : (_pressed && interactive ? neu.pressedShadows : neu.extrudedShadows);
@@ -668,8 +761,9 @@ class _NeuCardState extends State<NeuCard> {
     if (interactive) {
       final targetScale =
           (_pressed && !reduced) ? NeuMotion.cardPressedScale : 1.0;
-      final targetOffsetY =
-          (_hovered && !_pressed && !reduced) ? -1.5 : (_pressed && !reduced ? 1.0 : 0.0);
+      final targetOffsetY = (_hovered && !_pressed && !reduced)
+          ? -1.5
+          : (_pressed && !reduced ? 1.0 : 0.0);
       box = Focus(
         focusNode: _focusNode,
         onFocusChange: (value) {
@@ -754,7 +848,8 @@ class NeuAnimatedExpand extends StatelessWidget {
         curve: curve,
         child: AnimatedOpacity(
           opacity: expanded ? 1.0 : 0.0,
-          duration: Duration(milliseconds: (duration.inMilliseconds * 0.85).round()),
+          duration:
+              Duration(milliseconds: (duration.inMilliseconds * 0.85).round()),
           curve: curve,
           child: IgnorePointer(
             ignoring: !expanded,
@@ -780,11 +875,13 @@ class NeuMotionSwitcher extends StatelessWidget {
     final reduced = NeuMotion.isReduced(context);
     return AnimatedSwitcher(
       duration: reduced
-          ? const Duration(milliseconds: 100)
-          : const Duration(milliseconds: 180),
-      reverseDuration: const Duration(milliseconds: 50),
-      switchInCurve: Curves.linearToEaseOut,
-      switchOutCurve: Curves.easeIn,
+          ? NeuMotion.reducedDuration
+          : NeuMotion.resolvePageEnter(context),
+      reverseDuration: reduced
+          ? NeuMotion.reducedDuration
+          : NeuMotion.resolvePageExit(context),
+      switchInCurve: NeuMotion.resolvePressCurve(context),
+      switchOutCurve: NeuMotion.resolveExitCurve(context),
       layoutBuilder: (currentChild, previousChildren) {
         return Stack(
           alignment: Alignment.topLeft,
@@ -822,19 +919,19 @@ Future<T?> showNeuDialog<T>({
   bool barrierDismissible = true,
 }) {
   final reduced = NeuMotion.isReduced(context);
+  final neu = NeuTheme.of(context);
   return showGeneralDialog<T>(
     context: context,
     barrierDismissible: barrierDismissible,
     barrierLabel: '关闭弹窗',
-    barrierColor: const Color(0x520F172A),
-    transitionDuration:
-        reduced ? NeuMotion.reducedDuration : NeuMotion.pressDuration,
+    barrierColor: neu.dialogBarrier,
+    transitionDuration: NeuMotion.resolveModal(context),
     pageBuilder: (dialogContext, _, __) => builder(dialogContext),
     transitionBuilder: (dialogContext, animation, secondaryAnimation, child) {
       final curved = CurvedAnimation(
         parent: animation,
-        curve: reduced ? NeuMotion.reducedCurve : NeuMotion.pressCurve,
-        reverseCurve: Curves.easeIn,
+        curve: NeuMotion.resolveSheetCurve(context),
+        reverseCurve: NeuMotion.resolveExitCurve(context),
       );
       if (reduced) {
         return FadeTransition(opacity: curved, child: child);
@@ -874,6 +971,7 @@ class NeuButton extends StatefulWidget {
   final NeuButtonTone tone;
   final bool loading;
   final bool expanded;
+
   /// 为 true 时渲染为深炭黑色"未就绪/禁用态"，但若仍传入 [onPressed] 则保留点击以弹出提示。
   final bool disabledLook;
   final double radius;
@@ -920,50 +1018,46 @@ class _NeuButtonState extends State<NeuButton> {
     return KeyEventResult.ignored;
   }
 
-  Color _resolveForeground() {
-    if (widget.disabledLook) return NeuTokens.disabledDarkForeground;
-    if (!_enabled) return NeuTokens.textSecondary;
+  Color _resolveForeground(NeuTheme neu, Color background) {
+    if (widget.disabledLook) return neu.disabledDarkForeground;
+    if (!_enabled) return neu.textSecondary;
     return switch (widget.tone) {
-      NeuButtonTone.neutral => NeuTokens.textPrimary,
-      NeuButtonTone.primary => Colors.white,
-      NeuButtonTone.danger => Colors.white,
-      NeuButtonTone.healthy => Colors.white,
+      NeuButtonTone.neutral => neu.textPrimary,
+      NeuButtonTone.primary => pickContrastInk(background),
+      NeuButtonTone.danger => pickContrastInk(background),
+      NeuButtonTone.healthy => pickContrastInk(background),
     };
   }
 
   Color? _resolveBackground(NeuTheme neu) {
-    if (widget.disabledLook) return NeuTokens.disabledDarkSurface;
+    if (widget.disabledLook) return neu.disabledDarkSurface;
     if (!_enabled) return neu.insetColor;
     return switch (widget.tone) {
       NeuButtonTone.neutral =>
-        _hovered && !_pressed ? NeuTokens.hoverSurface : neu.surfaceColor,
-      NeuButtonTone.primary => _pressed ? NeuTokens.accentPressed : null,
-      NeuButtonTone.danger => NeuTokens.danger,
-      NeuButtonTone.healthy => NeuTokens.healthyButton,
+        _hovered && !_pressed ? neu.hoverSurface : neu.surfaceColor,
+      NeuButtonTone.primary => _pressed ? neu.accentPressed : neu.accent,
+      NeuButtonTone.danger => neu.danger,
+      NeuButtonTone.healthy => neu.healthyButton,
     };
   }
 
-  Gradient? _resolveGradient() {
+  Gradient? _resolveGradient(NeuTheme neu) {
     if (_looksDisabled || widget.tone != NeuButtonTone.primary) {
       return null;
     }
     if (_pressed) {
-      return const LinearGradient(
-        begin: Alignment.centerLeft,
-        end: Alignment.centerRight,
-        colors: <Color>[NeuTokens.accentPressed, NeuTokens.accent],
-      );
+      return neu.pressedGradient;
     }
-    return NeuTokens.primaryGradient;
+    return neu.primaryGradient;
   }
 
   List<BoxShadow>? _resolveShadows(NeuTheme neu) {
     if (_looksDisabled) return null;
     if (_pressed) return neu.pressedShadows;
     if (widget.tone == NeuButtonTone.primary) {
-      return NeuTokens.primaryButtonShadows;
+      return neu.primaryButtonShadows;
     }
-    return NeuTokens.controlShadows;
+    return neu.controlShadows;
   }
 
   @override
@@ -973,9 +1067,14 @@ class _NeuButtonState extends State<NeuButton> {
     final duration = NeuMotion.resolvePress(context);
     final curve = NeuMotion.resolvePressCurve(context);
     final minTouch = NeuTokens.resolveMinTouchTarget(context);
-    final fg = _resolveForeground();
     final bg = _resolveBackground(neu);
-    final gradient = _resolveGradient();
+    final gradient = _resolveGradient(neu);
+    final fg = _resolveForeground(
+      neu,
+      _pressed && widget.tone == NeuButtonTone.primary
+          ? neu.accentPressed
+          : bg ?? neu.accent,
+    );
     final targetScale =
         (_pressed && _enabled && !reduced) ? NeuMotion.pressedScale : 1.0;
 
@@ -988,7 +1087,7 @@ class _NeuButtonState extends State<NeuButton> {
             width: 18,
             height: 18,
             child: AnimatedSwitcher(
-              duration: const Duration(milliseconds: 150),
+              duration: NeuMotion.resolveState(context),
               child: widget.loading
                   ? SizedBox(
                       key: const ValueKey<String>('loading'),
@@ -1035,12 +1134,12 @@ class _NeuButtonState extends State<NeuButton> {
         gradient: gradient,
         borderRadius: BorderRadius.all(Radius.circular(widget.radius)),
         border: widget.disabledLook
-            ? Border.all(color: NeuTokens.disabledDarkBorder, width: 1.0)
+            ? Border.all(color: neu.disabledDarkBorder, width: 1.0)
             : (widget.tone == NeuButtonTone.neutral || !_enabled
                 ? Border.all(
                     color: _hovered && _enabled
-                        ? NeuTokens.controlOutline
-                        : NeuTokens.hairlineBorder,
+                        ? neu.controlOutline
+                        : neu.hairlineBorder,
                     width: 1.0,
                   )
                 : null),
@@ -1071,12 +1170,15 @@ class _NeuButtonState extends State<NeuButton> {
             },
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTapDown:
-                  _enabled && !widget.disabledLook ? (_) => _setPressed(true) : null,
-              onTapUp:
-                  _enabled && !widget.disabledLook ? (_) => _setPressed(false) : null,
-              onTapCancel:
-                  _enabled && !widget.disabledLook ? () => _setPressed(false) : null,
+              onTapDown: _enabled && !widget.disabledLook
+                  ? (_) => _setPressed(true)
+                  : null,
+              onTapUp: _enabled && !widget.disabledLook
+                  ? (_) => _setPressed(false)
+                  : null,
+              onTapCancel: _enabled && !widget.disabledLook
+                  ? () => _setPressed(false)
+                  : null,
               onTap: _enabled ? widget.onPressed : null,
               child: TweenAnimationBuilder<double>(
                 tween: Tween<double>(end: targetScale),
@@ -1153,6 +1255,7 @@ class _NeuSwitchState extends State<NeuSwitch> {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     final textTheme = Theme.of(context).textTheme;
     final stateDuration = NeuMotion.resolveState(context);
     final stateCurve = NeuMotion.resolveStateCurve(context);
@@ -1171,9 +1274,9 @@ class _NeuSwitchState extends State<NeuSwitch> {
       padding: const EdgeInsets.all(3),
       decoration: BoxDecoration(
         color: !_enabled
-            ? const Color(0xFFE2E8F0)
-            : (widget.value ? null : const Color(0xFFD6DFEE)),
-        gradient: _enabled && widget.value ? NeuTokens.primaryGradient : null,
+            ? neu.switchTrackDisabled
+            : (widget.value ? null : neu.switchTrackOff),
+        gradient: _enabled && widget.value ? neu.primaryGradient : null,
         borderRadius: const BorderRadius.all(Radius.circular(NeuRadius.pill)),
       ),
       child: AnimatedAlign(
@@ -1193,16 +1296,10 @@ class _NeuSwitchState extends State<NeuSwitch> {
           child: Container(
             width: 22,
             height: 22,
-            decoration: const BoxDecoration(
-              color: Colors.white,
+            decoration: BoxDecoration(
+              color: pickContrastInk(neu.switchTrackOff),
               shape: BoxShape.circle,
-              boxShadow: <BoxShadow>[
-                BoxShadow(
-                  color: Color(0x260F172A),
-                  offset: Offset(0, 2),
-                  blurRadius: 4,
-                ),
-              ],
+              boxShadow: neu.controlShadows,
             ),
           ),
         ),
@@ -1228,8 +1325,10 @@ class _NeuSwitchState extends State<NeuSwitch> {
                 : SystemMouseCursors.forbidden,
             child: GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTapDown: _enabled ? (_) => setState(() => _pressed = true) : null,
-              onTapUp: _enabled ? (_) => setState(() => _pressed = false) : null,
+              onTapDown:
+                  _enabled ? (_) => setState(() => _pressed = true) : null,
+              onTapUp:
+                  _enabled ? (_) => setState(() => _pressed = false) : null,
               onTapCancel:
                   _enabled ? () => setState(() => _pressed = false) : null,
               onTap: _enabled ? _toggle : null,
@@ -1256,8 +1355,8 @@ class _NeuSwitchState extends State<NeuSwitch> {
                                     widget.title,
                                     style: textTheme.titleSmall?.copyWith(
                                       color: _enabled
-                                          ? NeuTokens.textPrimary
-                                          : NeuTokens.textSecondary,
+                                          ? neu.textPrimary
+                                          : neu.textSecondary,
                                     ),
                                   ),
                                   if (widget.subtitle != null) ...<Widget>[
@@ -1398,7 +1497,7 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
                 Radius.circular(outerRadius),
               ),
               border: Border.all(
-                color: NeuTokens.hairlineBorder,
+                color: neu.hairlineBorder,
                 width: 1.0,
               ),
             ),
@@ -1416,13 +1515,13 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
                         heightFactor: 1.0,
                         child: DecoratedBox(
                           decoration: BoxDecoration(
-                            gradient: NeuTokens.primaryGradient,
+                            gradient: neu.primaryGradient,
                             borderRadius: BorderRadius.all(
                               Radius.circular(thumbRadius),
                             ),
-                            boxShadow: const <BoxShadow>[
+                            boxShadow: <BoxShadow>[
                               BoxShadow(
-                                color: Color(0x282563EB),
+                                color: neu.accent.withValues(alpha: 0.28),
                                 offset: Offset(0, 3),
                                 blurRadius: 8,
                               ),
@@ -1465,8 +1564,8 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
                                           .copyWith(
                                         fontSize: 13.5,
                                         color: segment.value == widget.value
-                                            ? Colors.white
-                                            : NeuTokens.textSecondary,
+                                            ? neu.onAccent
+                                            : neu.textSecondary,
                                       ),
                                       child: Text(
                                         segment.label,
@@ -1555,9 +1654,8 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
     final curve = NeuMotion.resolvePressCurve(context);
     final minTouch = NeuTokens.resolveMinTouchTarget(context);
     final hasError = widget.errorText != null;
-    final borderColor = hasError
-        ? NeuTokens.danger
-        : (_focused ? NeuTokens.accent : NeuTokens.hairlineBorder);
+    final borderColor =
+        hasError ? neu.danger : (_focused ? neu.accent : neu.hairlineBorder);
 
     return RepaintBoundary(
       child: Column(
@@ -1568,7 +1666,7 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
             Text(
               widget.label!,
               style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                    color: NeuTokens.textPrimary,
+                    color: neu.textPrimary,
                   ),
             ),
             const SizedBox(height: 6),
@@ -1579,7 +1677,7 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
             constraints: BoxConstraints(minHeight: minTouch),
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 2),
             decoration: BoxDecoration(
-              color: _focused ? NeuTokens.surface : neu.insetColor,
+              color: _focused ? neu.surface : neu.insetColor,
               borderRadius: const BorderRadius.all(
                 Radius.circular(NeuRadius.control),
               ),
@@ -1588,9 +1686,9 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
                 width: _focused || hasError ? 1.4 : 1.0,
               ),
               boxShadow: _focused
-                  ? const <BoxShadow>[
+                  ? <BoxShadow>[
                       BoxShadow(
-                        color: Color(0x1F2563EB),
+                        color: neu.accent.withValues(alpha: 0.18),
                         blurRadius: 8,
                         spreadRadius: 0,
                       ),
@@ -1604,12 +1702,12 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
               children: <Widget>[
                 if (widget.prefixIcon != null) ...<Widget>[
                   Padding(
-                    padding: EdgeInsets.only(top: widget.maxLines == 1 ? 0 : 12),
+                    padding:
+                        EdgeInsets.only(top: widget.maxLines == 1 ? 0 : 12),
                     child: Icon(
                       widget.prefixIcon,
                       size: 18,
-                      color:
-                          _focused ? NeuTokens.accent : NeuTokens.textSecondary,
+                      color: _focused ? neu.accent : neu.textSecondary,
                     ),
                   ),
                   const SizedBox(width: NeuSpace.sm),
@@ -1623,22 +1721,23 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
                     maxLines: widget.maxLines,
                     keyboardType: widget.keyboardType,
                     onSubmitted: widget.onSubmitted,
-                    cursorColor: NeuTokens.accent,
+                    cursorColor: neu.accent,
                     style: Theme.of(context).textTheme.bodyMedium?.copyWith(
                           fontSize: 15,
                           height: 1.4,
                           color: widget.enabled
-                              ? NeuTokens.textPrimary
-                              : NeuTokens.textSecondary,
+                              ? neu.textPrimary
+                              : neu.textSecondary,
                         ),
                     decoration: InputDecoration(
                       isDense: true,
                       border: InputBorder.none,
                       hintText: widget.hint,
-                      hintStyle: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            fontSize: 14.5,
-                            color: NeuTokens.textSecondary,
-                          ),
+                      hintStyle:
+                          Theme.of(context).textTheme.bodySmall?.copyWith(
+                                fontSize: 14.5,
+                                color: neu.textSecondary,
+                              ),
                       contentPadding: const EdgeInsets.symmetric(vertical: 11),
                     ),
                   ),
@@ -1657,7 +1756,7 @@ class _NeuInsetFieldState extends State<NeuInsetField> {
               style: Theme.of(context)
                   .textTheme
                   .bodySmall
-                  ?.copyWith(color: NeuTokens.danger),
+                  ?.copyWith(color: neu.danger),
             ),
           ],
         ],
@@ -1672,14 +1771,14 @@ class NeuProgressBar extends StatelessWidget {
     super.key,
     required this.value,
     this.height = 8,
-    this.fillColor = NeuTokens.accent,
+    this.fillColor,
     this.showPercentage = true,
     this.semanticLabel,
   }) : assert(value >= 0.0 && value <= 1.0, 'value must be in [0.0, 1.0].');
 
   final double value;
   final double height;
-  final Color fillColor;
+  final Color? fillColor;
   final bool showPercentage;
   final String? semanticLabel;
 
@@ -1690,7 +1789,8 @@ class NeuProgressBar extends StatelessWidget {
     final curve = NeuMotion.resolveStateCurve(context);
     const radius = BorderRadius.all(Radius.circular(NeuRadius.pill));
     final percent = (value * 100).round();
-    final usePrimaryGradient = fillColor == NeuTokens.accent;
+    final effectiveFill = fillColor ?? neu.accent;
+    final usePrimaryGradient = fillColor == null;
 
     final track = Container(
       height: height,
@@ -1707,8 +1807,8 @@ class NeuProgressBar extends StatelessWidget {
           heightFactor: 1.0,
           child: DecoratedBox(
             decoration: BoxDecoration(
-              color: usePrimaryGradient ? null : fillColor,
-              gradient: usePrimaryGradient ? NeuTokens.primaryGradient : null,
+              color: usePrimaryGradient ? null : effectiveFill,
+              gradient: usePrimaryGradient ? neu.primaryGradient : null,
               borderRadius: radius,
             ),
           ),
@@ -1731,11 +1831,11 @@ class NeuProgressBar extends StatelessWidget {
                       '$percent%',
                       textAlign: TextAlign.right,
                       style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                            color: NeuTokens.textPrimary,
-                            fontFeatures: const <FontFeature>[
-                              FontFeature.tabularFigures(),
-                            ],
-                          ),
+                        color: neu.textPrimary,
+                        fontFeatures: const <FontFeature>[
+                          FontFeature.tabularFigures(),
+                        ],
+                      ),
                     ),
                   ),
                 ],
@@ -1799,7 +1899,7 @@ class NeuDropdown<T> extends StatelessWidget {
             Text(
               label!,
               style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                    color: NeuTokens.textPrimary,
+                    color: neu.textPrimary,
                   ),
             ),
             const SizedBox(height: 6),
@@ -1813,14 +1913,14 @@ class NeuDropdown<T> extends StatelessWidget {
                 Radius.circular(NeuRadius.control),
               ),
               border: Border.all(
-                color: NeuTokens.hairlineBorder,
+                color: neu.hairlineBorder,
                 width: 1.0,
               ),
             ),
             child: Row(
               children: <Widget>[
                 if (prefixIcon != null) ...<Widget>[
-                  Icon(prefixIcon, size: 18, color: NeuTokens.textSecondary),
+                  Icon(prefixIcon, size: 18, color: neu.textSecondary),
                   const SizedBox(width: NeuSpace.sm),
                 ],
                 Expanded(
@@ -1834,7 +1934,7 @@ class NeuDropdown<T> extends StatelessWidget {
                                 .bodyMedium
                                 ?.copyWith(
                                   fontSize: 14.5,
-                                  color: NeuTokens.textSecondary,
+                                  color: neu.textSecondary,
                                 ),
                           ),
                         )
@@ -1842,15 +1942,15 @@ class NeuDropdown<T> extends StatelessWidget {
                           child: DropdownButton<T>(
                             value: effectiveValue,
                             isExpanded: true,
-                            dropdownColor: NeuTokens.surface,
+                            dropdownColor: neu.surface,
                             borderRadius: const BorderRadius.all(
                               Radius.circular(NeuRadius.control),
                             ),
                             icon: Icon(
                               Icons.keyboard_arrow_down_rounded,
                               color: canSelect
-                                  ? NeuTokens.textPrimary
-                                  : NeuTokens.textSecondary,
+                                  ? neu.textPrimary
+                                  : neu.textSecondary,
                             ),
                             hint: Text(
                               emptyHint,
@@ -1859,7 +1959,7 @@ class NeuDropdown<T> extends StatelessWidget {
                                   .bodyMedium
                                   ?.copyWith(
                                     fontSize: 14.5,
-                                    color: NeuTokens.textSecondary,
+                                    color: neu.textSecondary,
                                   ),
                             ),
                             style: Theme.of(context)
@@ -1867,7 +1967,7 @@ class NeuDropdown<T> extends StatelessWidget {
                                 .bodyMedium
                                 ?.copyWith(
                                   fontSize: 14.5,
-                                  color: NeuTokens.textPrimary,
+                                  color: neu.textPrimary,
                                 ),
                             onChanged: canSelect ? onChanged : null,
                             items: <DropdownMenuItem<T>>[
@@ -1899,30 +1999,31 @@ class NeuIconBadge extends StatelessWidget {
   const NeuIconBadge({
     super.key,
     required this.icon,
-    this.color = NeuTokens.accent,
-    this.backgroundColor = NeuTokens.accentSoft,
+    this.color,
+    this.backgroundColor,
     this.size = 40,
     this.iconSize = 20,
     this.radius = NeuRadius.control,
   });
 
   final IconData icon;
-  final Color color;
-  final Color backgroundColor;
+  final Color? color;
+  final Color? backgroundColor;
   final double size;
   final double iconSize;
   final double radius;
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     return Container(
       width: size,
       height: size,
       decoration: BoxDecoration(
-        color: backgroundColor,
+        color: backgroundColor ?? neu.accentSoft,
         borderRadius: BorderRadius.all(Radius.circular(radius)),
       ),
-      child: Icon(icon, size: iconSize, color: color),
+      child: Icon(icon, size: iconSize, color: color ?? neu.accent),
     );
   }
 }
@@ -1948,6 +2049,7 @@ class NeuDialog extends StatelessWidget {
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
     final viewHeight = MediaQuery.sizeOf(context).height;
+    final neu = NeuTheme.of(context);
 
     return Center(
       child: ConstrainedBox(
@@ -1958,7 +2060,7 @@ class NeuDialog extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
           child: Material(
-            color: Colors.transparent,
+            color: neu.transparent,
             child: NeuCard(
               padding: const EdgeInsets.all(20),
               child: SingleChildScrollView(
@@ -1989,10 +2091,10 @@ class NeuDialog extends StatelessWidget {
                         IconButton(
                           onPressed: () => Navigator.of(context).pop(),
                           tooltip: '关闭',
-                          icon: const Icon(
+                          icon: Icon(
                             Icons.close_rounded,
                             size: 18,
-                            color: NeuTokens.textSecondary,
+                            color: neu.textSecondary,
                           ),
                         ),
                       ],
@@ -2026,19 +2128,21 @@ class NeuKeyValueRow extends StatelessWidget {
     required this.label,
     required this.value,
     this.leadingIcon,
-    this.leadingColor = NeuTokens.healthy,
+    this.leadingColor,
     this.valueColor,
   });
 
   final String label;
   final String value;
   final IconData? leadingIcon;
-  final Color leadingColor;
+  final Color? leadingColor;
   final Color? valueColor;
 
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
+    final effectiveLeadingColor = leadingColor ?? neu.healthy;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 8),
       child: LayoutBuilder(
@@ -2048,7 +2152,7 @@ class NeuKeyValueRow extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             children: <Widget>[
               if (leadingIcon != null) ...<Widget>[
-                Icon(leadingIcon, size: 17, color: leadingColor),
+                Icon(leadingIcon, size: 17, color: effectiveLeadingColor),
                 const SizedBox(width: 8),
               ],
               Flexible(
@@ -2064,7 +2168,7 @@ class NeuKeyValueRow extends StatelessWidget {
           final valueWidget = Text(
             value,
             style: textTheme.bodySmall?.copyWith(
-              color: valueColor ?? NeuTokens.textSecondary,
+              color: valueColor ?? neu.textSecondary,
             ),
             textAlign: narrow ? TextAlign.left : TextAlign.right,
           );

@@ -274,6 +274,7 @@ class MainActivity : FlutterActivity() {
                 }
             }
 
+            "getFilesDir" -> result.success(filesDir.absolutePath)
             "openAppSettings" -> {
                 try {
                     val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {

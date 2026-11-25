@@ -7,6 +7,7 @@ import '../../bridge/lanvault_bridge.dart';
 import '../../bridge/system_env_helper.dart';
 import '../../theme/neu_theme.dart';
 import '../../theme/neu_toast.dart';
+import '../../theme/motion_slide.dart';
 import '../snapshots/snapshots_screen.dart';
 
 /// 3. 备份页：
@@ -789,9 +790,15 @@ class _BackupScreenState extends State<BackupScreen> {
           ),
         ),
         Expanded(
-          child: _subTab == 1
-              ? SnapshotsScreen(bridge: widget.bridge)
-              : _buildTasksTab(context, isWide),
+          child: SlideSwitchViewport(
+            index: _subTab,
+            axis: Axis.horizontal,
+            keepAlive: false,
+            children: <Widget>[
+              _buildTasksTab(context, isWide),
+              SnapshotsScreen(bridge: widget.bridge),
+            ],
+          ),
         ),
       ],
     );
@@ -905,6 +912,7 @@ class _BackupScreenState extends State<BackupScreen> {
 
   Widget _buildGroupRulesSection(BuildContext context, bool isWide) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     final activeMirrorCount = _mirrorRoots.where((r) => r.isActive).length;
 
     return Semantics(
@@ -972,9 +980,9 @@ class _BackupScreenState extends State<BackupScreen> {
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
               decoration: BoxDecoration(
-                color: NeuTokens.insetSurface,
+                color: neu.insetSurface,
                 borderRadius: const BorderRadius.all(Radius.circular(10)),
-                border: Border.all(color: NeuTokens.hairlineBorder),
+                border: Border.all(color: neu.hairlineBorder),
               ),
               child: Text(
                 '镜像同步范围说明：仅同步常规文件、空目录及平台可表示的修改时间（mtime）；符号链接（symlink）与特殊文件不支持同步。',
@@ -1011,6 +1019,7 @@ class _BackupScreenState extends State<BackupScreen> {
 
   Widget _buildGroupRuleItem(BuildContext context, GroupRuleViewModel view) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     final rule = view.rule;
     final isSyncing = _syncingGroupRuleIds.contains(rule.ruleId);
     final isToggling = _togglingGroupRuleIds.contains(rule.ruleId);
@@ -1040,11 +1049,9 @@ class _BackupScreenState extends State<BackupScreen> {
                   icon: rule.isMirrorSync
                       ? Icons.compare_arrows_rounded
                       : Icons.backup_rounded,
-                  color:
-                      rule.isMirrorSync ? NeuTokens.warning : NeuTokens.accent,
-                  backgroundColor: rule.isMirrorSync
-                      ? NeuTokens.folderGoldSoft
-                      : NeuTokens.accentSoft,
+                  color: rule.isMirrorSync ? neu.warning : neu.accent,
+                  backgroundColor:
+                      rule.isMirrorSync ? neu.folderGoldSoft : neu.accentSoft,
                   size: 40,
                   iconSize: 20,
                 ),
@@ -1169,6 +1176,7 @@ class _BackupScreenState extends State<BackupScreen> {
 
   Widget _buildBackupStatusCard(BuildContext context, SyncProgressEvent? sync) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     final isActive = sync != null &&
         (sync.status.toLowerCase().startsWith('sync') ||
             sync.status.toLowerCase().startsWith('upload') ||
@@ -1198,14 +1206,14 @@ class _BackupScreenState extends State<BackupScreen> {
               Container(
                 width: 40,
                 height: 40,
-                decoration: const BoxDecoration(
-                  color: NeuTokens.accentSoft,
+                decoration: BoxDecoration(
+                  color: neu.accentSoft,
                   borderRadius: BorderRadius.all(Radius.circular(12)),
                 ),
-                child: const Icon(
+                child: Icon(
                   Icons.cloud_upload_rounded,
                   size: 21,
-                  color: NeuTokens.accent,
+                  color: neu.accent,
                 ),
               ),
               const SizedBox(width: 12),
@@ -1230,7 +1238,7 @@ class _BackupScreenState extends State<BackupScreen> {
                 tooltip: _syncPaused ? '恢复自动备份' : '暂停全部备份',
                 icon: Icon(
                   _syncPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
-                  color: _syncPaused ? NeuTokens.warning : NeuTokens.accent,
+                  color: _syncPaused ? neu.warning : neu.accent,
                 ),
                 onPressed: _togglingGlobalPause ? null : _toggleGlobalPause,
               ),
@@ -1243,7 +1251,7 @@ class _BackupScreenState extends State<BackupScreen> {
               Text(
                 processedStr,
                 style: textTheme.labelMedium?.copyWith(
-                  color: NeuTokens.textPrimary,
+                  color: neu.textPrimary,
                   fontFeatures: const <FontFeature>[
                     FontFeature.tabularFigures(),
                   ],
@@ -1277,6 +1285,7 @@ class _BackupScreenState extends State<BackupScreen> {
     required String subtitle,
   }) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     return NeuCard(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       child: Row(
@@ -1284,11 +1293,11 @@ class _BackupScreenState extends State<BackupScreen> {
           Container(
             width: 38,
             height: 38,
-            decoration: const BoxDecoration(
-              color: NeuTokens.accentSoft,
+            decoration: BoxDecoration(
+              color: neu.accentSoft,
               borderRadius: BorderRadius.all(Radius.circular(10)),
             ),
-            child: Icon(icon, size: 19, color: NeuTokens.accent),
+            child: Icon(icon, size: 19, color: neu.accent),
           ),
           const SizedBox(width: 12),
           Expanded(
@@ -1313,6 +1322,7 @@ class _BackupScreenState extends State<BackupScreen> {
 
   Widget _buildTaskListCard(BuildContext context, bool isWide) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
 
     return NeuCard(
       padding: const EdgeInsets.all(20),
@@ -1358,10 +1368,10 @@ class _BackupScreenState extends State<BackupScreen> {
                     padding: const EdgeInsets.symmetric(vertical: 10),
                     child: Row(
                       children: <Widget>[
-                        const NeuIconBadge(
+                        NeuIconBadge(
                           icon: Icons.folder_rounded,
-                          color: NeuTokens.folderGold,
-                          backgroundColor: NeuTokens.folderGoldSoft,
+                          color: neu.folderGold,
+                          backgroundColor: neu.folderGoldSoft,
                           size: 42,
                           iconSize: 22,
                         ),
@@ -1421,9 +1431,9 @@ class _BackupScreenState extends State<BackupScreen> {
                                       strokeWidth: 2,
                                     ),
                                   )
-                                : const Icon(
+                                : Icon(
                                     Icons.play_arrow_rounded,
-                                    color: NeuTokens.accent,
+                                    color: neu.accent,
                                   ),
                             onPressed: isScanning
                                 ? null
@@ -1440,9 +1450,9 @@ class _BackupScreenState extends State<BackupScreen> {
                                     strokeWidth: 2,
                                   ),
                                 )
-                              : const Icon(
+                              : Icon(
                                   Icons.more_horiz_rounded,
-                                  color: NeuTokens.textSecondary,
+                                  color: neu.textSecondary,
                                 ),
                           onSelected: (value) {
                             if (value == 'scan') {
@@ -1457,8 +1467,7 @@ class _BackupScreenState extends State<BackupScreen> {
                               _removeFolder(folder);
                             }
                           },
-                          itemBuilder: (context) =>
-                              const <PopupMenuEntry<String>>[
+                          itemBuilder: (context) => <PopupMenuEntry<String>>[
                             PopupMenuItem<String>(
                               value: 'scan',
                               child: Row(
@@ -1466,7 +1475,7 @@ class _BackupScreenState extends State<BackupScreen> {
                                   Icon(
                                     Icons.sync_rounded,
                                     size: 18,
-                                    color: NeuTokens.accent,
+                                    color: neu.accent,
                                   ),
                                   SizedBox(width: 8),
                                   Text('立即增量扫描'),
@@ -1480,7 +1489,7 @@ class _BackupScreenState extends State<BackupScreen> {
                                   Icon(
                                     Icons.bolt_rounded,
                                     size: 18,
-                                    color: NeuTokens.accent,
+                                    color: neu.accent,
                                   ),
                                   SizedBox(width: 8),
                                   Text('设为：实时 · 增量'),
@@ -1494,7 +1503,7 @@ class _BackupScreenState extends State<BackupScreen> {
                                   Icon(
                                     Icons.today_rounded,
                                     size: 18,
-                                    color: NeuTokens.accent,
+                                    color: neu.accent,
                                   ),
                                   SizedBox(width: 8),
                                   Text('设为：每日 · 增量'),
@@ -1508,7 +1517,7 @@ class _BackupScreenState extends State<BackupScreen> {
                                   Icon(
                                     Icons.touch_app_outlined,
                                     size: 18,
-                                    color: NeuTokens.textSecondary,
+                                    color: neu.textSecondary,
                                   ),
                                   SizedBox(width: 8),
                                   Text('设为：手动'),
@@ -1522,12 +1531,12 @@ class _BackupScreenState extends State<BackupScreen> {
                                   Icon(
                                     Icons.delete_outline_rounded,
                                     size: 18,
-                                    color: NeuTokens.danger,
+                                    color: neu.danger,
                                   ),
                                   SizedBox(width: 8),
                                   Text(
                                     '删除备份任务',
-                                    style: TextStyle(color: NeuTokens.danger),
+                                    style: TextStyle(color: neu.danger),
                                   ),
                                 ],
                               ),
@@ -1548,6 +1557,7 @@ class _BackupScreenState extends State<BackupScreen> {
 
   Widget _buildStorageConfigCard(BuildContext context, bool isWide) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
 
     return AnimatedBuilder(
       animation: _targetControllersListenable,
@@ -1589,14 +1599,14 @@ class _BackupScreenState extends State<BackupScreen> {
                       Container(
                         width: 36,
                         height: 36,
-                        decoration: const BoxDecoration(
-                          color: NeuTokens.insetSurface,
+                        decoration: BoxDecoration(
+                          color: neu.insetSurface,
                           borderRadius: BorderRadius.all(Radius.circular(10)),
                         ),
-                        child: const Icon(
+                        child: Icon(
                           Icons.storage_rounded,
                           size: 18,
-                          color: NeuTokens.textPrimary,
+                          color: neu.textPrimary,
                         ),
                       ),
                       const SizedBox(width: 12),
@@ -1623,9 +1633,9 @@ class _BackupScreenState extends State<BackupScreen> {
                         turns: _storageExpanded ? 0.5 : 0.0,
                         duration: NeuMotion.resolveState(context),
                         curve: NeuMotion.resolveStateCurve(context),
-                        child: const Icon(
+                        child: Icon(
                           Icons.keyboard_arrow_down_rounded,
-                          color: NeuTokens.textSecondary,
+                          color: neu.textSecondary,
                         ),
                       ),
                     ],
@@ -1647,10 +1657,10 @@ class _BackupScreenState extends State<BackupScreen> {
                         vertical: 10,
                       ),
                       decoration: BoxDecoration(
-                        color: NeuTokens.insetSurface,
+                        color: neu.insetSurface,
                         borderRadius:
                             const BorderRadius.all(Radius.circular(10)),
-                        border: Border.all(color: NeuTokens.hairlineBorder),
+                        border: Border.all(color: neu.hairlineBorder),
                       ),
                       child: Text(
                         _primaryRoot.isEmpty
@@ -2224,6 +2234,7 @@ class _MirrorPreviewDialog extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     return NeuDialog(
       title: '执行前变更预览 · $ruleName',
       subtitle: isMirrorMode
@@ -2310,7 +2321,7 @@ class _MirrorPreviewDialog extends StatelessWidget {
                           Text(
                             '冲突与阻塞明细 (${report.conflicts.length})',
                             style: textTheme.labelMedium?.copyWith(
-                              color: NeuTokens.danger,
+                              color: neu.danger,
                             ),
                           ),
                           const SizedBox(height: 4),
@@ -2320,7 +2331,7 @@ class _MirrorPreviewDialog extends StatelessWidget {
                               child: Text(
                                 '• $conflict',
                                 style: textTheme.bodySmall?.copyWith(
-                                  color: NeuTokens.danger,
+                                  color: neu.danger,
                                 ),
                               ),
                             ),
@@ -2495,6 +2506,7 @@ class _TactileCircleFabState extends State<_TactileCircleFab> {
   @override
   Widget build(BuildContext context) {
     final reduced = NeuMotion.isReduced(context);
+    final neu = NeuTheme.of(context);
     final scale = (_pressed && !reduced) ? 0.92 : 1.0;
     return RepaintBoundary(
       child: Semantics(
@@ -2518,15 +2530,14 @@ class _TactileCircleFabState extends State<_TactileCircleFab> {
               width: 54,
               height: 54,
               decoration: BoxDecoration(
-                gradient: NeuTokens.primaryGradient,
+                gradient: neu.primaryGradient,
                 shape: BoxShape.circle,
-                boxShadow: _pressed
-                    ? NeuTokens.pressedShadows
-                    : NeuTokens.primaryButtonShadows,
+                boxShadow:
+                    _pressed ? neu.pressedShadows : neu.primaryButtonShadows,
               ),
-              child: const Icon(
+              child: Icon(
                 Icons.add_rounded,
-                color: Colors.white,
+                color: neu.onAccent,
                 size: 28,
               ),
             ),

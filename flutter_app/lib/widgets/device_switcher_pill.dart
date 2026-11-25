@@ -22,6 +22,7 @@ class DeviceSwitcherPill extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     return ValueListenableBuilder<List<PairedPeerModel>>(
       valueListenable: bridge.pairedPeersNotifier,
       builder: (context, peers, _) {
@@ -52,16 +53,16 @@ class DeviceSwitcherPill extends StatelessWidget {
                       vertical: compact ? 6 : 4,
                     ),
                     decoration: BoxDecoration(
-                      color: NeuTokens.surface,
+                      color: neu.surface,
                       borderRadius: const BorderRadius.all(
                         Radius.circular(NeuRadius.pill),
                       ),
                       border: Border.all(
                         color: online
-                            ? NeuTokens.healthy.withValues(alpha: 0.35)
-                            : NeuTokens.hairlineBorder,
+                            ? neu.healthy.withValues(alpha: 0.35)
+                            : neu.hairlineBorder,
                       ),
-                      boxShadow: NeuTokens.controlShadows,
+                      boxShadow: neu.controlShadows,
                     ),
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -72,10 +73,10 @@ class DeviceSwitcherPill extends StatelessWidget {
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
                             color: !hasDevice
-                                ? NeuTokens.textSecondary.withValues(alpha: 0.45)
+                                ? neu.textSecondary.withValues(alpha: 0.45)
                                 : (online
-                                    ? NeuTokens.healthy
-                                    : NeuTokens.warning),
+                                    ? neu.healthy
+                                    : neu.warning),
                           ),
                         ),
                         const SizedBox(width: 7),
@@ -86,17 +87,17 @@ class DeviceSwitcherPill extends StatelessWidget {
                             overflow: TextOverflow.ellipsis,
                             style:
                                 Theme.of(context).textTheme.labelMedium?.copyWith(
-                                      color: NeuTokens.textPrimary,
+                                      color: neu.textPrimary,
                                       fontWeight: FontWeight.w600,
                                       fontSize: compact ? 12.5 : 12,
                                     ),
                           ),
                         ),
                         const SizedBox(width: 3),
-                        const Icon(
+                        Icon(
                           Icons.keyboard_arrow_down_rounded,
                           size: 16,
-                          color: NeuTokens.textSecondary,
+                          color: neu.textSecondary,
                         ),
                       ],
                     ),
@@ -115,6 +116,7 @@ class DeviceSwitcherPill extends StatelessWidget {
     List<PairedPeerModel> peers,
     PairedPeerModel? active,
   ) async {
+    final neu = NeuTheme.of(context);
     final isWide =
         MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
     if (isWide) {
@@ -155,7 +157,7 @@ class DeviceSwitcherPill extends StatelessWidget {
 
     await showModalBottomSheet<void>(
       context: context,
-      backgroundColor: NeuTokens.surface,
+      backgroundColor: neu.surface,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(22)),
       ),
@@ -173,7 +175,7 @@ class DeviceSwitcherPill extends StatelessWidget {
                     width: 36,
                     height: 4,
                     decoration: BoxDecoration(
-                      color: NeuTokens.controlOutline,
+                      color: neu.controlOutline,
                       borderRadius: const BorderRadius.all(
                         Radius.circular(NeuRadius.pill),
                       ),
@@ -234,6 +236,7 @@ class _DeviceListContent extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -269,13 +272,13 @@ class _DeviceListContent extends StatelessWidget {
                     ),
                     decoration: BoxDecoration(
                       color: isSelected
-                          ? NeuTokens.accentSoft
-                          : NeuTokens.insetSurface,
+                          ? neu.accentSoft
+                          : neu.insetSurface,
                       borderRadius: const BorderRadius.all(Radius.circular(14)),
                       border: Border.all(
                         color: isSelected
-                            ? NeuTokens.accent.withValues(alpha: 0.4)
-                            : NeuTokens.hairlineBorder,
+                            ? neu.accent.withValues(alpha: 0.4)
+                            : neu.hairlineBorder,
                       ),
                     ),
                     child: Row(
@@ -283,9 +286,9 @@ class _DeviceListContent extends StatelessWidget {
                         NeuIconBadge(
                           icon: _iconForOs(peer.osType),
                           color: isSelected
-                              ? NeuTokens.accent
-                              : NeuTokens.slateMuted,
-                          backgroundColor: NeuTokens.surface,
+                              ? neu.accent
+                              : neu.slateMuted,
+                          backgroundColor: neu.surface,
                           size: 36,
                           iconSize: 18,
                         ),
@@ -323,10 +326,10 @@ class _DeviceListContent extends StatelessWidget {
                         ),
                         if (isSelected) ...<Widget>[
                           const SizedBox(width: 8),
-                          const Icon(
+                          Icon(
                             Icons.check_rounded,
                             size: 18,
-                            color: NeuTokens.accent,
+                            color: neu.accent,
                           ),
                         ],
                       ],

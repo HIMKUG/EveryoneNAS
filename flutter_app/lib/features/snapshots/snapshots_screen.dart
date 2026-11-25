@@ -507,6 +507,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
 
   Widget _buildCatalogArchiveView(BuildContext context, bool isWide) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
 
     if (_bindingOptions.isEmpty) {
       return const NeuEmptyState(
@@ -598,9 +599,9 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
             decoration: BoxDecoration(
-              color: NeuTokens.insetSurface,
+              color: neu.insetSurface,
               borderRadius: const BorderRadius.all(Radius.circular(10)),
-              border: Border.all(color: NeuTokens.hairlineBorder),
+              border: Border.all(color: neu.hairlineBorder),
             ),
             child: Text(
               '安全恢复提示：镜像与归档历史版本默认恢复到您指定的安全目录，避免写回源目录或在下次镜像同步时被覆盖。',
@@ -640,15 +641,15 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                               ? Icons.folder_rounded
                               : Icons.insert_drive_file_rounded,
                           color: entry.sourceDeleted
-                              ? NeuTokens.warning
+                              ? neu.warning
                               : (entry.isDir
-                                  ? NeuTokens.folderGold
-                                  : NeuTokens.accent),
+                                  ? neu.folderGold
+                                  : neu.accent),
                           backgroundColor: entry.sourceDeleted
-                              ? NeuTokens.folderGoldSoft
+                              ? neu.folderGoldSoft
                               : (entry.isDir
-                                  ? NeuTokens.folderGoldSoft
-                                  : NeuTokens.accentSoft),
+                                  ? neu.folderGoldSoft
+                                  : neu.accentSoft),
                           radius: 10,
                         ),
                         const SizedBox(width: 12),
@@ -719,6 +720,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
 
   Widget _buildTimelineView(BuildContext context, bool isWide) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
 
     if (_loading && _snapshots.isEmpty) {
       return NeuCard(
@@ -826,7 +828,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                         ),
                         decoration: BoxDecoration(
                           color: isSelected
-                              ? NeuTokens.accentSoft
+                              ? neu.accentSoft
                               : Colors.transparent,
                           borderRadius:
                               const BorderRadius.all(Radius.circular(12)),
@@ -836,10 +838,10 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                           children: <Widget>[
                             Row(
                               children: <Widget>[
-                                const NeuIconBadge(
+                                NeuIconBadge(
                                   icon: Icons.folder_rounded,
-                                  color: NeuTokens.folderGold,
-                                  backgroundColor: NeuTokens.folderGoldSoft,
+                                  color: neu.folderGold,
+                                  backgroundColor: neu.folderGoldSoft,
                                   radius: 10,
                                 ),
                                 const SizedBox(width: 12),
@@ -897,12 +899,13 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
     SnapshotSummaryModel selectedSnap,
   ) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: <Widget>[
         Text(
           selectedSnap.createdAt,
-          style: textTheme.titleSmall?.copyWith(color: NeuTokens.accent),
+          style: textTheme.titleSmall?.copyWith(color: neu.accent),
         ),
         const SizedBox(height: 4),
         Text(
@@ -940,27 +943,27 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                               height: isSelected ? 34 : 16,
                               decoration: BoxDecoration(
                                 color: isSelected
-                                    ? NeuTokens.accent
-                                    : NeuTokens.timelineInactive,
+                                    ? neu.accent
+                                    : neu.timelineInactive,
                                 shape: BoxShape.circle,
                                 border: isSelected
                                     ? Border.all(
-                                        color: NeuTokens.timelineHalo,
+                                        color: neu.timelineHalo,
                                         width: 5,
                                       )
                                     : null,
                                 boxShadow: isSelected
-                                    ? NeuTokens.primaryButtonShadows
+                                    ? neu.primaryButtonShadows
                                     : null,
                               ),
                               child: isSelected
-                                  ? const Center(
+                                  ? Center(
                                       child: SizedBox(
                                         width: 8,
                                         height: 8,
                                         child: DecoratedBox(
                                           decoration: BoxDecoration(
-                                            color: Colors.white,
+                                            color: neu.onAccent,
                                             shape: BoxShape.circle,
                                           ),
                                         ),
@@ -979,8 +982,8 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                                 style: textTheme.labelMedium?.copyWith(
                                   fontSize: 11,
                                   color: isSelected
-                                      ? NeuTokens.accent
-                                      : NeuTokens.textSecondary,
+                                      ? neu.accent
+                                      : neu.textSecondary,
                                 ),
                               ),
                             ),
@@ -995,7 +998,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                     width: 44,
                     height: 2,
                     margin: const EdgeInsets.only(bottom: 22),
-                    color: NeuTokens.timelineLine,
+                    color: neu.timelineLine,
                   ),
               ],
             ],
@@ -1010,6 +1013,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
     SnapshotSummaryModel selectedSnap,
   ) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: <Widget>[
@@ -1041,12 +1045,12 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                             ),
                             decoration: BoxDecoration(
                               color: isSelected
-                                  ? NeuTokens.accent
-                                  : NeuTokens.timelineInactive,
+                                  ? neu.accent
+                                  : neu.timelineInactive,
                               shape: BoxShape.circle,
                               border: isSelected
                                   ? Border.all(
-                                      color: NeuTokens.timelineHalo,
+                                      color: neu.timelineHalo,
                                       width: 4,
                                     )
                                   : null,
@@ -1056,7 +1060,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                             Container(
                               width: 2,
                               height: 36,
-                              color: NeuTokens.timelineLine,
+                              color: neu.timelineLine,
                             ),
                         ],
                       ),
@@ -1071,8 +1075,8 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                                 snap.createdAt,
                                 style: textTheme.titleSmall?.copyWith(
                                   color: isSelected
-                                      ? NeuTokens.accent
-                                      : NeuTokens.textPrimary,
+                                      ? neu.accent
+                                      : neu.textPrimary,
                                 ),
                               ),
                               const SizedBox(height: 2),
@@ -1105,6 +1109,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
 
   Widget _buildScrubView(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     final scrub = _lastScrubResult;
 
     return NeuCard(
@@ -1117,14 +1122,14 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
               Container(
                 width: 44,
                 height: 44,
-                decoration: const BoxDecoration(
-                  color: NeuTokens.healthySoft,
+                decoration: BoxDecoration(
+                  color: neu.healthySoft,
                   borderRadius: BorderRadius.all(Radius.circular(12)),
                 ),
-                child: const Icon(
+                child: Icon(
                   Icons.health_and_safety_rounded,
                   size: 24,
-                  color: NeuTokens.healthy,
+                  color: neu.healthy,
                 ),
               ),
               const SizedBox(width: 14),
@@ -1157,7 +1162,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
               width: double.infinity,
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                color: NeuTokens.insetSurface,
+                color: neu.insetSurface,
                 borderRadius: const BorderRadius.all(Radius.circular(12)),
               ),
               child: Text(
@@ -1175,7 +1180,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                       child: _ScrubMetricTile(
                         label: '已校验块数',
                         value: '${scrub.checkedChunks}',
-                        color: NeuTokens.accent,
+                        color: neu.accent,
                       ),
                     ),
                     const SizedBox(width: 10),
@@ -1184,8 +1189,8 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                         label: '损坏块数',
                         value: '${scrub.corruptedChunks}',
                         color: scrub.corruptedChunks > 0
-                            ? NeuTokens.danger
-                            : NeuTokens.healthy,
+                            ? neu.danger
+                            : neu.healthy,
                       ),
                     ),
                     const SizedBox(width: 10),
@@ -1193,7 +1198,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                       child: _ScrubMetricTile(
                         label: '已自愈块数',
                         value: '${scrub.healedChunks}',
-                        color: NeuTokens.healthy,
+                        color: neu.healthy,
                       ),
                     ),
                   ],
@@ -1212,6 +1217,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
 
   Widget _buildRestoreHistoryView(BuildContext context) {
     final textTheme = Theme.of(context).textTheme;
+    final neu = NeuTheme.of(context);
     if (_restoreHistory.isEmpty) {
       return NeuCard(
         padding: const EdgeInsets.all(28),
@@ -1239,9 +1245,9 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                   padding: const EdgeInsets.symmetric(vertical: 8),
                   child: Row(
                     children: <Widget>[
-                      const Icon(
+                      Icon(
                         Icons.restore_rounded,
-                        color: NeuTokens.accent,
+                        color: neu.accent,
                       ),
                       const SizedBox(width: 12),
                       Expanded(
@@ -1508,10 +1514,11 @@ class _ScrubMetricTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: NeuTokens.insetSurface,
+        color: neu.insetSurface,
         borderRadius: const BorderRadius.all(Radius.circular(12)),
       ),
       child: Column(

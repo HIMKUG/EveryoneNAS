@@ -5,7 +5,9 @@ import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../bridge/window_chrome.dart';
+import '../theme/appearance_controller.dart';
 import '../theme/neu_theme.dart';
+import '../theme/theme_reveal.dart';
 
 /// Windows 桌面端的自绘标题栏。
 ///
@@ -85,6 +87,8 @@ class _WindowsTitleBarState extends State<WindowsTitleBar> {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
+    final appearance = AppearanceScope.of(context);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) _syncCaptionMetrics();
     });
@@ -95,10 +99,10 @@ class _WindowsTitleBarState extends State<WindowsTitleBar> {
         width: MediaQuery.sizeOf(context).width,
         height: WindowsTitleBar.height,
         padding: const EdgeInsets.only(left: 14, right: 8),
-        decoration: const BoxDecoration(
-          color: Color(0xFFFAFBFD),
+        decoration: BoxDecoration(
+          color: neu.chromeSurface,
           border: Border(
-            bottom: BorderSide(color: NeuTokens.hairlineBorder, width: 1),
+            bottom: BorderSide(color: neu.hairlineBorder, width: 1),
           ),
         ),
         child: Stack(
@@ -119,6 +123,34 @@ class _WindowsTitleBarState extends State<WindowsTitleBar> {
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
                     children: <Widget>[
+                      KeyedSubtree(
+                        key: const ValueKey<String>('CaptionThemeToggle'),
+                        child: Builder(
+                          builder: (buttonContext) => _CaptionButton(
+                            icon: neu.isDark
+                                ? Icons.light_mode_outlined
+                                : Icons.dark_mode_outlined,
+                            label: neu.isDark
+                                ? '切换到日间模式'
+                                : '切换到夜间模式',
+                            onPressed: () {
+                              final nextMode = neu.isDark
+                                  ? ThemeModePreference.light
+                                  : ThemeModePreference.dark;
+                              ThemeRevealHost.of(buttonContext).reveal(
+                                buttonContext,
+                                () => appearance.setThemeMode(nextMode),
+                              );
+                            },
+                          ),
+                        ),
+                      ),
+                      Container(
+                        width: 1,
+                        height: 20,
+                        margin: const EdgeInsets.symmetric(horizontal: 4),
+                        color: neu.hairlineBorder,
+                      ),
                       _CaptionButton(
                         icon: Icons.remove_rounded,
                         label: '最小化',
@@ -178,6 +210,7 @@ class _CaptionButton extends StatefulWidget {
 class _CaptionButtonState extends State<_CaptionButton> {
   static const double _buttonWidth = 42;
   static const double _buttonHeight = 32;
+  static const Offset _destructivePressedOffset = Offset(0, 1);
 
   final FocusNode _focusNode = FocusNode(debugLabel: 'CaptionButton');
   bool _hovered = false;
@@ -215,25 +248,33 @@ class _CaptionButtonState extends State<_CaptionButton> {
     return KeyEventResult.ignored;
   }
 
-  Color get _background {
+  Color _background(NeuTheme neu) {
     if (widget.destructive) {
-      if (_pressed) return const Color(0xFFC42B1C);
-      if (_hovered) return NeuTokens.danger;
+      if (_pressed) {
+        return neu.isDark ? const Color(0xFFA82317) : const Color(0xFFC42B1C);
+      }
+      if (_hovered) return neu.danger;
       return Colors.transparent;
     }
-    if (_pressed) return const Color(0xFFDCE6F5);
-    if (_hovered) return NeuTokens.insetSurface;
+    if (_pressed) return neu.surfacePressed;
+    if (_hovered) return neu.insetSurface;
     return Colors.transparent;
   }
 
-  Color get _foreground {
-    if (widget.destructive && (_hovered || _pressed)) return Colors.white;
-    return NeuTokens.textSecondary;
+  Color _foreground(NeuTheme neu) {
+    if (widget.destructive && (_hovered || _pressed)) return neu.onAccent;
+    return neu.textSecondary;
   }
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     final Duration duration = NeuMotion.resolveState(context);
+    final bool reduceMotion = NeuMotion.isReduced(context);
+    final Offset pressedOffset =
+        widget.destructive && _hovered && !_pressed && !reduceMotion
+            ? _destructivePressedOffset
+            : Offset.zero;
 
     return Semantics(
       button: true,
@@ -260,13 +301,18 @@ class _CaptionButtonState extends State<_CaptionButton> {
               child: AnimatedContainer(
                 duration: duration,
                 curve: NeuMotion.resolveStateCurve(context),
+                transform: Matrix4.translationValues(
+                  pressedOffset.dx,
+                  pressedOffset.dy,
+                  0,
+                ),
                 width: _buttonWidth,
                 height: _buttonHeight,
                 decoration: BoxDecoration(
-                  color: _background,
+                  color: _background(neu),
                   borderRadius: const BorderRadius.all(Radius.circular(8)),
                   border: Border.all(
-                    color: _focused ? NeuTokens.accent : Colors.transparent,
+                    color: _focused ? neu.accent : Colors.transparent,
                     width: 1.5,
                   ),
                 ),
@@ -274,7 +320,7 @@ class _CaptionButtonState extends State<_CaptionButton> {
                   child: Icon(
                     widget.icon,
                     size: widget.iconSize,
-                    color: _foreground,
+                    color: _foreground(neu),
                   ),
                 ),
               ),

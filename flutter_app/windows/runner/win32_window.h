@@ -65,6 +65,9 @@ class Win32Window {
   // Return a RECT representing the bounds of the current client area.
   RECT GetClientArea();
 
+  // Applies the Flutter-selected appearance to the native window decorations.
+  void ApplyDarkMode(bool dark);
+
   // Configures the app-drawn (borderless) window chrome. The whole window is
   // client area; the top |caption_height_logical| DIPs behave like a native
   // title bar (drag, double-click maximize, Aero snap, system menu), while

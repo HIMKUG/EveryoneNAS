@@ -8,10 +8,14 @@ import '../../bridge/lanvault_bridge.dart';
 import '../../bridge/system_env_helper.dart';
 import '../../theme/neu_theme.dart';
 import '../../theme/neu_toast.dart';
+import '../../theme/appearance_controller.dart';
+import '../../theme/skins.dart';
+import '../../theme/theme_reveal.dart';
 import '../../widgets/nav_rail_item.dart';
 
 enum _SettingsSection {
   general,
+  appearance,
   backup,
   webSecurity,
   serviceDiag,
@@ -34,6 +38,230 @@ class SettingsScreen extends StatefulWidget {
 
 class _SettingsScreenState extends State<SettingsScreen>
     with WidgetsBindingObserver {
+  TextEditingController? _ownedSearchController;
+
+  TextEditingController get _searchController =>
+      _ownedSearchController ??= TextEditingController();
+
+  @override
+  void dispose() {
+    _ownedSearchController?.dispose();
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  Future<void> _applyAppearance(
+    BuildContext triggerContext,
+    VoidCallback change,
+  ) async {
+    await ThemeRevealHost.of(triggerContext).reveal(triggerContext, change);
+  }
+
+  void _showSkinMarket() {
+    showNeuDialog<void>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          final appearance = AppearanceScope.of(context);
+          final query = _searchController.text.trim().toLowerCase();
+          final groups = query.isEmpty
+              ? skinGroups
+              : skinGroups
+                  .map((group) => SkinGroup(
+                        id: group.id,
+                        label: group.label,
+                        skins: group.skins.where((skin) {
+                          return skin.name.toLowerCase().contains(query) ||
+                              group.label.toLowerCase().contains(query);
+                        }).toList(growable: false),
+                      ))
+                  .where((group) => group.skins.isNotEmpty)
+                  .toList(growable: false);
+          return NeuDialog(
+            title: '皮肤市场',
+            subtitle: '搜索名称或分类，点击色板即时预览并应用',
+            maxWidth: 680,
+            actions: <Widget>[
+              NeuButton(
+                label: '恢复柔冰蓝',
+                onPressed: () {
+                  _applyAppearance(
+                      context, () => appearance.setSkin(defaultSkin));
+                  Navigator.of(dialogContext).pop();
+                },
+              ),
+              NeuButton(
+                label: '完成',
+                tone: NeuButtonTone.primary,
+                onPressed: () => Navigator.of(dialogContext).pop(),
+              ),
+            ],
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: <Widget>[
+                NeuInsetField(
+                  controller: _searchController,
+                  hint: '搜索皮肤，例如：赤陶、蓝色、舒适',
+                  prefixIcon: Icons.search_rounded,
+                  onSubmitted: (_) => setDialogState(() {}),
+                ),
+                const SizedBox(height: 12),
+                Flexible(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxHeight: 420),
+                    child: SingleChildScrollView(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: <Widget>[
+                          for (final group in groups) ...<Widget>[
+                            Padding(
+                              padding: const EdgeInsets.fromLTRB(2, 10, 2, 7),
+                              child: Text(
+                                group.label,
+                                style: Theme.of(context)
+                                    .textTheme
+                                    .labelMedium
+                                    ?.copyWith(
+                                        color: NeuTheme.of(context).accent),
+                              ),
+                            ),
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              children: <Widget>[
+                                for (final skin in group.skins)
+                                  _SkinMarketCard(
+                                    skin: skin,
+                                    selected: appearance.skinId == skin.id,
+                                    onTap: () => _applyAppearance(
+                                      context,
+                                      () => appearance.setSkin(skin),
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ],
+                          if (groups.isEmpty)
+                            Padding(
+                              padding: const EdgeInsets.all(24),
+                              child: Text(
+                                '没有匹配的皮肤，请换一个关键词。',
+                                textAlign: TextAlign.center,
+                                style: Theme.of(context).textTheme.bodyMedium,
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildAppearanceGroup(BuildContext context) {
+    final appearance =
+        AppearanceScope.maybeOf(context) ?? AppearanceController.memory();
+    final neu = NeuTheme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 8),
+          child: Text('日夜模式', style: Theme.of(context).textTheme.titleSmall),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: NeuSegmentedControl<ThemeModePreference>(
+            semanticLabel: '日夜模式',
+            value: appearance.themeMode,
+            segments: const <NeuSegment<ThemeModePreference>>[
+              NeuSegment(value: ThemeModePreference.system, label: '跟随系统'),
+              NeuSegment(value: ThemeModePreference.light, label: '日间'),
+              NeuSegment(value: ThemeModePreference.dark, label: '夜间'),
+            ],
+            onChanged: (mode) => _applyAppearance(
+              context,
+              () => appearance.setThemeMode(mode),
+            ),
+          ),
+        ),
+        const SizedBox(height: 14),
+        _SettingsValueRow(
+          title: '当前皮肤',
+          subtitle: '${appearance.activeSkin.name} · 双日夜调板',
+          value: appearance.activeSkin.family == SkinFamily.duo ? '双色' : '单色',
+          icon: Icons.palette_outlined,
+          onTap: _showSkinMarket,
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+          child: Row(
+            children: <Widget>[
+              for (final color in appearance.activeSkin.swatches) ...<Widget>[
+                Container(
+                  width: 18,
+                  height: 18,
+                  decoration: BoxDecoration(
+                    color: color,
+                    shape: BoxShape.circle,
+                    border: Border.all(color: neu.hairlineBorder),
+                  ),
+                ),
+                const SizedBox(width: 6),
+              ],
+              const Spacer(),
+              NeuButton(
+                label: '更换皮肤',
+                icon: Icons.storefront_outlined,
+                onPressed: _showSkinMarket,
+              ),
+            ],
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          child: Text(
+            '滑动与交互动画速度',
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+          child: NeuSegmentedControl<MotionSpeed>(
+            semanticLabel: '动画速度',
+            value: appearance.motionSpeed,
+            segments: <NeuSegment<MotionSpeed>>[
+              for (final speed in MotionSpeed.values)
+                NeuSegment(value: speed, label: speed.label),
+            ],
+            onChanged: appearance.setMotionSpeed,
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 14),
+          child: Row(
+            children: <Widget>[
+              Icon(Icons.devices_rounded, size: 18, color: neu.textSecondary),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Windows 标题栏与 Android 系统栏会自动同步当前日夜模式；系统开启减弱动画时自动降级。',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
   _SettingsSection _desktopSection = _SettingsSection.general;
 
   RoleMode _roleMode = RoleMode.dual;
@@ -43,8 +271,6 @@ class _SettingsScreenState extends State<SettingsScreen>
   bool _scrubbing = false;
   bool _debugMode = false;
   bool _webPasswordEnabled = false;
-  List<String> _loadFailures = const <String>[];
-  Map<String, bool> _androidPermStates = const <String, bool>{};
 
   PowerNetworkPolicyModel _policy = const PowerNetworkPolicyModel(
     wifiOnly: true,
@@ -66,12 +292,6 @@ class _SettingsScreenState extends State<SettingsScreen>
   }
 
   @override
-  void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    super.dispose();
-  }
-
-  @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && Platform.isAndroid) {
       unawaited(_refreshAndroidPermissions());
@@ -81,11 +301,13 @@ class _SettingsScreenState extends State<SettingsScreen>
   Future<void> _refreshAndroidPermissions() async {
     if (!Platform.isAndroid) return;
     try {
-      final states = await widget.bridge.getAndroidPermissionStates();
+      await widget.bridge.getAndroidPermissionStates();
       if (!mounted) return;
-      setState(() => _androidPermStates = states);
+      setState(() {});
     } catch (_) {}
   }
+
+  List<String> _loadFailures = const <String>[];
 
   Future<void> _loadAll() async {
     final failures = <String>[];
@@ -175,6 +397,7 @@ class _SettingsScreenState extends State<SettingsScreen>
   }
 
   Future<void> _pickRoleMode() async {
+    final neu = NeuTheme.of(context);
     final chosen = await showNeuDialog<RoleMode>(
       context: context,
       builder: (ctx) => NeuDialog(
@@ -188,7 +411,7 @@ class _SettingsScreenState extends State<SettingsScreen>
               ListTile(
                 title: Text(mode.label),
                 trailing: mode == _roleMode
-                    ? const Icon(Icons.check_rounded, color: NeuTokens.accent)
+                    ? Icon(Icons.check_rounded, color: neu.accent)
                     : null,
                 onTap: () => Navigator.of(ctx).pop(mode),
               ),
@@ -312,14 +535,13 @@ class _SettingsScreenState extends State<SettingsScreen>
                 const SizedBox(width: 8),
                 NeuButton(
                   label: '浏览',
-                    onPressed: () async {
-                      final p = await widget.bridge.pickDirectory(
-                        description: '选择主存储目录',
-                      );
-                      if (ctx.mounted && p != null && p.isNotEmpty) {
-                        primaryCtrl.text = p;
-                      }
-                    },
+                  onPressed: () async {
+                    final p = await widget.bridge.pickDirectory(
+                      description: '选择主存储目录',
+                    );
+                    if (ctx.mounted && p != null && p.isNotEmpty)
+                      primaryCtrl.text = p;
+                  },
                 ),
               ],
             ),
@@ -338,14 +560,13 @@ class _SettingsScreenState extends State<SettingsScreen>
                 const SizedBox(width: 8),
                 NeuButton(
                   label: '浏览',
-                    onPressed: () async {
-                      final p = await widget.bridge.pickDirectory(
-                        description: '选择备用存储目录',
-                      );
-                      if (ctx.mounted && p != null && p.isNotEmpty) {
-                        fallbackCtrl.text = p;
-                      }
-                    },
+                  onPressed: () async {
+                    final p = await widget.bridge.pickDirectory(
+                      description: '选择备用存储目录',
+                    );
+                    if (ctx.mounted && p != null && p.isNotEmpty)
+                      fallbackCtrl.text = p;
+                  },
                 ),
               ],
             ),
@@ -704,9 +925,8 @@ class _SettingsScreenState extends State<SettingsScreen>
               tone: NeuButtonTone.danger,
               onPressed: () async {
                 await widget.bridge.clearDebugLogs();
-                if (ctx.mounted) {
+                if (ctx.mounted)
                   setDialogState(() => logs = const <DebugLogEntryModel>[]);
-                }
                 if (mounted) NeuToast.info(this.context, '调试日志已清空');
               },
             ),
@@ -742,6 +962,7 @@ class _SettingsScreenState extends State<SettingsScreen>
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     final isWide = MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
 
     if (!isWide) {
@@ -754,6 +975,9 @@ class _SettingsScreenState extends State<SettingsScreen>
             if (_loadFailures.isNotEmpty) _buildLoadFailureBanner(),
             _buildSectionHeader(context, '常规与节点'),
             _buildGeneralGroup(context),
+            _buildSectionHeader(context, '外观与动效'),
+            _SettingsGroupCard(
+                children: <Widget>[_buildAppearanceGroup(context)]),
             _buildSectionHeader(context, '备份与容灾'),
             _buildBackupGroup(context),
             _buildSectionHeader(context, 'Web 访问与安全'),
@@ -793,22 +1017,21 @@ class _SettingsScreenState extends State<SettingsScreen>
                 Container(
                   padding: const EdgeInsets.all(8),
                   decoration: BoxDecoration(
-                    color: NeuTokens.surface,
+                    color: neu.surface,
                     borderRadius: const BorderRadius.all(Radius.circular(16)),
-                    border: Border.all(color: NeuTokens.hairlineBorder),
-                    boxShadow: const <BoxShadow>[
-                      BoxShadow(
-                        color: Color(0x0A0F172A),
-                        offset: Offset(0, 4),
-                        blurRadius: 14,
-                      ),
-                    ],
+                    border: Border.all(color: neu.hairlineBorder),
+                    boxShadow: neu.extrudedShadows,
                   ),
                   child: Column(
                     children: <Widget>[
                       for (final entry
                           in const <(_SettingsSection, String, IconData)>[
                         (_SettingsSection.general, '常规与节点', Icons.tune_rounded),
+                        (
+                          _SettingsSection.appearance,
+                          '外观与动效',
+                          Icons.palette_outlined
+                        ),
                         (
                           _SettingsSection.backup,
                           '备份与容灾',
@@ -871,48 +1094,34 @@ class _SettingsScreenState extends State<SettingsScreen>
   }
 
   Widget _buildDesktopSectionBody(BuildContext context) {
-    switch (_desktopSection) {
-      case _SettingsSection.general:
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: <Widget>[
+        switch (_desktopSection) {
+          _SettingsSection.general =>
             _buildSectionHeader(context, '常规与节点', topPadding: 0),
-            _buildGeneralGroup(context),
-          ],
-        );
-      case _SettingsSection.backup:
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
+          _SettingsSection.appearance =>
+            _buildSectionHeader(context, '外观与动效', topPadding: 0),
+          _SettingsSection.backup =>
             _buildSectionHeader(context, '备份与容灾', topPadding: 0),
-            _buildBackupGroup(context),
-          ],
-        );
-      case _SettingsSection.webSecurity:
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
+          _SettingsSection.webSecurity =>
             _buildSectionHeader(context, 'Web 访问与安全', topPadding: 0),
-            _buildWebSecurityGroup(context),
-          ],
-        );
-      case _SettingsSection.serviceDiag:
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
+          _SettingsSection.serviceDiag =>
             _buildSectionHeader(context, '服务与诊断', topPadding: 0),
-            _buildServiceDiagGroup(context),
-          ],
-        );
-      case _SettingsSection.about:
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: <Widget>[
+          _SettingsSection.about =>
             _buildSectionHeader(context, '关于', topPadding: 0),
-            _buildAboutGroup(context),
-          ],
-        );
-    }
+        },
+        switch (_desktopSection) {
+          _SettingsSection.general => _buildGeneralGroup(context),
+          _SettingsSection.appearance => _SettingsGroupCard(
+              children: <Widget>[_buildAppearanceGroup(context)]),
+          _SettingsSection.backup => _buildBackupGroup(context),
+          _SettingsSection.webSecurity => _buildWebSecurityGroup(context),
+          _SettingsSection.serviceDiag => _buildServiceDiagGroup(context),
+          _SettingsSection.about => _buildAboutGroup(context),
+        },
+      ],
+    );
   }
 
   Widget _buildSectionHeader(
@@ -920,12 +1129,13 @@ class _SettingsScreenState extends State<SettingsScreen>
     String title, {
     double topPadding = 18,
   }) {
+    final neu = NeuTheme.of(context);
     return Padding(
       padding: EdgeInsets.fromLTRB(6, topPadding, 6, 8),
       child: Text(
         title,
         style: Theme.of(context).textTheme.labelLarge?.copyWith(
-              color: NeuTokens.accent,
+              color: neu.accent,
               fontWeight: FontWeight.w700,
               fontSize: 13,
             ),
@@ -938,13 +1148,13 @@ class _SettingsScreenState extends State<SettingsScreen>
       padding: const EdgeInsets.only(bottom: 12),
       child: NeuCard(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        backgroundColor: NeuTokens.folderGoldSoft,
+        backgroundColor: NeuTheme.of(context).folderGoldSoft,
         child: Row(
           children: <Widget>[
-            const Icon(
+            Icon(
               Icons.warning_amber_rounded,
               size: 18,
-              color: NeuTokens.warning,
+              color: NeuTheme.of(context).warning,
             ),
             const SizedBox(width: 10),
             Expanded(
@@ -986,7 +1196,7 @@ class _SettingsScreenState extends State<SettingsScreen>
             } catch (err) {
               if (!mounted) return;
               setState(() => _autoReconnect = prev);
-              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(context, LanVaultBridge.formatUserError(err));
             }
           },
         ),
@@ -1002,7 +1212,7 @@ class _SettingsScreenState extends State<SettingsScreen>
             } catch (err) {
               if (!mounted) return;
               setState(() => _autostartServer = prev);
-              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(context, LanVaultBridge.formatUserError(err));
             }
           },
         ),
@@ -1109,7 +1319,7 @@ class _SettingsScreenState extends State<SettingsScreen>
             } catch (err) {
               if (!mounted) return;
               setState(() => _bitRotAutoScrub = prev);
-              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(context, LanVaultBridge.formatUserError(err));
             }
           },
         ),
@@ -1124,124 +1334,64 @@ class _SettingsScreenState extends State<SettingsScreen>
     );
   }
 
-  Future<void> _showPermissionSettingsPrompt(String permissionName) async {
-    if (!mounted) return;
-    final openSettings = await showNeuDialog<bool>(
-      context: context,
-      builder: (ctx) => NeuDialog(
-        title: '$permissionName已被拒绝',
-        subtitle: '请在系统应用设置中手动开启权限，开启后返回应用将自动刷新状态。',
-        maxWidth: 380,
-        actions: <Widget>[
-          NeuButton(
-            label: '取消',
-            onPressed: () => Navigator.of(ctx).pop(false),
-          ),
-          NeuButton(
-            label: '打开系统设置',
-            tone: NeuButtonTone.primary,
-            onPressed: () => Navigator.of(ctx).pop(true),
-          ),
-        ],
-        child: const SizedBox.shrink(),
-      ),
-    );
-    if (openSettings == true) {
-      await widget.bridge.openAppSettings();
-    }
-  }
-
-  String _permissionLabel(String key, {String? deniedForeverKey}) {
-    final granted = _androidPermStates[key];
-    if (granted == true) return '已授权';
-    if (deniedForeverKey != null && _androidPermStates[deniedForeverKey] == true) {
-      return '去系统设置';
-    }
-    if (granted == false) return '未授权';
-    return '去授权';
-  }
-
   Widget _buildAndroidPermissionsGroup(BuildContext context) {
     return _SettingsGroupCard(
       children: <Widget>[
         _SettingsValueRow(
           title: '所有文件访问权限',
           subtitle: '用于读写自定义目录与存储池文件',
-          value: _permissionLabel('storage'),
+          value: '去授权',
           icon: Icons.chevron_right_rounded,
           onTap: () async {
             final ok = await widget.bridge.requestStoragePermission();
-            await _refreshAndroidPermissions();
             if (!mounted) return;
             NeuToast.info(
               this.context,
-              ok ? '已获得所有文件访问权限' : '尚未授予所有文件访问权限，请在系统设置中开启',
+              ok ? '已获得所有文件访问权限' : '请在系统设置中授予所有文件访问权限',
             );
           },
         ),
         _SettingsValueRow(
           title: '通知权限',
           subtitle: '保持后台服务常驻与传输进度提醒',
-          value: _permissionLabel(
-            'notification',
-            deniedForeverKey: 'notificationDeniedForever',
-          ),
+          value: '去授权',
           icon: Icons.chevron_right_rounded,
           onTap: () async {
             final ok = await widget.bridge.requestNotificationPermission();
-            await _refreshAndroidPermissions();
             if (!mounted) return;
-            if (ok) {
-              NeuToast.success(this.context, '已获得通知权限');
-            } else if (_androidPermStates['notificationDeniedForever'] == true) {
-              await _showPermissionSettingsPrompt('通知权限');
-            } else {
-              NeuToast.info(this.context, '未获得通知权限，后台保活通知可能不可见');
-            }
+            NeuToast.info(
+              this.context,
+              ok ? '已获得通知权限' : '请在系统设置中允许通知权限',
+            );
           },
         ),
         _SettingsValueRow(
           title: '电池优化白名单',
           subtitle: '防止锁屏后系统休眠中断局域网同步',
-          value: _androidPermStates['battery'] == true ? '已加入' : '去设置',
+          value: '去设置',
           icon: Icons.chevron_right_rounded,
           onTap: () async {
             final ok = await widget.bridge.requestBatteryExemption();
-            await _refreshAndroidPermissions();
             if (!mounted) return;
             NeuToast.info(
               this.context,
-              ok ? '已加入电池优化白名单' : '尚未加入电池优化白名单，请在系统设置中设为无限制',
+              ok ? '已加入电池优化白名单' : '请在系统电池设置中设为无限制',
             );
           },
         ),
         _SettingsValueRow(
           title: 'Wi-Fi 定位权限',
           subtitle: '用于识别当前连接的家庭 Wi-Fi 名称',
-          value: _permissionLabel(
-            'location',
-            deniedForeverKey: 'locationDeniedForever',
-          ),
+          value: '去授权',
           icon: Icons.chevron_right_rounded,
           onTap: () async {
             final ok = await widget.bridge.requestLocationPermission();
-            await _refreshAndroidPermissions();
             if (!mounted) return;
-            if (ok) {
-              NeuToast.success(this.context, '已获得 Wi-Fi 定位权限');
-            } else if (_androidPermStates['locationDeniedForever'] == true) {
-              await _showPermissionSettingsPrompt('Wi-Fi 定位权限');
-            } else {
-              NeuToast.info(this.context, '未授予位置权限，您仍可在“家庭 Wi-Fi”中手动添加名称');
-            }
+            NeuToast.info(
+              this.context,
+              ok ? '已获得 Wi-Fi 定位权限' : '请在系统设置中授予位置权限',
+            );
           },
-        ),
-        _SettingsValueRow(
-          title: '应用系统设置',
-          subtitle: '若系统弹窗不再提示，可直接前往系统应用信息页修改权限',
-          value: '打开设置',
-          icon: Icons.open_in_new_rounded,
-          onTap: () => unawaited(widget.bridge.openAppSettings()),
         ),
       ],
     );
@@ -1278,7 +1428,7 @@ class _SettingsScreenState extends State<SettingsScreen>
             } catch (err) {
               if (!mounted) return;
               setState(() => _debugMode = prev);
-              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(context, LanVaultBridge.formatUserError(err));
             }
           },
         ),
@@ -1354,6 +1504,7 @@ class _SettingsGroupCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     return NeuCard(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Column(
@@ -1362,9 +1513,9 @@ class _SettingsGroupCard extends StatelessWidget {
           for (var i = 0; i < children.length; i++) ...<Widget>[
             children[i],
             if (i < children.length - 1)
-              const Padding(
+              Padding(
                 padding: EdgeInsets.symmetric(horizontal: 16),
-                child: Divider(height: 1, color: Color(0x59000000)),
+                child: Divider(height: 1, color: neu.dividerSubtle),
               ),
           ],
         ],
@@ -1390,6 +1541,7 @@ class _SettingsSwitchRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       child: Row(
@@ -1409,7 +1561,7 @@ class _SettingsSwitchRow extends StatelessWidget {
                   Text(
                     subtitle!,
                     style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: NeuTokens.textSecondary,
+                          color: neu.textSecondary,
                         ),
                   ),
                 ],
@@ -1445,6 +1597,7 @@ class _SettingsValueRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     return InkWell(
       onTap: onTap,
       child: Padding(
@@ -1468,7 +1621,7 @@ class _SettingsValueRow extends StatelessWidget {
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                            color: NeuTokens.textSecondary,
+                            color: neu.textSecondary,
                           ),
                     ),
                   ],
@@ -1483,16 +1636,90 @@ class _SettingsValueRow extends StatelessWidget {
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: NeuTokens.textSecondary,
+                      color: neu.textSecondary,
                       fontWeight: FontWeight.w500,
                     ),
               ),
             ),
             if (onTap != null) ...<Widget>[
               const SizedBox(width: 4),
-              Icon(icon, size: 17, color: NeuTokens.textSecondary),
+              Icon(icon, size: 17, color: neu.textSecondary),
             ],
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SkinMarketCard extends StatelessWidget {
+  const _SkinMarketCard({
+    required this.skin,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final SkinDefinition skin;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
+    return Semantics(
+      button: true,
+      selected: selected,
+      label: '应用${skin.name}皮肤',
+      child: InkWell(
+        onTap: onTap,
+        borderRadius:
+            const BorderRadius.all(Radius.circular(NeuRadius.control)),
+        child: AnimatedContainer(
+          duration: NeuMotion.resolveState(context),
+          curve: NeuMotion.resolveStateCurve(context),
+          width: 132,
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(
+            color: selected ? neu.accentSoft : neu.surface,
+            borderRadius:
+                const BorderRadius.all(Radius.circular(NeuRadius.control)),
+            border: Border.all(
+              color: selected ? neu.accent : neu.hairlineBorder,
+              width: selected ? 2 : 1,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Row(
+                children: <Widget>[
+                  for (final swatch in skin.swatches) ...<Widget>[
+                    Container(
+                      width: 24,
+                      height: 24,
+                      decoration: BoxDecoration(
+                        color: swatch,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: neu.hairlineBorder),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                  ],
+                  const Spacer(),
+                  if (selected)
+                    Icon(Icons.check_circle_rounded,
+                        size: 18, color: neu.accent),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                skin.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: Theme.of(context).textTheme.titleSmall,
+              ),
+            ],
+          ),
         ),
       ),
     );

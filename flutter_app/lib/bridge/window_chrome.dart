@@ -11,20 +11,29 @@ import 'package:flutter/services.dart';
 class WindowChrome {
   WindowChrome._();
 
-  static const MethodChannel _channel = MethodChannel('com.lanvault.app/window');
+  static const MethodChannel _channel =
+      MethodChannel('com.lanvault.app/window');
 
   static bool _handlerInstalled = false;
   static ValueChanged<bool>? _onMaximizedChanged;
+  static VoidCallback? _onSystemThemeChanged;
 
   /// 当前平台是否为支持自绘标题栏的 Windows 桌面端。
   static bool get isSupported => !kIsWeb && Platform.isWindows;
 
-  static void attach({ValueChanged<bool>? onMaximizedChanged}) {
+  static void attach({
+    ValueChanged<bool>? onMaximizedChanged,
+    VoidCallback? onSystemThemeChanged,
+  }) {
     _onMaximizedChanged = onMaximizedChanged;
+    _onSystemThemeChanged = onSystemThemeChanged;
     if (!isSupported || _handlerInstalled) return;
     _channel.setMethodCallHandler((MethodCall call) async {
       if (call.method == 'maximizedChanged' && call.arguments is bool) {
         _onMaximizedChanged?.call(call.arguments as bool);
+      }
+      if (call.method == 'systemThemeChanged') {
+        _onSystemThemeChanged?.call();
       }
       return null;
     });
@@ -35,6 +44,7 @@ class WindowChrome {
     if (!_handlerInstalled) return;
     _handlerInstalled = false;
     _onMaximizedChanged = null;
+    _onSystemThemeChanged = null;
     _channel.setMethodCallHandler(null);
   }
 
@@ -43,6 +53,17 @@ class WindowChrome {
   static Future<void> toggleMaximize() => _invoke('toggleMaximize');
 
   static Future<void> close() => _invoke('close');
+
+  static Future<void> setDarkMode(bool dark) async {
+    if (!isSupported) return;
+    try {
+      await _channel.invokeMethod<void>('setDarkMode', dark);
+    } on PlatformException {
+      // 原生窗口已销毁时无需上层处理。
+    } on MissingPluginException {
+      // 非 Windows 运行环境直接忽略。
+    }
+  }
 
   static Future<bool> isMaximized() async {
     if (!isSupported) return false;

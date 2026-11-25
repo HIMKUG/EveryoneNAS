@@ -51,9 +51,10 @@ class _NavRailItemState extends State<NavRailItem> {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     final foreground = widget.selected
-        ? Colors.white
-        : (_hovered ? NeuTokens.textPrimary : NeuTokens.textSecondary);
+        ? neu.onAccent
+        : (_hovered ? neu.textPrimary : neu.textSecondary);
     final pressDuration = NeuMotion.resolvePress(context);
     final pressCurve = NeuMotion.resolvePressCurve(context);
     final reduced = NeuMotion.isReduced(context);
@@ -98,17 +99,17 @@ class _NavRailItemState extends State<NavRailItem> {
                   padding: const EdgeInsets.symmetric(horizontal: 13),
                   decoration: BoxDecoration(
                     color: (!widget.selected && _hovered)
-                        ? NeuTokens.insetSurface
+                        ? neu.insetSurface
                         : null,
-                    gradient: showSelection ? NeuTokens.primaryGradient : null,
+                    gradient: showSelection ? neu.primaryGradient : null,
                     borderRadius: const BorderRadius.all(Radius.circular(12)),
                     border: Border.all(
                       color: _focused
-                          ? (widget.selected ? Colors.white : NeuTokens.accent)
+                          ? (widget.selected ? neu.onAccent : neu.accent)
                           : Colors.transparent,
                     ),
                     boxShadow:
-                        showSelection ? NeuTokens.primaryButtonShadows : null,
+                        showSelection ? neu.primaryButtonShadows : null,
                   ),
                   child: Row(
                     children: <Widget>[

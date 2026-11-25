@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     EveryoneNAS v0.2.0 Windows 8C16T 发行版一键构建脚本。
@@ -58,6 +58,7 @@ if ($Clean) {
 # 2. 编译 Rust 原生库（lanvault-ffi + 可选 lanvault-win-svc）
 Push-Location $RepoRoot
 try {
+    Get-ChildItem Env: | Where-Object { $_.Name -like "GIT_CONFIG_*" } | ForEach-Object { Remove-Item -LiteralPath ("Env:" + $_.Name) -ErrorAction SilentlyContinue }
     $CargoArgs = @(
         "build",
         "--release",

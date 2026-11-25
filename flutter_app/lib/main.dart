@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:ui';
 
 import 'package:flutter/services.dart';
@@ -14,6 +15,9 @@ import 'features/settings/settings_screen.dart';
 import 'features/vault/vault_screen.dart';
 import 'theme/neu_theme.dart';
 import 'theme/neu_toast.dart';
+import 'theme/appearance_controller.dart';
+import 'theme/motion_slide.dart';
+import 'theme/theme_reveal.dart';
 import 'widgets/device_switcher_pill.dart';
 import 'widgets/nav_rail_item.dart';
 import 'widgets/windows_title_bar.dart';
@@ -98,7 +102,12 @@ void main() {
         const Duration(seconds: 3),
         onTimeout: () {},
       );
-      runApp(LanVaultApp(bridge: bridge));
+      final appearance = await AppearanceController.preload().timeout(
+        const Duration(milliseconds: 300),
+        onTimeout: () => AppearanceController.memory(observeSystem: false),
+      );
+      appearance.resumeSystemObservation();
+      runApp(LanVaultApp(bridge: bridge, appearance: appearance));
     },
     (Object error, StackTrace stack) {
       debugPrint('EveryoneNAS ZoneError: $error\n$stack');
@@ -114,29 +123,75 @@ void main() {
 }
 
 class LanVaultApp extends StatefulWidget {
-  const LanVaultApp({super.key, required this.bridge});
+  const LanVaultApp({
+    super.key,
+    required this.bridge,
+    this.appearance,
+  });
 
   final LanVaultBridge bridge;
+  final AppearanceController? appearance;
 
   @override
   State<LanVaultApp> createState() => _LanVaultAppState();
 }
 
 class _LanVaultAppState extends State<LanVaultApp> {
+  late final AppearanceController _appearance =
+      widget.appearance ?? AppearanceController();
+
   @override
   void dispose() {
+    if (widget.appearance == null) {
+      _appearance.dispose();
+    }
     widget.bridge.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'EveryoneNAS',
-      debugShowCheckedModeBanner: false,
-      theme: buildLanVaultTheme(),
-      home: LanVaultShell(bridge: widget.bridge),
+    return AnimatedBuilder(
+      animation: _appearance,
+      builder: (context, _) {
+        final theme = _appearance.themeData;
+        unawaited(_applySystemChrome(theme));
+        return ThemeRevealHost(
+          child: AppearanceScope(
+            notifier: _appearance,
+            child: MaterialApp(
+              title: 'EveryoneNAS',
+              debugShowCheckedModeBanner: false,
+              theme: theme,
+              themeMode: ThemeMode.light,
+              home: LanVaultShell(bridge: widget.bridge),
+            ),
+          ),
+        );
+      },
     );
+  }
+
+  Future<void> _applySystemChrome(ThemeData theme) async {
+    final neu = theme.extension<NeuTheme>();
+    if (neu == null) {
+      return;
+    }
+    final dark = neu.isDark;
+    if (Platform.isAndroid) {
+      SystemChrome.setSystemUIOverlayStyle(
+        SystemUiOverlayStyle(
+          statusBarIconBrightness: dark ? Brightness.light : Brightness.dark,
+          statusBarColor: Colors.transparent,
+          systemNavigationBarColor: neu.surface,
+          systemNavigationBarIconBrightness:
+              dark ? Brightness.light : Brightness.dark,
+        ),
+      );
+    }
+    if (Platform.isWindows) {
+      unawaited(WindowChrome.setDarkMode(dark));
+    }
   }
 }
 
@@ -223,13 +278,13 @@ class _LanVaultShellState extends State<LanVaultShell> {
 
   void _openDeviceManager() {
     Navigator.of(context).push(
-      MaterialPageRoute<void>(
+      NeuSlidePageRoute<void>(
         builder: (routeCtx) => Scaffold(
-          backgroundColor: NeuTokens.canvas,
+          backgroundColor: NeuTheme.of(context).canvas,
           appBar: WindowChrome.isSupported
               ? null
               : AppBar(
-                  backgroundColor: NeuTokens.canvas,
+                  backgroundColor: NeuTheme.of(context).canvas,
                   surfaceTintColor: Colors.transparent,
                   elevation: 0,
                   title: const Text('设备管理'),
@@ -476,12 +531,14 @@ class _LanVaultShellState extends State<LanVaultShell> {
                   padding: const EdgeInsets.all(14),
                   child: Row(
                     children: <Widget>[
-                      NeuIconBadge(
-                        icon: request.osType.toLowerCase().contains('android')
-                            ? Icons.phone_android_rounded
-                            : Icons.computer_rounded,
-                        color: NeuTokens.accent,
-                        backgroundColor: NeuTokens.accentSoft,
+                      Builder(
+                        builder: (badgeContext) => NeuIconBadge(
+                          icon: request.osType.toLowerCase().contains('android')
+                              ? Icons.phone_android_rounded
+                              : Icons.computer_rounded,
+                          color: NeuTheme.of(badgeContext).accent,
+                          backgroundColor: NeuTheme.of(badgeContext).accentSoft,
+                        ),
                       ),
                       const SizedBox(width: 12),
                       Expanded(
@@ -524,33 +581,19 @@ class _LanVaultShellState extends State<LanVaultShell> {
   }
 
   Widget _buildAnimatedPageContent() {
-    return RepaintBoundary(
-      child: TweenAnimationBuilder<double>(
-        key: ValueKey<_ShellTab>(_selectedTab),
-        tween: Tween<double>(begin: 0.0, end: 1.0),
-        duration: const Duration(milliseconds: 160),
-        curve: Curves.linearToEaseOut,
-        builder: (context, t, child) {
-          final reduced = NeuMotion.isReduced(context);
-          return Opacity(
-            opacity: 0.92 + 0.08 * t,
-            child: Transform.translate(
-              offset: Offset(0, reduced ? 0 : (1 - t) * 5),
-              child: child,
-            ),
-          );
-        },
-        child: IndexedStack(
-          key: _pagesStackKey,
-          index: _selectedTab.index,
-          children: _pages,
-        ),
-      ),
+    return SlideSwitchViewport(
+      key: _pagesStackKey,
+      index: _selectedTab.index,
+      axis: MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide
+          ? Axis.vertical
+          : Axis.horizontal,
+      children: _pages,
     );
   }
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     final isWide = MediaQuery.sizeOf(context).width >= NeuTokens.breakpointWide;
     final hasCustomChrome = WindowChrome.isSupported;
 
@@ -593,7 +636,7 @@ class _LanVaultShellState extends State<LanVaultShell> {
           );
 
     return Scaffold(
-      backgroundColor: NeuTokens.canvas,
+      backgroundColor: neu.canvas,
       body: hasCustomChrome
           ? Column(
               children: <Widget>[
@@ -635,9 +678,10 @@ class _MobileTopBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     return Container(
       padding: const EdgeInsets.fromLTRB(20, 10, 16, 6),
-      color: NeuTokens.canvas,
+      color: neu.canvas,
       child: Row(
         children: <Widget>[
           Text(
@@ -656,6 +700,36 @@ class _MobileTopBar extends StatelessWidget {
           const SizedBox(width: 10),
           Semantics(
             button: true,
+            label: neu.isDark ? '切换日间模式' : '切换夜间模式',
+            child: InkWell(
+              onTap: () => ThemeRevealHost.of(context).reveal(
+                context,
+                () => AppearanceScope.of(context).toggleLightDark(),
+              ),
+              borderRadius:
+                  const BorderRadius.all(Radius.circular(NeuRadius.pill)),
+              child: Container(
+                width: NeuTokens.minMobileTouchTarget,
+                height: NeuTokens.minMobileTouchTarget,
+                decoration: BoxDecoration(
+                  color: neu.surface,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: neu.hairlineBorder),
+                  boxShadow: neu.controlShadows,
+                ),
+                child: Icon(
+                  neu.isDark
+                      ? Icons.light_mode_outlined
+                      : Icons.dark_mode_outlined,
+                  size: 20,
+                  color: neu.textPrimary,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Semantics(
+            button: true,
             label: inSettings ? '返回总览' : '打开设置',
             child: InkWell(
               onTap: onToggleSettings,
@@ -665,19 +739,19 @@ class _MobileTopBar extends StatelessWidget {
                 width: NeuTokens.minMobileTouchTarget,
                 height: NeuTokens.minMobileTouchTarget,
                 decoration: BoxDecoration(
-                  color: inSettings ? NeuTokens.accentSoft : NeuTokens.surface,
+                  color: inSettings ? neu.accentSoft : neu.surface,
                   shape: BoxShape.circle,
                   border: Border.all(
                     color: inSettings
-                        ? NeuTokens.accent.withValues(alpha: 0.35)
-                        : NeuTokens.hairlineBorder,
+                        ? neu.accent.withValues(alpha: 0.35)
+                        : neu.hairlineBorder,
                   ),
-                  boxShadow: NeuTokens.controlShadows,
+                  boxShadow: neu.controlShadows,
                 ),
                 child: Icon(
                   inSettings ? Icons.close_rounded : Icons.settings_outlined,
                   size: 20,
-                  color: inSettings ? NeuTokens.accent : NeuTokens.textPrimary,
+                  color: inSettings ? neu.accent : neu.textPrimary,
                 ),
               ),
             ),
@@ -707,13 +781,14 @@ class _DesktopNavRail extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     return Container(
       width: 212,
       padding: const EdgeInsets.fromLTRB(14, 18, 14, 16),
-      decoration: const BoxDecoration(
-        color: Color(0xFFFAFBFD),
+      decoration: BoxDecoration(
+        color: neu.chromeSurface,
         border: Border(
-          right: BorderSide(color: NeuTokens.hairlineBorder, width: 1),
+          right: BorderSide(color: neu.hairlineBorder, width: 1),
         ),
       ),
       child: Column(
@@ -752,10 +827,10 @@ class _DesktopNavRail extends StatelessWidget {
                     height: itemHeight,
                     child: DecoratedBox(
                       decoration: BoxDecoration(
-                        gradient: NeuTokens.primaryGradient,
+                        gradient: neu.primaryGradient,
                         borderRadius:
                             const BorderRadius.all(Radius.circular(12)),
-                        boxShadow: NeuTokens.primaryButtonShadows,
+                        boxShadow: neu.primaryButtonShadows,
                       ),
                     ),
                   ),
@@ -791,9 +866,9 @@ class _DesktopNavRail extends StatelessWidget {
                   padding:
                       const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                   decoration: BoxDecoration(
-                    color: NeuTokens.insetSurface,
+                    color: neu.insetSurface,
                     borderRadius: const BorderRadius.all(Radius.circular(12)),
-                    border: Border.all(color: NeuTokens.hairlineBorder),
+                    border: Border.all(color: neu.hairlineBorder),
                   ),
                   child: Row(
                     children: <Widget>[
@@ -803,8 +878,8 @@ class _DesktopNavRail extends StatelessWidget {
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
                           color: running
-                              ? NeuTokens.healthy
-                              : NeuTokens.textSecondary.withValues(alpha: 0.4),
+                              ? neu.healthy
+                              : neu.textSecondary.withValues(alpha: 0.4),
                         ),
                       ),
                       const SizedBox(width: 8),
@@ -816,7 +891,7 @@ class _DesktopNavRail extends StatelessWidget {
                           overflow: TextOverflow.ellipsis,
                           style:
                               Theme.of(context).textTheme.labelMedium?.copyWith(
-                                    color: NeuTokens.textSecondary,
+                                    color: neu.textSecondary,
                                     fontSize: 11.5,
                                   ),
                         ),
@@ -846,19 +921,14 @@ class _MobileNavBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final neu = NeuTheme.of(context);
     return Container(
-      decoration: const BoxDecoration(
-        color: NeuTokens.surface,
+      decoration: BoxDecoration(
+        color: neu.surface,
         border: Border(
-          top: BorderSide(color: NeuTokens.hairlineBorder, width: 1),
+          top: BorderSide(color: neu.hairlineBorder, width: 1),
         ),
-        boxShadow: <BoxShadow>[
-          BoxShadow(
-            color: Color(0x0A0F172A),
-            offset: Offset(0, -4),
-            blurRadius: 12,
-          ),
-        ],
+        boxShadow: neu.extrudedShadows,
       ),
       child: SafeArea(
         top: false,
@@ -891,7 +961,7 @@ class _MobileNavBar extends StatelessWidget {
                                 ),
                                 decoration: BoxDecoration(
                                   color: item.tab == selectedTab
-                                      ? NeuTokens.accentSoft
+                                      ? neu.accentSoft
                                       : Colors.transparent,
                                   borderRadius: const BorderRadius.all(
                                     Radius.circular(NeuRadius.pill),
@@ -903,8 +973,8 @@ class _MobileNavBar extends StatelessWidget {
                                       : item.icon,
                                   size: 22,
                                   color: item.tab == selectedTab
-                                      ? NeuTokens.accent
-                                      : NeuTokens.textSecondary,
+                                      ? neu.accent
+                                      : neu.textSecondary,
                                 ),
                               ),
                               const SizedBox(height: 2),
@@ -918,8 +988,8 @@ class _MobileNavBar extends StatelessWidget {
                                       ? FontWeight.w700
                                       : FontWeight.w500,
                                   color: item.tab == selectedTab
-                                      ? NeuTokens.accent
-                                      : NeuTokens.textSecondary,
+                                      ? neu.accent
+                                      : neu.textSecondary,
                                 ),
                               ),
                             ],
