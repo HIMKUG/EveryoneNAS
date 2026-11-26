@@ -2368,6 +2368,21 @@ pub async fn autostart_local_server() -> Result<Option<u16>> {
     }
 }
 
+/// 清除已留档的 Web 管理密码，并停止本机存储服务。
+///
+/// 之前 UI 的"关闭 Web 密码"只是把本地开关置 false 并弹一句提示，服务端
+/// 仍带着旧密码运行、下次自启也会恢复它；这里做真实的往返。
+pub async fn clear_web_password() -> Result<bool> {
+    let state = runtime_state()?;
+    let mut life = state.lifecycle.lock().await;
+    stop_local_server_gracefully(&mut life).await?;
+    state
+        .client_db
+        .delete_setting(SETTING_SERVER_PASSWORD_ENC)?;
+    info!("cleared persisted web password and stopped the local server");
+    Ok(true)
+}
+
 /// 读取"启动时自动开启存储服务"开关。
 pub async fn get_autostart_server() -> Result<bool> {
     let state = runtime_state()?;

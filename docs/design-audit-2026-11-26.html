@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>草稿到作品 · 体检与重构方案</title>
+  <style>
+    :root {
+      --paper: #f7f4ee;
+      --surface: #fffdf9;
+      --ink: #1b1a17;
+      --muted: #6e6a61;
+      --rule: #e2ddd3;
+      --pro: #27593a; --pro-bg: #edf5ef;
+      --semi: #945d1f; --semi-bg: #faf3e8;
+      --draft: #993730; --draft-bg: #faecea;
+      --fast: #1e4e68; --fast-bg: #eaf3f8;
+      --opus: #4c2a6b; --opus-bg: #f3edf8;
+      --ease: cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--paper); color: var(--ink);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Noto Sans SC", sans-serif;
+      line-height: 1.68; -webkit-font-smoothing: antialiased; padding: 44px 24px 96px;
+    }
+    .page { max-width: 960px; margin: 0 auto; }
+    .serif { font-family: Georgia, "Songti SC", "Noto Serif SC", serif; }
+    .mono { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: 0.88em; }
+
+    header.masthead { border-top: 2px solid var(--ink); border-bottom: 1px solid var(--rule); padding: 24px 0 18px; margin-bottom: 28px; }
+    .kicker { font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+    h1.title { font-size: 28px; font-weight: 600; margin: 0 0 6px; letter-spacing: -0.02em; }
+    .meta-line { color: var(--muted); font-size: 13px; margin: 0; }
+
+    .reveal { opacity: 0; transform: translateY(12px); transition: opacity 0.55s var(--ease), transform 0.55s var(--ease); }
+    .reveal.visible { opacity: 1; transform: translateY(0); }
+
+    /* Inverted Pyramid Top Hero */
+    .hero-card { background: var(--surface); border: 1px solid var(--rule); padding: 28px 30px; margin-bottom: 22px; }
+    .summary-spread { display: grid; grid-template-columns: 190px 1fr; gap: 32px; align-items: center; }
+    .ring-wrap { position: relative; width: 156px; height: 156px; margin: 0 auto; }
+    .ring-wrap svg { transform: rotate(-90deg); width: 156px; height: 156px; }
+    .ring-track { fill: none; stroke: var(--rule); stroke-width: 6; }
+    .ring-fill { fill: none; stroke: var(--ink); stroke-width: 6; stroke-linecap: round; stroke-dasharray: 440; stroke-dashoffset: 440; transition: stroke-dashoffset 1s var(--ease); }
+    .ring-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+    .ring-num { font-size: 40px; font-weight: 600; line-height: 1; }
+    .ring-label { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+    .tldr { border-left: 2px solid var(--ink); padding: 2px 0 2px 14px; font-size: 14px; margin: 0 0 16px; }
+
+    /* 4 KPI Quartet */
+    .kpi-quartet { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 18px; }
+    .kpi { background: var(--paper); border: 1px solid var(--rule); padding: 10px 12px; }
+    .kpi-val { font-size: 20px; font-weight: 600; line-height: 1.2; }
+    .kpi-lbl { font-size: 11.5px; color: var(--muted); }
+
+    .dim-row { display: grid; grid-template-columns: 180px 1fr 48px; gap: 10px; align-items: center; margin-bottom: 8px; font-size: 12.5px; }
+    .dim-track { height: 5px; background: #e8e3d9; overflow: hidden; }
+    .dim-fill { height: 100%; width: 0%; background: var(--ink); transition: width 0.85s var(--ease); }
+
+    /* Primary Visual Focus: Action & Model-Tier Matrix */
+    .action-box { background: var(--surface); border: 1px solid var(--rule); padding: 26px 30px; margin-bottom: 24px; }
+    .sec-head { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+    .sec-head h2 { font-size: 19px; margin: 0; font-weight: 600; }
+    .sec-sub { font-size: 13px; color: var(--muted); margin: 0; }
+
+    /* Progressive Disclosure Drawers */
+    details.drawer { background: var(--surface); border: 1px solid var(--rule); margin-bottom: 12px; }
+    details.drawer > summary {
+      cursor: pointer; list-style: none; padding: 16px 22px; font-size: 15.5px; font-weight: 600;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    details.drawer > summary::-webkit-details-marker { display: none; }
+    details.drawer > summary::after { content: "展开细节 ▾"; font-size: 12px; font-weight: 400; color: var(--muted); }
+    details.drawer[open] > summary::after { content: "收起 ▴"; }
+    .drawer-body { padding: 4px 22px 22px; border-top: 1px solid var(--rule); }
+
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+    th { font-size: 11.5px; color: var(--muted); font-weight: 500; }
+
+    .tag { display: inline-block; padding: 2px 7px; font-size: 11.5px; font-weight: 500; white-space: nowrap; }
+    .tag-pro { color: var(--pro); background: var(--pro-bg); }
+    .tag-semi { color: var(--semi); background: var(--semi-bg); }
+    .tag-draft { color: var(--draft); background: var(--draft-bg); }
+    .tag-fast { color: var(--fast); background: var(--fast-bg); }
+    .tag-opus { color: var(--opus); background: var(--opus-bg); }
+
+    .arch-layer { background: var(--paper); border: 1px solid var(--rule); padding: 10px 14px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .res-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 14px; }
+    .res-card { border-top: 2px solid var(--ink); padding-top: 8px; }
+    .res-card h3 { font-size: 13.5px; margin: 0 0 4px; }
+    .res-card p { font-size: 12.5px; color: var(--muted); margin: 0; }
+
+    details.tree-node { margin-left: 16px; border-left: 1px solid var(--rule); padding-left: 12px; margin-top: 4px; }
+    details.tree-node > summary { cursor: pointer; list-style: none; font-size: 13px; padding: 3px 0; }
+    .tree-leaf { margin-left: 16px; padding: 3px 0 3px 12px; border-left: 1px solid var(--rule); font-size: 13px; }
+
+    @media (max-width: 760px) {
+      .summary-spread, .kpi-quartet, .res-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="masthead reveal">
+      <div class="kicker">Draft-to-Opus · Bottom-Up Codebase Audit</div>
+      <h1 class="title serif" id="project-title">项目体检与重构方案</h1>
+      <p class="meta-line" id="project-meta">只读诊断模式 · 尚未改动任何源码</p>
+    </header>
+
+    <!-- 1. Inverted Pyramid Hero -->
+    <section class="hero-card reveal">
+      <div class="summary-spread">
+        <div class="ring-wrap">
+          <svg viewBox="0 0 160 160">
+            <circle class="ring-track" cx="80" cy="80" r="70" />
+            <circle class="ring-fill" id="score-ring" cx="80" cy="80" r="70" />
+          </svg>
+          <div class="ring-center">
+            <div class="ring-num serif" id="score-num">0</div>
+            <div class="ring-label" id="score-verdict">评估中</div>
+          </div>
+        </div>
+        <div>
+          <p class="tldr" id="plain-summary"></p>
+          <div class="kpi-quartet" id="kpi-quartet"></div>
+          <div id="dim-bars"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 2. Primary Action Focus: Risk x Payoff + Model Tier -->
+    <section class="action-box reveal">
+      <div class="sec-head">
+        <h2 class="serif">优先改造清单（按风险 × 收益与模型算力分级）</h2>
+        <p class="sec-sub">低风险、中风险与「高风险高收益」建议修；「高风险中低收益」自动豁免不修</p>
+      </div>
+      <table>
+        <thead><tr><th scope="col">改造项</th><th scope="col">风险 × 收益</th><th scope="col">推荐模型</th><th scope="col">执行方式与人话说明</th></tr></thead>
+        <tbody id="action-body"></tbody>
+      </table>
+    </section>
+
+    <!-- 3. Progressive Disclosure Drawers (Click to inspect details) -->
+    <details class="drawer reveal" open>
+      <summary class="serif">01 · 架构分层、抗风险三问与工程发布门禁</summary>
+      <div class="drawer-body">
+        <div id="arch-stack"></div>
+        <div class="res-grid" id="resilience-cards"></div>
+      </div>
+    </details>
+
+    <details class="drawer reveal">
+      <summary class="serif">02 · 前端控件大类盘点（令牌统一 vs 组件合并）</summary>
+      <div class="drawer-body">
+        <table>
+          <thead><tr><th scope="col">控件大类</th><th scope="col">现状</th><th scope="col">建议</th><th scope="col">说明</th></tr></thead>
+          <tbody id="frontend-body"></tbody>
+        </table>
+      </div>
+    </details>
+
+    <details class="drawer reveal">
+      <summary class="serif">03 · 后端模块血统树与中等模块异味</summary>
+      <div class="drawer-body">
+        <p style="font-size:12.5px;color:var(--muted);margin:8px 0 12px;">
+          <span class="tag tag-pro">专业</span> 可复用 · <span class="tag tag-semi">半手写</span> 带补丁 · <span class="tag tag-draft">手写草稿</span> 建议重写
+        </p>
+        <div id="backend-tree"></div>
+      </div>
+    </details>
+
+    <details class="drawer reveal">
+      <summary class="serif">04 · 性能热点、数学损失与资源浪费</summary>
+      <div class="drawer-body">
+        <table>
+          <thead><tr><th scope="col">类型与位置</th><th scope="col">问题</th><th scope="col">改良方案</th><th scope="col">实际影响</th></tr></thead>
+          <tbody id="perf-body"></tbody>
+        </table>
+      </div>
+    </details>
+
+    <details class="drawer reveal">
+      <summary class="serif">05 · 安全边界、数据状态机、可观测性与豁免区</summary>
+      <div class="drawer-body">
+        <table>
+          <thead><tr><th scope="col">审查域与位置</th><th scope="col">问题</th><th scope="col">修复建议</th><th scope="col">潜在后果</th></tr></thead>
+          <tbody id="audit-body"></tbody>
+        </table>
+        <h4 style="font-size:13.5px;margin:18px 0 8px;">虽然丑但别乱动（高风险 × 中低收益豁免）</h4>
+        <ul id="exemption-list" style="margin:0;padding-left:18px;font-size:13px;color:var(--muted);"></ul>
+      </div>
+    </details>
+  </div>
+
+  <script>
+    // AI ONLY NEEDS TO POPULATE THIS CONCISE OBJECT
+    window.REPORT_DATA = {
+      "projectName": "EveryoneNAS 前端（Web + Flutter）",
+      "scanDate": "2026-11-26",
+      "totalScore": 54,
+      "verdict": "可接受 · 组件强、装配弱",
+      "plainSummary": "组件库与皮肤系统是真工艺，问题集中在页面装配层：破坏性操作零确认、失败只弹一条会消失的提示、两端契约有三处漂移。先修 4 个 P0，再按批次收敛。",
+      "kpis": [
+            {
+                  "val": "47 项",
+                  "lbl": "归并主题"
+            },
+            {
+                  "val": "4 项",
+                  "lbl": "P0 必修"
+            },
+            {
+                  "val": "17 项",
+                  "lbl": "P1 发布前"
+            },
+            {
+                  "val": "395 处",
+                  "lbl": "file:line 实例"
+            }
+      ],
+      "dimensions": [
+            {
+                  "name": "UI 控件收敛度",
+                  "score": 8,
+                  "max": 15
+            },
+            {
+                  "name": "反补丁与模块化",
+                  "score": 6,
+                  "max": 15
+            },
+            {
+                  "name": "性能与数学健康",
+                  "score": 11,
+                  "max": 20
+            },
+            {
+                  "name": "架构秩序与韧性",
+                  "score": 10,
+                  "max": 20
+            },
+            {
+                  "name": "安全数据与可观测",
+                  "score": 12,
+                  "max": 20
+            },
+            {
+                  "name": "发布就绪与可测性",
+                  "score": 5,
+                  "max": 10
+            }
+      ],
+      "actions": [
+            {
+                  "name": "池模式改枚举并对齐 wire 值",
+                  "riskPayoff": "高风险 · 高收益",
+                  "model": "opus",
+                  "desc": "App 传 'raid1' 而后端只认 'mirror_raid1'，镜像池必失败；定义 PoolMode 枚举 + 集中映射，并补契约测试。"
+            },
+            {
+                  "name": "拆开加载/失败/空三态",
+                  "riskPayoff": "高风险 · 高收益",
+                  "model": "opus",
+                  "desc": "总览与配对把「取不到」渲染成「服务未启动」，会引用户走错路；先加 error 分支与重试，再补骨架屏。"
+            },
+            {
+                  "name": "Web 密码开关接真实桥接",
+                  "riskPayoff": "高风险 · 高收益",
+                  "model": "opus",
+                  "desc": "当前只改本地布尔并报「已启用」，安全开关给假保证；改走启停接口并回读状态，失败回滚。"
+            },
+            {
+                  "name": "焦点装饰抽成装饰器统一套用",
+                  "riskPayoff": "低风险 · 高收益",
+                  "model": "fast",
+                  "desc": "NeuCard 已有实现，Button/Switch/SegmentedControl 直接复用；单文件改动。"
+            },
+            {
+                  "name": "破坏性操作统一确认",
+                  "riskPayoff": "中风险 · 高收益",
+                  "model": "fast",
+                  "desc": "抽 confirmDestructive()，9 处 Flutter + 6 处 Web 逐一替换，正文写清后果。"
+            },
+            {
+                  "name": "NeuCard 强制按钮语义",
+                  "riskPayoff": "低风险 · 高收益",
+                  "model": "fast",
+                  "desc": "onTap 非空时强制包 Semantics，label 回退子文本；一处改动覆盖 9 个调用点。"
+            },
+            {
+                  "name": "Web 三类刷新补请求序号",
+                  "riskPayoff": "低风险 · 中收益",
+                  "model": "fast",
+                  "desc": "复用已有 *RequestSeq 模式，三个函数各加三行。"
+            },
+            {
+                  "name": "字体子集化",
+                  "riskPayoff": "中风险 · 高收益",
+                  "model": "fast",
+                  "desc": "11.4 MB 单字重、两端各带一份；按字频子集化到 1-2 MB，或改系统中文栈。"
+            }
+      ],
+      "archLayers": [
+            {
+                  "title": "Web 控制台",
+                  "items": [
+                        "index.html",
+                        "2 CSS（1 371 行）",
+                        "5 JS（3 178 行）"
+                  ],
+                  "note": "单页 5 块面板，单例 state 31 字段"
+            },
+            {
+                  "title": "Flutter 外壳",
+                  "items": [
+                        "main.dart",
+                        "_DesktopNavRail",
+                        "_MobileNavBar"
+                  ],
+                  "note": "统一 breakpointWide = 840"
+            },
+            {
+                  "title": "Flutter 组件层",
+                  "items": [
+                        "15 个 Neu* 组件",
+                        "NeuMotion 令牌",
+                        "78 套皮肤"
+                  ],
+                  "note": "语义与键盘路径最完整的部分"
+            },
+            {
+                  "title": "Flutter 页面层",
+                  "items": [
+                        "7 个 features 屏",
+                        "2 549 行 backup",
+                        "1 727 行 settings"
+                  ],
+                  "note": "绕开组件的地方，问题集中在此"
+            },
+            {
+                  "title": "桥接层",
+                  "items": [
+                        "lanvault_bridge.dart",
+                        "264 个异步方法",
+                        "194 处 as 强转"
+                  ],
+                  "note": "单类承载全部 FFI 面"
+            }
+      ],
+      "resilience": [
+            {
+                  "title": "关键处能否自愈",
+                  "body": "Web 请求层有 15s 超时与 429 持久化锁定；但 7 个轮询器全都不感知前后台，Flutter 桥接的 Android 通道调用无超时。"
+            },
+            {
+                  "title": "能不能保证下线",
+                  "body": "Flutter 设置页 10 项配置并发加载、失败聚合成横幅 + 重试，是全库最好的降级范式；其余 6 屏失败只弹一条会消失的 toast。"
+            },
+            {
+                  "title": "极端情况是否会崩",
+                  "body": "全库 0 处 textScaler/FittedBox，系统字号 2.0 时总览三列 KPI 会溢出；0 处 ListView.builder，长列表全量构建。"
+            }
+      ],
+      "frontendInventory": [
+            {
+                  "category": "按钮",
+                  "variants": "Flutter：106 处 NeuButton + 7 IconButton + 15 InkWell + 2 TextButton；Web：29 个手写 button",
+                  "action": "仅统一令牌",
+                  "note": "Flutter 已有组件层，Web 靠 .neu-btn 类收敛"
+            },
+            {
+                  "category": "开关",
+                  "variants": "NeuSwitch 6 处 + 设置页裸 Switch 8 处",
+                  "action": "合并标准组件",
+                  "note": "裸 Switch 缺 MergeSemantics，改回 NeuSwitch 即可"
+            },
+            {
+                  "category": "确认对话框",
+                  "variants": "21 处 showNeuDialog",
+                  "action": "合并标准组件",
+                  "note": "缺 confirmDestructive 语义封装"
+            },
+            {
+                  "category": "空态",
+                  "variants": "13 处 NeuEmptyState，仅 4 处带 action",
+                  "action": "仅统一令牌",
+                  "note": "组件已支持 action，补传即可"
+            },
+            {
+                  "category": "状态徽标",
+                  "variants": "NeuStatusBadge 27 处；Web .status-badge 5 色",
+                  "action": "仅统一令牌",
+                  "note": "存储页徽标文案说模式、颜色说在线，需拆两个"
+            },
+            {
+                  "category": "提示",
+                  "variants": "NeuToast 四类 147 次调用；Web feedback-line 7 处",
+                  "action": "合并标准组件",
+                  "note": "缺动作按钮，失败后无就地重试"
+            }
+      ],
+      "backendTree": {
+            "name": "Flutter 前端模块",
+            "provenance": "semi",
+            "desc": "组件层已是专业级，页面层带补丁",
+            "children": [
+                  {
+                        "name": "theme/（4 555 行）",
+                        "provenance": "pro",
+                        "desc": "令牌、78 皮肤、动效、减弱动效均成体系"
+                  },
+                  {
+                        "name": "widgets/（3 个）",
+                        "provenance": "pro",
+                        "desc": "标题栏、导航项、设备胶囊"
+                  },
+                  {
+                        "name": "features/backup（2 549 行）",
+                        "provenance": "semi",
+                        "desc": "语义最全但删除类零确认"
+                  },
+                  {
+                        "name": "features/settings（1 727 行）",
+                        "provenance": "semi",
+                        "desc": "加载与回滚扎实，密码开关是伪状态"
+                  },
+                  {
+                        "name": "features/snapshots（1 543 行）",
+                        "provenance": "draft",
+                        "desc": "恢复无确认、无进度、不可取消"
+                  },
+                  {
+                        "name": "features/dashboard（832 行）",
+                        "provenance": "draft",
+                        "desc": "三态混同，卡片可点但无角色"
+                  },
+                  {
+                        "name": "bridge/lanvault_bridge（4 458 行）",
+                        "provenance": "draft",
+                        "desc": "264 个方法单类，194 处强转"
+                  },
+                  {
+                        "name": "web-ui/js/app.js（2 173 行）",
+                        "provenance": "draft",
+                        "desc": "5 块面板共用一个 state，3 类刷新无守卫"
+                  }
+            ]
+      },
+      "perfLosses": [
+            {
+                  "category": "资源体积",
+                  "location": "flutter_app/assets/fonts/SourceHanSansSC-Regular.woff2",
+                  "issue": "11.4 MB 单字重、无子集化，Web 与 App 各带一份（md5 相同）",
+                  "fix": "按字频子集化到 1-2 MB，或改系统中文栈；补 preload",
+                  "impact": "首屏与安装包体积直接减少约 10 MB"
+            },
+            {
+                  "category": "列表渲染",
+                  "location": "web-ui/js/app.js:1552",
+                  "issue": "每条 WS 状态帧全量重建快传列表并全量排序",
+                  "fix": "按 client_msg_id 局部更新单卡片",
+                  "impact": "消息密集时不再掉帧"
+            },
+            {
+                  "category": "布局抖动",
+                  "location": "web-ui/js/app.js:404",
+                  "issue": "锁定倒计时 200ms 写样式与 aria，60s 内约 300 次",
+                  "fix": "1s 节拍 + CSS transition",
+                  "impact": "降低无谓重排"
+            },
+            {
+                  "category": "数据界",
+                  "location": "lanvault_bridge.dart:3908 / crates/lanvault-core/src/db.rs:28",
+                  "issue": "App 传 'raid1'，后端只认 'mirror_raid1'",
+                  "fix": "PoolMode 枚举 + 集中映射",
+                  "impact": "镜像池从不可用变为可用"
+            },
+            {
+                  "category": "轮询",
+                  "location": "flutter_app/lib/bridge/lanvault_bridge.dart:2235",
+                  "issue": "2s/1s/15s/2s 四个轮询器无生命周期门控",
+                  "fix": "统一 AppLifecycle 暂停/恢复",
+                  "impact": "移动端后台耗电与无效 IPC"
+            },
+            {
+                  "category": "虚拟化",
+                  "location": "flutter_app/lib/features/backup/backup_screen.dart:812",
+                  "issue": "ListView(children:[...]) 全量构建；全库 0 处 builder",
+                  "fix": "改 ListView.builder",
+                  "impact": "500+ 条目时滑动流畅"
+            }
+      ],
+      "deepAudit": [
+            {
+                  "domain": "交互安全",
+                  "location": "flutter_app/lib/features/backup/backup_screen.dart:467",
+                  "issue": "删除组规则直接执行，无确认不可撤销",
+                  "fix": "复用 pairing_screen:328 的确认弹窗并写明后果",
+                  "impact": "避免误触删除整条镜像规则"
+            },
+            {
+                  "domain": "交互安全",
+                  "location": "flutter_app/lib/features/snapshots/snapshots_screen.dart:319",
+                  "issue": "恢复快照选完目录即写盘，无确认、无进度、不可取消",
+                  "fix": "恢复前确认来源/大小/目标，恢复中给可取消进度",
+                  "impact": "大快照期间用户不再被锁死"
+            },
+            {
+                  "domain": "状态真实",
+                  "location": "flutter_app/lib/features/settings/settings_screen.dart:645",
+                  "issue": "无服务时开关直接置 true 并提示已启用",
+                  "fix": "走桥接启停并回读状态",
+                  "impact": "安全开关不再给假保证"
+            },
+            {
+                  "domain": "状态真实",
+                  "location": "flutter_app/lib/features/dashboard/dashboard_screen.dart:322",
+                  "issue": "加载/失败/空都渲染成「点击进入设置启动」",
+                  "fix": "显式 error 分支 + 重试 + 骨架",
+                  "impact": "不再把网络故障误报为服务停止"
+            },
+            {
+                  "domain": "无障碍",
+                  "location": "flutter_app/lib/theme/neu_theme.dart:818",
+                  "issue": "NeuCard 只在传 semanticLabel 时包 Semantics，9 处 onTap 仅 1 处带",
+                  "fix": "onTap 非空强制包 Semantics，label 回退子文本",
+                  "impact": "读屏不再遇到无角色的可点区域"
+            },
+            {
+                  "domain": "无障碍",
+                  "location": "flutter_app/lib/theme/neu_theme.dart:1156",
+                  "issue": "Button/Switch/SegmentedControl 无焦点视觉（Card 有）",
+                  "fix": "把 Card 的焦点描边抽成装饰器统一套用",
+                  "impact": "键盘用户能定位焦点"
+            },
+            {
+                  "domain": "无障碍",
+                  "location": "web-ui/js/timeline.js:167",
+                  "issue": "回滚面板只监听 pointerup，AT 派发的 click 无效",
+                  "fix": "改原生 click，pointer 仅做按压视觉",
+                  "impact": "读屏用户可用回滚"
+            },
+            {
+                  "domain": "无障碍",
+                  "location": "web-ui/css/neumorphism-tokens.css:50",
+                  "issue": "warn 文本 4.13:1、ok 4.50:1 零余量、ok-alt 4.12:1",
+                  "fix": "提高对比至 4.5 以上或加大字号/字重",
+                  "impact": "顶部「连接中…」等状态文字达 AA"
+            },
+            {
+                  "domain": "契约漂移",
+                  "location": "web-ui/index.html:220",
+                  "issue": "E2EE 复选框可取消，服务端强制 true",
+                  "fix": "策略下沉或两侧真正支持",
+                  "impact": "取消勾选不再必然失败"
+            },
+            {
+                  "domain": "契约漂移",
+                  "location": "flutter_app/lib/features/vault/vault_screen.dart:259",
+                  "issue": "段值 'raid1'，缺 'striped'，后端三值齐全",
+                  "fix": "与 P0 第一项同批",
+                  "impact": "两端建库能力对齐"
+            },
+            {
+                  "domain": "可观测",
+                  "location": "flutter_app/lib/theme/neu_toast.dart:15",
+                  "issue": "四类 toast 无动作按钮，57 处错误无处重试",
+                  "fix": "增加可选 action，长耗时失败改行内错误区",
+                  "impact": "失败可恢复而非一闪而过"
+            },
+            {
+                  "domain": "工程门禁",
+                  "location": "flutter_app/analysis_options.yaml:11",
+                  "issue": "仅默认 flutter_lints；测试桩 56 处空实现、3 处 UnimplementedError",
+                  "fix": "启用更多 lint + 为 P0/P1 补契约测试 + 最小 CI",
+                  "impact": "此类缺陷不再逃过 analyze 与 test"
+            }
+      ],
+      "exemptions": [
+            "新拟态双光源阴影系统（高风险 · 中收益）：1.19-1.40 的边框对比度是同一套取舍，靠光影而非描边分层，改写会动摇整个视觉世界。",
+            "minTouchTarget = 42（高风险 · 低收益）：低于 Apple 44，但与 11px 小字、紧凑卡片共同构成当前密度，单改会撑破多处布局。",
+            "NeuToast 单槽替换（中风险 · 低收益）：队列化会引入提示排队延迟，等就地重试修好后再考虑。",
+            "buildDerivedPalette 的固定混色比例（中风险 · 低收益）：已由 ensure* 兜底，重写收益有限。",
+            "barrierDismissible 默认 true（中风险 · 中收益）：涉及 21 处调用，按调用点逐个改而非改默认值。",
+            "Web 端零 hover、仅 pointer 事件（低风险）：app.js:4 明确声明为触屏优先的有意取舍。"
+      ]
+};
+
+    const provMap = { pro: ["tag-pro", "专业"], semi: ["tag-semi", "半手写"], draft: ["tag-draft", "手写草稿"] };
+    const modelMap = { fast: ["tag-fast", "轻量快速模型"], opus: ["tag-opus", "高阶推理模型"] };
+
+    function renderAll() {
+      const d = window.REPORT_DATA;
+      document.getElementById("project-title").textContent = `${d.projectName} · 体检与重构方案`;
+      document.getElementById("project-meta").textContent = `扫描日期：${d.scanDate} · 三阶渐进审查（只读，未改源码）`;
+      document.getElementById("score-verdict").textContent = `满分 100 · ${d.verdict}`;
+      document.getElementById("plain-summary").textContent = d.plainSummary || "";
+
+      const ring = document.getElementById("score-ring");
+      setTimeout(() => { ring.style.strokeDashoffset = 440 - (440 * d.totalScore) / 100; }, 100);
+      let cur = 0;
+      const timer = setInterval(() => {
+        cur = Math.min(d.totalScore, cur + Math.max(1, Math.ceil(d.totalScore / 28)));
+        document.getElementById("score-num").textContent = cur;
+        if (cur >= d.totalScore) clearInterval(timer);
+      }, 24);
+
+      document.getElementById("kpi-quartet").innerHTML = (d.kpis || []).map(k =>
+        `<div class="kpi"><div class="kpi-val serif">${k.val}</div><div class="kpi-lbl">${k.lbl}</div></div>`).join("");
+
+      document.getElementById("dim-bars").innerHTML = d.dimensions.map(dim => `
+        <div class="dim-row">
+          <span>${dim.name}</span>
+          <div class="dim-track"><div class="dim-fill" data-pct="${(dim.score / dim.max) * 100}"></div></div>
+          <span class="mono" style="text-align:right">${dim.score}/${dim.max}</span>
+        </div>`).join("");
+      setTimeout(() => { document.querySelectorAll(".dim-fill").forEach(el => { el.style.width = el.dataset.pct + "%"; }); }, 160);
+
+      document.getElementById("action-body").innerHTML = (d.actions || []).map(a => {
+        const [mCls, mLbl] = modelMap[a.model] || modelMap.fast;
+        return `<tr><td><strong>${a.name}</strong></td><td>${a.riskPayoff}</td><td><span class="tag ${mCls}">${mLbl}</span></td><td>${a.desc}</td></tr>`;
+      }).join("");
+
+      document.getElementById("arch-stack").innerHTML = (d.archLayers || []).map(l =>
+        `<div class="arch-layer"><div><strong>${l.title}</strong> <span style="color:var(--muted);font-size:12px;">${l.note || ""}</span></div><div class="mono" style="font-size:12px;">${(l.items || []).join(" · ")}</div></div>`).join("");
+
+      document.getElementById("resilience-cards").innerHTML = (d.resilience || []).map(r =>
+        `<div class="res-card"><h3>${r.title}</h3><p>${r.body}</p></div>`).join("");
+
+      document.getElementById("frontend-body").innerHTML = (d.frontendInventory || []).map(f =>
+        `<tr><td><strong>${f.category}</strong></td><td>${f.variants}</td><td>${f.action}</td><td>${f.note}</td></tr>`).join("");
+
+      function buildTree(node) {
+        const [cls, lbl] = provMap[node.provenance] || provMap.draft;
+        const badge = `<span class="tag ${cls}">${lbl}</span>`;
+        if (!node.children || !node.children.length) return `<div class="tree-leaf">${node.name} ${badge} <span style="color:var(--muted)">${node.desc || ""}</span></div>`;
+        return `<details class="tree-node" open><summary>${node.name} ${badge} <span style="color:var(--muted)">${node.desc || ""}</span></summary>${node.children.map(buildTree).join("")}</details>`;
+      }
+      document.getElementById("backend-tree").innerHTML = buildTree(d.backendTree);
+
+      document.getElementById("perf-body").innerHTML = (d.perfLosses || []).map(p =>
+        `<tr><td><strong>${p.category}</strong><div class="mono">${p.location}</div></td><td>${p.issue}</td><td>${p.fix}</td><td>${p.impact}</td></tr>`).join("");
+
+      document.getElementById("audit-body").innerHTML = (d.deepAudit || []).map(a =>
+        `<tr><td><strong>${a.domain}</strong><div class="mono">${a.location}</div></td><td>${a.issue}</td><td>${a.fix}</td><td>${a.impact}</td></tr>`).join("");
+
+      document.getElementById("exemption-list").innerHTML = (d.exemptions || []).map(e => `<li>${e}</li>`).join("");
+    }
+
+    const io = new IntersectionObserver(entries => {
+      entries.forEach((e, i) => { if (e.isIntersecting) { setTimeout(() => e.target.classList.add("visible"), i * 50); io.unobserve(e.target); } });
+    }, { threshold: 0.06 });
+    document.querySelectorAll(".reveal").forEach(el => io.observe(el));
+    renderAll();
+  </script>
+</body>
+</html>

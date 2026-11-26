@@ -465,6 +465,12 @@ class _BackupScreenState extends State<BackupScreen> {
   }
 
   Future<void> _deleteGroupRule(GroupRuleViewModel view) async {
+    final confirmed = await confirmDestructive(
+      context,
+      title: '删除组规则「${view.rule.name}」',
+      body: '该规则的绑定目标会一并停用，已归档的历史版本保留在目标设备上。此操作不可撤销。',
+    );
+    if (!confirmed || !mounted) return;
     try {
       await widget.bridge.deleteGroupRule(view.rule.ruleId);
       if (!mounted) return;
@@ -610,6 +616,13 @@ class _BackupScreenState extends State<BackupScreen> {
   }
 
   Future<void> _removeFolder(SyncRuleModel folder) async {
+    final confirmed = await confirmDestructive(
+      context,
+      title: '删除备份任务',
+      body: '将停止对 ${SystemEnvHelper.folderDisplayName(folder.localDir)} 的自动备份保护，'
+          '已在目标设备上的历史快照不受影响。此操作不可撤销。',
+    );
+    if (!confirmed || !mounted) return;
     try {
       await widget.bridge.deleteSyncRule(folder.ruleId);
       final updated = await widget.bridge.listSyncRules();

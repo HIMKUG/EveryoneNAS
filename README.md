@@ -152,13 +152,13 @@ EveryoneNAS 走的是第四条路：**用你已有的设备做存储，用零知
 ┌──────────────────────────────────────────────────────────────────────────────┐
 │                              用户设备（任意组合）                              │
 │                                                                              │
-│   ┌────────────────────┐   ┌────────────────────┐   ┌────────────────────┐   │
-│   │  Windows 桌面/服务  │   │   Android 手机      │   │   浏览器 / Web 管理台 │  │
-│   │  lanvault-win-svc  │   │  flutter_app       │   │   web-ui (静态)      │   │
-│   │  └ lanvault-server │   │  └ lanvault-ffi    │   │   └ REST + WebSocket │   │
-│   └─────────┬──────────┘   └─────────┬──────────┘   └──────────┬───────────┘  │
-│             │                        │                          │              │
-│             └────────────┬───────────┴──────────────────────────┘              │
+│   ┌────────────────────┐   ┌────────────────────┐                              │
+│   │  Windows 桌面/服务  │   │   Android 手机      │   第三方客户端 / 脚本        │
+│   │  lanvault-win-svc  │   │  flutter_app       │   └ REST + WebSocket (无 UI) │
+│   │  └ lanvault-server │   │  └ lanvault-ffi    │                              │
+│   └─────────┬──────────┘   └─────────┬──────────┘                              │
+│             │                        │                                          │
+│             └────────────┬───────────┘                                          │
 │                          │  局域网（HTTP / WS / mDNS / UDP 广播）                │
 └──────────────────────────┼───────────────────────────────────────────────────┘
                            │
@@ -192,8 +192,9 @@ EveryoneNAS 走的是第四条路：**用你已有的设备做存储，用零知
 | `lanvault-client` | 1 680 | 监听、对账、增量同步、重连、剪贴板 | `watcher.rs` `scanner.rs` `sync_engine.rs` `reconnect.rs` |
 | `lanvault-ffi` | 2 303 | FRB v2 + C-ABI + Android JNI | `api.rs` `c_abi.rs` |
 | `lanvault-win-svc` | 900 | Windows SCM、防火墙、Volume GUID | `main.rs` `firewall.rs` `volume_guid.rs` |
-| `web-ui` | 3 084 | 零构建静态管理台 | `index.html` `js/*.js` `css/*.css` |
 | `flutter_app` | 6 133 | 跨端 UI（Dart 4 639）+ 原生保活层（Kotlin 1 494） | `lib/**` `android/**/*.kt` |
+
+> 原 `web-ui` 静态管理台已于 v0.2.2 归档到 `archive/web-ui-2026-11-26/`，不再编入客户端二进制；服务端只保留 `/api/*` 与 `/ws` 接口，供 Flutter 端与第三方客户端使用。
 
 **约 21 700 行自有代码，零占位符，零 `todo!()`。**
 

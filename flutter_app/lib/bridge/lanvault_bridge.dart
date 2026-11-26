@@ -412,6 +412,27 @@ class VaultVolumeModel {
   }
 }
 
+/// 存储池拓扑，wire 值与 `lanvault-core` 的 `PoolMode` 一一对应。
+///
+/// 之前 UI 用裸字符串 `'raid1'` 提交，而后端只接受 `'mirror_raid1'`，导致
+/// 镜像池创建必然失败；枚举把这类漂移变成编译期错误。
+enum PoolMode {
+  single('single'),
+  striped('striped'),
+  mirrorRaid1('mirror_raid1');
+
+  const PoolMode(this.wire);
+
+  final String wire;
+
+  static PoolMode? tryParse(String? raw) {
+    for (final mode in PoolMode.values) {
+      if (mode.wire == raw) return mode;
+    }
+    return null;
+  }
+}
+
 /// 存储池摘要模型（对齐 `list_vaults` 与 `create_vault`）。
 @immutable
 class VaultSummaryModel {
@@ -428,6 +449,10 @@ class VaultSummaryModel {
   final String vaultId;
   final String name;
   final String poolMode;
+
+  /// 后端未知拓扑时为 `null`（例如新版本新增了 App 尚不认识的模式）。
+  PoolMode? get poolModeValue => PoolMode.tryParse(poolMode);
+
   final int quotaBytes;
   final int usedBytes;
   final bool e2eeEnabled;
@@ -1658,6 +1683,9 @@ abstract class LanVaultRustFfi {
     int? port,
   });
   Future<void> prepareGracefulRestart();
+
+  /// 清除已留档的 Web 管理密码并停止本机服务。
+  Future<bool> clearWebPassword();
   Future<LastServerConfig?> getLastServerConfig();
   Stream<SyncProgressEvent> subscribeSyncProgress();
   Future<void> triggerIncrementalScan(String ruleId);
@@ -1715,7 +1743,7 @@ abstract class LanVaultRustFfi {
   Future<VaultSummaryModel> createVault({
     required String name,
     required String mountPath,
-    required String poolMode,
+    required PoolMode poolMode,
     required int quotaGb,
     required bool e2eeEnabled,
     String? extraMountPath,
@@ -2349,6 +2377,13 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
   }
 
   @override
+  Future<bool> clearWebPassword() async {
+    final resp =
+        await _callAsync('clear_web_password', const <String, Object?>{});
+    return resp['cleared'] as bool? ?? true;
+  }
+
+  @override
   Future<LastServerConfig?> getLastServerConfig() async {
     final resp = await _callAsync(
       'get_last_server_config',
@@ -2663,7 +2698,7 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
   Future<VaultSummaryModel> createVault({
     required String name,
     required String mountPath,
-    required String poolMode,
+    required PoolMode poolMode,
     required int quotaGb,
     required bool e2eeEnabled,
     String? extraMountPath,
@@ -2671,7 +2706,7 @@ class NativeLanVaultRustFfi implements LanVaultRustFfi {
     final resp = await _callAsync('create_vault', <String, Object?>{
       'name': name,
       'mount_path': mountPath,
-      'pool_mode': poolMode,
+      'pool_mode': poolMode.wire,
       'quota_gb': quotaGb,
       'e2ee_enabled': e2eeEnabled,
       'extra_mount_path': extraMountPath,
@@ -3777,6 +3812,9 @@ class LanVaultBridge {
 
   Future<void> prepareGracefulRestart() => _ffi.prepareGracefulRestart();
 
+  /// 清除 Web 管理密码并停止本机服务（真实往返，不做本地伪状态）。
+  Future<bool> clearWebPassword() => _ffi.clearWebPassword();
+
   Stream<SyncProgressEvent> subscribeSyncProgress() {
     if (_sharedSyncStream == null) {
       _sharedSyncSub = _ffi.subscribeSyncProgress().listen(
@@ -3891,7 +3929,7 @@ class LanVaultBridge {
   Future<VaultSummaryModel> createVault({
     required String name,
     required String mountPath,
-    required String poolMode,
+    required PoolMode poolMode,
     required int quotaGb,
     required bool e2eeEnabled,
     String? extraMountPath,
@@ -3908,7 +3946,7 @@ class LanVaultBridge {
     final created = await _ffi.createVault(
       name: name.trim(),
       mountPath: mountPath.trim(),
-      poolMode: poolMode.trim(),
+      poolMode: poolMode,
       quotaGb: quotaGb,
       e2eeEnabled: e2eeEnabled,
       extraMountPath: extraMountPath != null && extraMountPath.trim().isNotEmpty

@@ -212,6 +212,10 @@ fn dispatch_json_inner(fn_name: &str, payload_json: &str) -> Result<Value> {
             api::block_on(api::prepare_graceful_restart())??;
             Ok(json!({ "ok": true }))
         }
+        "clear_web_password" => {
+            let cleared = api::block_on(api::clear_web_password())??;
+            Ok(json!({ "ok": true, "cleared": cleared }))
+        }
         "subscribe_sync_progress" => {
             let ev = api::latest_sync_progress()?;
             Ok(json!({

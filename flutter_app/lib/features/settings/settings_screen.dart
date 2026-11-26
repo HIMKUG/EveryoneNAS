@@ -539,8 +539,9 @@ class _SettingsScreenState extends State<SettingsScreen>
                     final p = await widget.bridge.pickDirectory(
                       description: '选择主存储目录',
                     );
-                    if (ctx.mounted && p != null && p.isNotEmpty)
+                    if (ctx.mounted && p != null && p.isNotEmpty) {
                       primaryCtrl.text = p;
+                    }
                   },
                 ),
               ],
@@ -564,8 +565,9 @@ class _SettingsScreenState extends State<SettingsScreen>
                     final p = await widget.bridge.pickDirectory(
                       description: '选择备用存储目录',
                     );
-                    if (ctx.mounted && p != null && p.isNotEmpty)
+                    if (ctx.mounted && p != null && p.isNotEmpty) {
                       fallbackCtrl.text = p;
+                    }
                   },
                 ),
               ],
@@ -585,8 +587,34 @@ class _SettingsScreenState extends State<SettingsScreen>
 
   Future<void> _toggleWebPassword(bool enabled) async {
     if (!enabled) {
-      setState(() => _webPasswordEnabled = false);
-      NeuToast.info(context, '已关闭 Web 密码保护提示');
+      final confirmed = await showNeuDialog<bool>(
+        context: context,
+        builder: (ctx) => NeuDialog(
+          title: '关闭 Web 访问密码',
+          subtitle: '会立即停止本机存储服务，并清除已留档的密码；再次启动需要重新设置。',
+          maxWidth: 420,
+          actions: <Widget>[
+            NeuButton(label: '取消', onPressed: () => Navigator.of(ctx).pop(false)),
+            NeuButton(
+              label: '关闭并停服',
+              tone: NeuButtonTone.danger,
+              onPressed: () => Navigator.of(ctx).pop(true),
+            ),
+          ],
+          child: const SizedBox.shrink(),
+        ),
+      );
+      if (confirmed != true || !mounted) return;
+      try {
+        await widget.bridge.clearWebPassword();
+        if (!mounted) return;
+        setState(() => _webPasswordEnabled = false);
+        NeuToast.success(context, '已关闭 Web 密码保护并停止本机存储服务');
+      } catch (err) {
+        if (!mounted) return;
+        // 失败时不改开关，让 UI 与真实状态保持一致。
+        NeuToast.error(context, LanVaultBridge.formatUserError(err));
+      }
       return;
     }
     final pwdCtrl = TextEditingController();
@@ -643,8 +671,11 @@ class _SettingsScreenState extends State<SettingsScreen>
         NeuToast.error(context, LanVaultBridge.formatUserError(err));
       }
     } else {
-      setState(() => _webPasswordEnabled = true);
-      NeuToast.success(context, '已启用 Web 访问密码保护');
+      // 没有可用的最近配置时无法真正启动带密码的服务，绝不能只把开关点亮。
+      NeuToast.warning(
+        context,
+        '还没有可用的存储目录配置，请先在"存储"页创建存储池后再启用密码',
+      );
     }
   }
 
@@ -925,9 +956,12 @@ class _SettingsScreenState extends State<SettingsScreen>
               tone: NeuButtonTone.danger,
               onPressed: () async {
                 await widget.bridge.clearDebugLogs();
-                if (ctx.mounted)
+                if (ctx.mounted) {
                   setDialogState(() => logs = const <DebugLogEntryModel>[]);
-                if (mounted) NeuToast.info(this.context, '调试日志已清空');
+                }
+                if (mounted) {
+                  NeuToast.info(this.context, '调试日志已清空');
+                }
               },
             ),
             NeuButton(
@@ -1196,7 +1230,7 @@ class _SettingsScreenState extends State<SettingsScreen>
             } catch (err) {
               if (!mounted) return;
               setState(() => _autoReconnect = prev);
-              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
             }
           },
         ),
@@ -1212,7 +1246,7 @@ class _SettingsScreenState extends State<SettingsScreen>
             } catch (err) {
               if (!mounted) return;
               setState(() => _autostartServer = prev);
-              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
             }
           },
         ),
@@ -1319,7 +1353,7 @@ class _SettingsScreenState extends State<SettingsScreen>
             } catch (err) {
               if (!mounted) return;
               setState(() => _bitRotAutoScrub = prev);
-              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
             }
           },
         ),
@@ -1428,7 +1462,7 @@ class _SettingsScreenState extends State<SettingsScreen>
             } catch (err) {
               if (!mounted) return;
               setState(() => _debugMode = prev);
-              NeuToast.error(context, LanVaultBridge.formatUserError(err));
+              NeuToast.error(this.context, LanVaultBridge.formatUserError(err));
             }
           },
         ),
@@ -1541,39 +1575,25 @@ class _SettingsSwitchRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final neu = NeuTheme.of(context);
+    // 标题 + 开关合并成一个可朗读、可键盘操作的节点（NeuSwitch），
+    // 行内还可能有额外动作按钮（如「立即校验」），所以保留外层 Row。
     return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 16),
       child: Row(
         children: <Widget>[
           Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: <Widget>[
-                Text(
-                  title,
-                  style: Theme.of(context).textTheme.titleSmall?.copyWith(
-                        fontWeight: FontWeight.w600,
-                      ),
-                ),
-                if (subtitle != null && subtitle!.isNotEmpty) ...<Widget>[
-                  const SizedBox(height: 3),
-                  Text(
-                    subtitle!,
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: neu.textSecondary,
-                        ),
-                  ),
-                ],
-              ],
+            child: NeuSwitch(
+              title: title,
+              subtitle: subtitle,
+              value: value,
+              onChanged: onChanged,
+              padding: const EdgeInsets.symmetric(vertical: 12),
             ),
           ),
           if (trailing != null) ...<Widget>[
             const SizedBox(width: 10),
             trailing!,
           ],
-          const SizedBox(width: 10),
-          Switch(value: value, onChanged: onChanged),
         ],
       ),
     );

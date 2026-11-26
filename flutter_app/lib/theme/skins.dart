@@ -21,23 +21,39 @@ enum SkinGroupId {
 
 const String defaultSkinId = 'skin_default';
 
+/// Mixes `first` toward `second` by `amount` in 0..1.
+///
+/// `Color` exposes 0..1 doubles while `Color.fromARGB` takes 0..255 ints, so
+/// every channel is scaled on the way out. Negative amounts used to be the
+/// light palettes' way of asking for a darker tint; callers now pass an
+/// explicit darker target instead (see `_darken`), because a clamped negative
+/// silently returns `first` and collapses the whole light hierarchy.
 Color mixColor(Color first, Color second, double amount) {
   final ratio = amount.clamp(0.0, 1.0);
+  int channel(double from, double to) =>
+      ((from + (to - from) * ratio) * 255).round().clamp(0, 255);
+
   return Color.fromARGB(
-    (first.a + (second.a - first.a) * ratio).round(),
-    (first.r + (second.r - first.r) * ratio).round(),
-    (first.g + (second.g - first.g) * ratio).round(),
-    (first.b + (second.b - first.b) * ratio).round(),
+    channel(first.a, second.a),
+    channel(first.r, second.r),
+    channel(first.g, second.g),
+    channel(first.b, second.b),
   );
 }
 
+/// Darkens [color] by [amount] (0..1) toward black, preserving alpha.
+Color _darken(Color color, double amount) =>
+    mixColor(color, const Color(0xFF000000), amount);
+
 Color _composite(Color foreground, Color background) {
-  final alpha = foreground.a;
+  final alpha = foreground.a.clamp(0.0, 1.0);
+  int channel(double fg, double bg) =>
+      ((fg * alpha + bg * (1 - alpha)) * 255).round().clamp(0, 255);
   return Color.fromARGB(
     255,
-    (foreground.r * alpha + background.r * (1 - alpha)).round(),
-    (foreground.g * alpha + background.g * (1 - alpha)).round(),
-    (foreground.b * alpha + background.b * (1 - alpha)).round(),
+    channel(foreground.r, background.r),
+    channel(foreground.g, background.g),
+    channel(foreground.b, background.b),
   );
 }
 
@@ -75,6 +91,23 @@ Color pickContrastInk(Color background) {
       : ink;
 }
 
+/// Picks the label colour for [accent] and, when neither white nor near-black
+/// clears 4.5:1 (mid-tone accents such as `#887B3F` peak around 4.4), nudges the
+/// accent itself darker/lighter until the pair passes.
+(Color, Color) readableAccentPair(Color accent, {double target = 4.5}) {
+  var ink = pickContrastInk(accent);
+  if (contrastRatio(ink, accent) >= target) return (accent, ink);
+  final towards =
+      relativeLuminance(accent) > 0.5 ? const Color(0xFF000000) : const Color(0xFFFFFFFF);
+  var candidate = accent;
+  for (var step = 1; step <= 24; step++) {
+    candidate = mixColor(accent, towards, step / 48);
+    final nextInk = pickContrastInk(candidate);
+    if (contrastRatio(nextInk, candidate) >= target) return (candidate, nextInk);
+  }
+  return (candidate, pickContrastInk(candidate));
+}
+
 Color ensureVisibleLine(Color canvas, Color surface, Color line) {
   final cardSurface = _composite(surface, canvas);
   if (contrastRatio(line, cardSurface) >= 1.6) return line;
@@ -95,6 +128,23 @@ Color ensureReadableAccent(Color source, Color canvas, bool dark) {
   for (var step = 0; step <= 24; step++) {
     candidate = mixColor(source, towards, step / 24 * 0.8);
     if (contrastRatio(candidate, canvas) >= target) return candidate;
+  }
+  return candidate;
+}
+
+/// Pushes [source] toward black or white until it clears [target] against
+/// [background]. Used for ink tokens (`textPrimary`/`textSecondary`/
+/// `slateMuted`) that previously bypassed every guard.
+Color _ensureReadableInk(Color source, Color background, {required double target}) {
+  if (contrastRatio(source, background) >= target) return source;
+  final towards =
+      relativeLuminance(background) > 0.32
+          ? const Color(0xFF000000)
+          : const Color(0xFFFFFFFF);
+  var candidate = source;
+  for (var step = 1; step <= 24; step++) {
+    candidate = mixColor(source, towards, step / 24);
+    if (contrastRatio(candidate, background) >= target) return candidate;
   }
   return candidate;
 }
@@ -473,20 +523,38 @@ SkinPalette buildDerivedPalette({
   const white = Color(0xFFFFFFFF);
   const black = Color(0xFF000000);
   final surface = mixColor(canvas, white, dark ? 0.07 : 0.55);
-  final insetSurface = mixColor(canvas, white, dark ? 0.05 : -0.05);
+  final insetSurface = dark
+      ? mixColor(canvas, white, 0.05)
+      : _darken(canvas, 0.05);
   final hoverSurface = mixColor(canvas, white, dark ? 0.12 : 0.02);
-  final surfacePressed = mixColor(canvas, white, dark ? 0.16 : -0.08);
+  final surfacePressed = dark
+      ? mixColor(canvas, white, 0.16)
+      : _darken(canvas, 0.08);
   final chromeSurface = mixColor(canvas, white, dark ? 0.025 : 0.035);
-  final textPrimary = mixColor(canvas, white, dark ? 0.92 : -0.88);
-  final textSecondary = mixColor(textPrimary, canvas, 0.52);
-  final slateMuted = mixColor(textPrimary, canvas, 0.30);
+  final textPrimary = dark
+      ? mixColor(canvas, white, 0.92)
+      : _darken(canvas, 0.88);
+  // Secondary ink used to be a flat 52% blend back toward the canvas, which
+  // lands below 4.5:1 on both palettes. It is guarded against the darkest
+  // surface it is actually drawn on, not against the canvas.
+  final textSecondary = _ensureReadableInk(
+    mixColor(textPrimary, canvas, dark ? 0.34 : 0.46),
+    surface,
+    target: 4.5,
+  );
+  final slateMuted = _ensureReadableInk(
+    mixColor(textPrimary, canvas, dark ? 0.55 : 0.30),
+    surface,
+    target: 3.0,
+  );
   final line = ensureVisibleLine(
     canvas,
     surface,
     mixColor(canvas, textPrimary, dark ? 0.18 : 0.14),
   );
-  final accent = ensureReadableAccent(accentSource, canvas, dark);
-  final onAccent = pickContrastInk(accent);
+  final (accent, onAccent) = readableAccentPair(
+    ensureReadableAccent(accentSource, canvas, dark),
+  );
   final accentLight = _ensureInkContrast(
     ensureReadableAccent(mixColor(accent, onAccent, 0.12), canvas, dark),
     onAccent,

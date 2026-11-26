@@ -277,20 +277,26 @@ class NeuSlidePageRoute<T> extends PageRoute<T> {
     final reduced = NeuMotion.isReduced(context);
     if (reduced) return child;
     final speed = NeuMotion.resolveSpeed(context);
+    final enterMicros = NeuMotion.scaleDuration(
+      NeuMotion.pageEnterDuration,
+      speed,
+    ).inMicroseconds;
+    final exitMicros = NeuMotion.scaleDuration(
+      NeuMotion.pageExitDuration,
+      speed,
+    ).inMicroseconds;
+    // The old expression divided by 1e6 twice, collapsing the interval end to
+    // ~6e-7 and disabling the exit fade entirely. The interval is the exit
+    // share of the enter window, expressed at most at 1.0.
+    final exitShare = enterMicros == 0
+        ? 1.0
+        : (exitMicros / enterMicros).clamp(0.0, 1.0);
     return FadeTransition(
       opacity: CurvedAnimation(
         parent: secondaryAnimation,
         curve: Interval(
           0,
-          NeuMotion.scaleDuration(
-                NeuMotion.pageExitDuration,
-                speed,
-              ).inMicroseconds /
-              NeuMotion.scaleDuration(
-                NeuMotion.pageEnterDuration,
-                speed,
-              ).inMicroseconds.clamp(0, 1000000) /
-              1000000,
+          exitShare,
           curve: NeuMotion.resolveExitCurve(context),
         ),
       ),

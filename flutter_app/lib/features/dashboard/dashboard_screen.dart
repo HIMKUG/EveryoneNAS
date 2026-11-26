@@ -33,19 +33,21 @@ class DashboardScreen extends StatefulWidget {
   State<DashboardScreen> createState() => _DashboardScreenState();
 }
 
-class _DashboardScreenState extends State<DashboardScreen> {
+class _DashboardScreenState extends State<DashboardScreen> with WidgetsBindingObserver {
   SystemOverviewModel? _overview;
   List<VaultSummaryModel> _vaults = const <VaultSummaryModel>[];
   SyncProgressEvent? _lastSync;
   StreamSubscription<SyncProgressEvent>? _syncSub;
   Timer? _pollTimer;
   bool _loading = true;
+  bool _loadFailed = false;
   bool _refreshing = false;
   bool _batteryBannerDismissed = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _syncSub = widget.bridge.subscribeSyncProgress().listen((event) {
       if (!mounted) return;
       setState(() => _lastSync = event);
@@ -59,7 +61,23 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 轮询在前后台之间必须停一会：此前退到后台仍按 6s 间隔打 FFI。
+    if (state == AppLifecycleState.resumed) {
+      _pollTimer ??= Timer.periodic(
+        const Duration(seconds: 6),
+        (_) => unawaited(_refreshAll(silent: true)),
+      );
+      unawaited(_refreshAll(silent: true));
+    } else {
+      _pollTimer?.cancel();
+      _pollTimer = null;
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
     _syncSub?.cancel();
     widget.bridge.serverStateVersion.removeListener(_onExternalStateChange);
@@ -85,10 +103,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
         _overview = results[0] as SystemOverviewModel;
         _vaults = results[1] as List<VaultSummaryModel>;
         _loading = false;
+        _loadFailed = false;
       });
     } catch (err) {
       if (!mounted) return;
-      setState(() => _loading = false);
+      setState(() {
+        _loading = false;
+        // 首次加载失败时 _overview 仍为 null，不能把它当成「服务未启动」。
+        _loadFailed = _overview == null;
+      });
       if (!silent) {
         NeuToast.error(context, LanVaultBridge.formatUserError(err));
       }
@@ -268,9 +291,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }) {
       final neu = NeuTheme.of(context);
     final running = overview?.serverRunning ?? false;
-    final portText = overview?.serverPort != null
-        ? '端口 :${overview!.serverPort}'
-        : '等待启动';
+    final portText = overview == null
+        ? (_loadFailed ? '状态读取失败' : '正在读取状态…')
+        : (overview.serverPort != null
+            ? '端口 :${overview.serverPort}'
+            : '等待启动');
     final lanIp = overview?.lanIp ?? '';
     final showIp = lanIp.isNotEmpty &&
         !lanIp.startsWith('198.18.') &&
@@ -412,9 +437,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
   }) {
       final neu = NeuTheme.of(context);
     final running = overview?.serverRunning ?? false;
-    final portText = overview?.serverPort != null
-        ? '端口 :${overview!.serverPort}'
-        : '点击进入设置启动';
+    final portText = overview == null
+        ? (_loadFailed ? '状态读取失败' : '正在读取状态…')
+        : (overview.serverPort != null
+            ? '端口 :${overview.serverPort}'
+            : '点击进入设置启动');
 
     return Column(
       children: <Widget>[
@@ -629,9 +656,22 @@ class _DashboardScreenState extends State<DashboardScreen> {
               const SizedBox(width: 20),
               Expanded(
                 child: _vaults.isEmpty
-                    ? Text(
-                        '暂无存储池，点击前往新建存储池。',
-                        style: Theme.of(context).textTheme.bodySmall,
+                    ? Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: <Widget>[
+                          Text(
+                            _loadFailed ? '存储池读取失败。' : '暂无存储池。',
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                          const SizedBox(height: 8),
+                          NeuButton(
+                            label: _loadFailed ? '重新加载' : '新建存储池',
+                            tone: NeuButtonTone.neutral,
+                            onPressed: _loadFailed
+                                ? () => _refreshAll(silent: false)
+                                : widget.onOpenVault,
+                          ),
+                        ],
                       )
                     : Column(
                         children: <Widget>[
@@ -757,10 +797,15 @@ class _DashboardScreenState extends State<DashboardScreen> {
           ),
           const SizedBox(height: 14),
           if (activities.isEmpty)
-            const NeuEmptyState(
+            NeuEmptyState(
               icon: Icons.bolt_rounded,
               title: '暂无最近活动',
               subtitle: '开始备份、配对设备或校验数据后将在此显示。',
+              action: NeuButton(
+                label: '去配对设备',
+                tone: NeuButtonTone.neutral,
+                onPressed: widget.onOpenPairing,
+              ),
             )
           else
             for (var i = 0; i < activities.length; i++) ...<Widget>[

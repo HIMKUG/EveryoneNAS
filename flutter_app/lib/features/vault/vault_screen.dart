@@ -112,7 +112,7 @@ class _VaultScreenState extends State<VaultScreen> {
     final pathController = TextEditingController();
     final extraPathController = TextEditingController();
     final quotaController = TextEditingController(text: '100');
-    var poolMode = 'single';
+    var poolMode = PoolMode.single;
     var submitting = false;
 
     await showNeuDialog<void>(
@@ -157,11 +157,18 @@ class _VaultScreenState extends State<VaultScreen> {
                             NeuToast.warning(context, '容量配额必须大于 0 GB');
                             return;
                           }
-                          if (poolMode == 'raid1') {
-                            if (extraPath.isEmpty) {
-                              NeuToast.warning(context, '双盘镜像模式需要选择第二块磁盘目录');
-                              return;
-                            }
+                          final needsExtraVolume =
+                              poolMode != PoolMode.single;
+                          if (needsExtraVolume && extraPath.isEmpty) {
+                            NeuToast.warning(
+                              context,
+                              poolMode == PoolMode.mirrorRaid1
+                                  ? '双盘镜像模式需要选择第二块磁盘目录'
+                                  : '多盘串联模式需要选择要追加的磁盘目录',
+                            );
+                            return;
+                          }
+                          if (poolMode == PoolMode.mirrorRaid1) {
                             final k1 =
                                 SystemEnvHelper.extractDriveKey(mountPath);
                             final k2 =
@@ -180,8 +187,7 @@ class _VaultScreenState extends State<VaultScreen> {
                               poolMode: poolMode,
                               quotaGb: quotaGb,
                               e2eeEnabled: true,
-                              extraMountPath:
-                                  poolMode == 'raid1' ? extraPath : null,
+                              extraMountPath: needsExtraVolume ? extraPath : null,
                             );
                             if (dialogCtx.mounted) {
                               Navigator.of(dialogCtx).pop();
@@ -250,16 +256,20 @@ class _VaultScreenState extends State<VaultScreen> {
                   ),
                   if (!Platform.isAndroid) ...<Widget>[
                     const SizedBox(height: 12),
-                    NeuSegmentedControl<String>(
+                    NeuSegmentedControl<PoolMode>(
                       semanticLabel: '存储池模式',
                       value: poolMode,
                       onChanged: (v) => setDialogState(() => poolMode = v),
-                      segments: const <NeuSegment<String>>[
-                        NeuSegment<String>(value: 'single', label: '单盘模式'),
-                        NeuSegment<String>(value: 'raid1', label: '双盘镜像'),
+                      segments: const <NeuSegment<PoolMode>>[
+                        NeuSegment<PoolMode>(
+                            value: PoolMode.single, label: '单盘模式'),
+                        NeuSegment<PoolMode>(
+                            value: PoolMode.striped, label: '多盘串联'),
+                        NeuSegment<PoolMode>(
+                            value: PoolMode.mirrorRaid1, label: '双盘镜像'),
                       ],
                     ),
-                    if (poolMode == 'raid1') ...<Widget>[
+                    if (poolMode != PoolMode.single) ...<Widget>[
                       const SizedBox(height: 12),
                       Row(
                         crossAxisAlignment: CrossAxisAlignment.end,
@@ -267,8 +277,12 @@ class _VaultScreenState extends State<VaultScreen> {
                           Expanded(
                             child: NeuInsetField(
                               controller: extraPathController,
-                              label: '第二磁盘目录',
-                              hint: r'E:\EveryoneNAS_Mirror',
+                              label: poolMode == PoolMode.striped
+                                  ? '追加磁盘目录'
+                                  : '第二磁盘目录',
+                              hint: poolMode == PoolMode.striped
+                                  ? r'E:\EveryoneNAS_Ext'
+                                  : r'E:\EveryoneNAS_Mirror',
                               prefixIcon: Icons.folder_copy_outlined,
                             ),
                           ),
@@ -277,7 +291,9 @@ class _VaultScreenState extends State<VaultScreen> {
                             label: '选择',
                             onPressed: () async {
                               final picked = await widget.bridge.pickDirectory(
-                                description: '选择镜像盘目录',
+                                description: poolMode == PoolMode.striped
+                                    ? '选择要追加到存储池的磁盘目录'
+                                    : '选择镜像盘目录',
                               );
                               if (dialogCtx.mounted && picked != null && picked.isNotEmpty) {
                                 extraPathController.text = picked;
@@ -539,7 +555,12 @@ class _VaultPoolCard extends StatelessWidget {
                 ),
               ),
               NeuStatusBadge(
-                label: vault.poolMode == 'raid1' ? '双盘镜像' : '单盘模式',
+                label: switch (vault.poolModeValue) {
+                  PoolMode.mirrorRaid1 => '双盘镜像',
+                  PoolMode.striped => '多盘串联',
+                  PoolMode.single => '单盘模式',
+                  null => '未知拓扑',
+                },
                 tone: allOnline ? NeuStatusTone.accent : NeuStatusTone.warning,
               ),
             ],

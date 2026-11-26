@@ -1967,6 +1967,14 @@ PRAGMA mmap_size = 268435456;";
         Self::write_setting(&conn, key, value)
     }
 
+    /// Removes a stored setting; used to genuinely drop the remembered web
+    /// password instead of leaving a stale encrypted copy behind.
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        let conn = self.lock_conn();
+        conn.execute("DELETE FROM app_settings WHERE key = ?1", params![key])?;
+        Ok(())
+    }
+
     fn write_setting(conn: &Connection, key: &str, value: &str) -> Result<()> {
         conn.execute(
             r#"

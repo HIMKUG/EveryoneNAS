@@ -6,7 +6,6 @@ license.workspace = true
 
 [features]
 default = []
-embed-web-ui = ["dep:static-serve"]
 
 [dependencies]
 lanvault-core = { path = "../lanvault-core" }
@@ -22,7 +21,6 @@ hex = { workspace = true }
 uuid = { workspace = true }
 axum = { workspace = true }
 tower-cookies = { workspace = true }
-static-serve = { workspace = true, optional = true }
 dashmap = { workspace = true }
 futures-util = { workspace = true }
 rustls = { workspace = true }

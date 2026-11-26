@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     EveryoneNAS Android (arm64-v8a) 8C16T 极限性能发行版一键构建脚本。
@@ -20,7 +20,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$AppVersion = "0.2.0"
+$AppVersion = "0.2.2"
 
 # 1. 锁定 8 核 16 线程并发、ARM64 NEON/Crypto/CRC 指令集优化与 Android 15 16KB 页对齐链接标志
 $env:CARGO_BUILD_JOBS = "16"

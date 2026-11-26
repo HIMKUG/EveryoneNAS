@@ -165,7 +165,7 @@ class _FakeLanVaultFfi implements LanVaultRustFfi {
   Future<VaultSummaryModel> createVault({
     required String name,
     required String mountPath,
-    required String poolMode,
+    required PoolMode poolMode,
     required int quotaGb,
     required bool e2eeEnabled,
     String? extraMountPath,
@@ -211,6 +211,9 @@ class _FakeLanVaultFfi implements LanVaultRustFfi {
 
   @override
   Future<void> prepareGracefulRestart() async {}
+
+  @override
+  Future<bool> clearWebPassword() async => true;
 
   @override
   Future<bool> pushClipboardFile({
@@ -817,22 +820,24 @@ void main() {
               of: find.text('数据完整性定期检查'),
               matching: find.byType(Row),
             )
-            .first,
+            .last,
         matching: scrubButton,
       ),
       findsOneWidget,
     );
+    final integrityRow = find
+        .ancestor(
+          of: find.text('数据完整性定期检查'),
+          matching: find.byType(Row),
+        )
+        .last;
     expect(
-      find.descendant(
-        of: find
-            .ancestor(
-              of: find.text('数据完整性定期检查'),
-              matching: find.byType(Row),
-            )
-            .first,
-        matching: find.byType(Switch),
-      ),
+      find.descendant(of: integrityRow, matching: scrubButton),
       findsOneWidget,
+    );
+    expect(
+      find.descendant(of: integrityRow, matching: find.byType(NeuSwitch)),
+      findsWidgets,
     );
     final divider = tester.widget<Divider>(
       find
@@ -1061,6 +1066,21 @@ void main() {
           greaterThanOrEqualTo(4.5),
           reason: '${skin.name} ${palette == skin.dark ? 'dark' : 'light'}',
         );
+      }
+    }
+  });
+
+  // Regression guard for the mixColor channel/negative-amount bugs: a clamped
+  // negative used to return the canvas unchanged, collapsing every light
+  // palette to white-on-white.
+  test('built-in skin body ink stays readable on every palette', () {
+    for (final skin in builtInSkins) {
+      for (final palette in <SkinPalette>[skin.light, skin.dark]) {
+        final label = '${skin.name} ${palette == skin.dark ? 'dark' : 'light'}';
+        expect(contrastRatio(palette.textPrimary, palette.canvas),
+            greaterThanOrEqualTo(4.5), reason: 'textPrimary $label');
+        expect(contrastRatio(palette.textSecondary, palette.surface),
+            greaterThanOrEqualTo(4.5), reason: 'textSecondary $label');
       }
     }
   });

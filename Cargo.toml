@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
@@ -36,7 +36,6 @@ brotli-decompressor = "6.3"
 mdns-sd = "0.18"
 axum = { version = "0.8", features = ["ws"] }
 tower-cookies = "0.11"
-static-serve = "0.6"
 dashmap = "6"
 notify = "7"
 windows-service = "0.8"

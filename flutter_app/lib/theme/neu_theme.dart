@@ -815,10 +815,21 @@ class _NeuCardState extends State<NeuCard> {
     }
 
     final wrapped = RepaintBoundary(child: box);
-    if (widget.semanticLabel == null) return wrapped;
+    // A tappable card must always announce itself as a button. Previously the
+    // Semantics wrapper was gated on `semanticLabel`, so 8 of 9 tappable cards
+    // shipped as unlabelled, role-less regions. Now the label falls back to the
+    // card's own text content.
+    if (!interactive) {
+      if (widget.semanticLabel == null) return wrapped;
+      return Semantics(
+        container: true,
+        label: widget.semanticLabel,
+        child: wrapped,
+      );
+    }
     return Semantics(
       container: true,
-      button: interactive,
+      button: true,
       label: widget.semanticLabel,
       child: wrapped,
     );
@@ -913,6 +924,43 @@ class NeuMotionSwitcher extends StatelessWidget {
 }
 
 /// 统一轻拟态弹窗容器（220ms `scale(0.95 -> 1.0) + fade` 物理入场动效）。
+/// 统一的破坏性操作确认框。
+///
+/// 删除设备组、删除备份任务、恢复快照等动作此前都是单击即执行，对话框也
+/// 各自手写；这里固定三件事：正文写清后果、默认焦点落在「取消」、危险按钮
+/// 用 danger 语义。
+Future<bool> confirmDestructive(
+  BuildContext context, {
+  required String title,
+  required String body,
+  String confirmLabel = '删除',
+  String cancelLabel = '取消',
+  bool danger = true,
+}) async {
+  final confirmed = await showNeuDialog<bool>(
+    context: context,
+    barrierDismissible: false,
+    builder: (ctx) => NeuDialog(
+      title: title,
+      subtitle: body,
+      maxWidth: 440,
+      actions: <Widget>[
+        NeuButton(
+          label: cancelLabel,
+          onPressed: () => Navigator.of(ctx).pop(false),
+        ),
+        NeuButton(
+          label: confirmLabel,
+          tone: danger ? NeuButtonTone.danger : NeuButtonTone.primary,
+          onPressed: () => Navigator.of(ctx).pop(true),
+        ),
+      ],
+      child: const SizedBox.shrink(),
+    ),
+  );
+  return confirmed ?? false;
+}
+
 Future<T?> showNeuDialog<T>({
   required BuildContext context,
   required WidgetBuilder builder,
@@ -985,14 +1033,28 @@ class _NeuButtonState extends State<NeuButton> {
   final FocusNode _focusNode = FocusNode(debugLabel: 'NeuButton');
   bool _hovered = false;
   bool _pressed = false;
+  bool _focused = false;
 
   bool get _enabled => widget.onPressed != null && !widget.loading;
   bool get _looksDisabled => !_enabled || widget.disabledLook;
 
   @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_onFocusChanged);
+  }
+
+  @override
   void dispose() {
+    _focusNode.removeListener(_onFocusChanged);
     _focusNode.dispose();
     super.dispose();
+  }
+
+  void _onFocusChanged() {
+    if (_focusNode.hasFocus != _focused) {
+      setState(() => _focused = _focusNode.hasFocus);
+    }
   }
 
   void _setPressed(bool value) {
@@ -1133,16 +1195,20 @@ class _NeuButtonState extends State<NeuButton> {
         color: gradient == null ? bg : null,
         gradient: gradient,
         borderRadius: BorderRadius.all(Radius.circular(widget.radius)),
-        border: widget.disabledLook
-            ? Border.all(color: neu.disabledDarkBorder, width: 1.0)
-            : (widget.tone == NeuButtonTone.neutral || !_enabled
-                ? Border.all(
-                    color: _hovered && _enabled
-                        ? neu.controlOutline
-                        : neu.hairlineBorder,
-                    width: 1.0,
-                  )
-                : null),
+        // Focus is visible for every tone: keyboard users could not tell where
+        // they were because only NeuCard painted a ring.
+        border: _focused && _enabled
+            ? Border.all(color: neu.accent.withValues(alpha: 0.75), width: 2.0)
+            : (widget.disabledLook
+                ? Border.all(color: neu.disabledDarkBorder, width: 1.0)
+                : (widget.tone == NeuButtonTone.neutral || !_enabled
+                    ? Border.all(
+                        color: _hovered && _enabled
+                            ? neu.controlOutline
+                            : neu.hairlineBorder,
+                        width: 1.0,
+                      )
+                    : null)),
         boxShadow: _resolveShadows(neu),
       ),
       child: content,
@@ -1227,13 +1293,27 @@ class NeuSwitch extends StatefulWidget {
 class _NeuSwitchState extends State<NeuSwitch> {
   final FocusNode _focusNode = FocusNode(debugLabel: 'NeuSwitch');
   bool _pressed = false;
+  bool _focused = false;
 
   bool get _enabled => widget.onChanged != null;
 
   @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_onFocusChanged);
+  }
+
+  @override
   void dispose() {
+    _focusNode.removeListener(_onFocusChanged);
     _focusNode.dispose();
     super.dispose();
+  }
+
+  void _onFocusChanged() {
+    if (_focusNode.hasFocus != _focused) {
+      setState(() => _focused = _focusNode.hasFocus);
+    }
   }
 
   void _toggle() {
@@ -1278,6 +1358,9 @@ class _NeuSwitchState extends State<NeuSwitch> {
             : (widget.value ? null : neu.switchTrackOff),
         gradient: _enabled && widget.value ? neu.primaryGradient : null,
         borderRadius: const BorderRadius.all(Radius.circular(NeuRadius.pill)),
+        border: _focused && _enabled
+            ? Border.all(color: neu.accent.withValues(alpha: 0.75), width: 2)
+            : null,
       ),
       child: AnimatedAlign(
         alignment: widget.value ? Alignment.centerRight : Alignment.centerLeft,
@@ -1423,11 +1506,25 @@ class NeuSegmentedControl<T> extends StatefulWidget {
 
 class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
   final FocusNode _focusNode = FocusNode(debugLabel: 'NeuSegmentedControl');
+  bool _focused = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _focusNode.addListener(_onFocusChanged);
+  }
 
   @override
   void dispose() {
+    _focusNode.removeListener(_onFocusChanged);
     _focusNode.dispose();
     super.dispose();
+  }
+
+  void _onFocusChanged() {
+    if (_focusNode.hasFocus != _focused) {
+      setState(() => _focused = _focusNode.hasFocus);
+    }
   }
 
   int get _selectedIndex {
@@ -1497,8 +1594,10 @@ class _NeuSegmentedControlState<T> extends State<NeuSegmentedControl<T>> {
                 Radius.circular(outerRadius),
               ),
               border: Border.all(
-                color: neu.hairlineBorder,
-                width: 1.0,
+                color: _focused && widget.enabled
+                    ? neu.accent.withValues(alpha: 0.75)
+                    : neu.hairlineBorder,
+                width: _focused ? 2.0 : 1.0,
               ),
             ),
             child: SizedBox(

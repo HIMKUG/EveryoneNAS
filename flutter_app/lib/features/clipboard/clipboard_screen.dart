@@ -26,7 +26,7 @@ class ClipboardScreen extends StatefulWidget {
   State<ClipboardScreen> createState() => _ClipboardScreenState();
 }
 
-class _ClipboardScreenState extends State<ClipboardScreen> {
+class _ClipboardScreenState extends State<ClipboardScreen> with WidgetsBindingObserver {
   final TextEditingController _inputController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   List<TransferHistoryModel> _history = const <TransferHistoryModel>[];
@@ -40,6 +40,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     unawaited(_refreshHistory(silent: false));
     _pollTimer = Timer.periodic(
       const Duration(seconds: 2),
@@ -48,7 +49,23 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 轮询在前后台之间必须停一会：此前退到后台仍按 2s 间隔打 FFI。
+    if (state == AppLifecycleState.resumed) {
+      _pollTimer ??= Timer.periodic(
+        const Duration(seconds: 2),
+        (_) => unawaited(_refreshHistory(silent: true)),
+      );
+      unawaited(_refreshHistory(silent: true));
+    } else {
+      _pollTimer?.cancel();
+      _pollTimer = null;
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _pollTimer?.cancel();
     _inputController.dispose();
     _scrollController.dispose();
@@ -343,7 +360,11 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                     itemBuilder: (context, index) {
                       final peer = peers[index];
                       final selected = peer.deviceId == activePeer?.deviceId;
-                      return InkWell(
+                      return Semantics(
+                        button: true,
+                        selected: selected,
+                        label: '${peer.deviceName}，${selected ? '当前目标' : '切换为目标设备'}',
+                        child: InkWell(
                         onTap: () => widget.bridge.selectPeer(peer.deviceId),
                         borderRadius:
                             const BorderRadius.all(Radius.circular(12)),
@@ -409,6 +430,7 @@ class _ClipboardScreenState extends State<ClipboardScreen> {
                               ),
                             ],
                           ),
+                        ),
                         ),
                       );
                     },

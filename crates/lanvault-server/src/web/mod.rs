@@ -1,5 +1,5 @@
 //! Axum 0.8 HTTP REST API, Cookie-authenticated WebSocket telemetry/alerts with
-//! Ping/Pong backpressure disconnection, conditional `static-serve` Web UI embedding,
+//! Ping/Pong backpressure disconnection,
 //! and graceful restart orchestration.
 //!
 //! 100% aligned with `ARCHITECTURE_CONTRACTS.md` §3.1 (REST endpoints + `/ws`).
@@ -52,9 +52,6 @@ use crate::auth::{
 use crate::scrub::{BitRotAlertEvent, BitRotScrubber, ScrubReport};
 use crate::tls::LanConnectionInfo;
 use crate::vault::{unix_timestamp_secs, ExtraVolumeSpec, VaultStore};
-
-#[cfg(feature = "embed-web-ui")]
-static_serve::embed_assets!("web-ui");
 
 const WS_PING_INTERVAL_SECS: u64 = 15;
 const WS_PONG_TIMEOUT_SECS: u64 = 30;
@@ -554,14 +551,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(CookieManagerLayer::new())
         .with_state(state);
 
-    #[cfg(feature = "embed-web-ui")]
-    {
-        api_router.merge(static_router::<()>())
-    }
-    #[cfg(not(feature = "embed-web-ui"))]
-    {
-        api_router
-    }
+    api_router
 }
 
 // =============================================================================

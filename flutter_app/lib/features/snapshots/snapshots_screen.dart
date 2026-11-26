@@ -320,6 +320,15 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
         description: '选择快照恢复目标文件夹',
       );
       if (targetDir == null || !mounted) return;
+      final confirmed = await confirmDestructive(
+        context,
+        title: '恢复到 $targetDir',
+        body: '将把快照 ${snapshot.snapshotId} 的文件写入该目录，'
+            '目标目录中同名文件会被覆盖（不会回写源目录）。恢复期间不可中断。',
+        confirmLabel: '开始恢复',
+        danger: false,
+      );
+      if (!confirmed || !mounted) return;
       setState(() => _restoring = true);
       NeuToast.info(context, '正在解密并校验恢复快照 ${snapshot.snapshotId}…');
       final res = await widget.bridge.restoreSnapshot(
@@ -817,7 +826,13 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                       ],
                     );
 
-                    return InkWell(
+                    // 选中态此前只靠背景色，读屏与色觉障碍用户都无法判断当前行。
+                    return Semantics(
+                      button: true,
+                      selected: isSelected,
+                      label: '${snap.createdAt} ${snap.retentionLabel} 快照，'
+                          '${isSelected ? '已选中' : '点按选中'}',
+                      child: InkWell(
                       onTap: () =>
                           setState(() => _selectedSnapshotId = snap.snapshotId),
                       borderRadius: const BorderRadius.all(Radius.circular(12)),
@@ -881,6 +896,7 @@ class _SnapshotsScreenState extends State<SnapshotsScreen> {
                             ],
                           ],
                         ),
+                      ),
                       ),
                     );
                   },

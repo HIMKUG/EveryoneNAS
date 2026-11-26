@@ -1,11 +1,11 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    EveryoneNAS v0.2.0 Windows 8C16T 发行版一键构建脚本。
+    EveryoneNAS v0.2.2 Windows 8C16T 发行版一键构建脚本。
 .DESCRIPTION
     以 16 并发线程编译 Rust 原生 FFI 动态库 (lanvault_ffi.dll) 与可选 Windows SCM 服务
     (lanvault-win-svc.exe)，随后构建混淆且剥离调试符号的 Flutter Windows Release 产物，
-    最终统一归档至 dist/windows-release/ 并生成版本化压缩包 dist/EveryoneNAS-0.2.0-windows-x64.zip。
+    最终统一归档至 dist/windows-release/ 并生成版本化压缩包 dist/EveryoneNAS-0.2.2-windows-x64.zip。
 .PARAMETER SkipWinSvc
     跳过 lanvault-win-svc.exe 的编译与归档（仅打包桌面主程序与 lanvault_ffi.dll）。
 .PARAMETER Clean
@@ -20,7 +20,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$AppVersion = "0.2.0"
+$AppVersion = "0.2.2"
 
 # 1. 锁定 8 核 16 线程并行构建环境变量
 $env:CARGO_BUILD_JOBS = "16"
@@ -110,7 +110,7 @@ finally {
     Pop-Location
 }
 
-# 4. 统一归档至 dist/windows-release/ 并生成 0.2.0 版本压缩包
+# 4. 统一归档至 dist/windows-release/ 并生成 0.2.2 版本压缩包
 $FlutterReleaseDir = Join-Path $FlutterDir "build\windows\x64\runner\Release"
 if (-not (Test-Path $FlutterReleaseDir)) {
     # 兼容旧版 Flutter 输出路径

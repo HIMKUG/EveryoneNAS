@@ -24,7 +24,7 @@ class PairingScreen extends StatefulWidget {
   State<PairingScreen> createState() => _PairingScreenState();
 }
 
-class _PairingScreenState extends State<PairingScreen> {
+class _PairingScreenState extends State<PairingScreen> with WidgetsBindingObserver {
   final Map<String, DiscoveredPeer> _discovered = <String, DiscoveredPeer>{};
   List<DeviceGroupViewModel> _deviceGroups = const <DeviceGroupViewModel>[];
   StreamSubscription<DiscoveredPeer>? _scanSub;
@@ -39,6 +39,7 @@ class _PairingScreenState extends State<PairingScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _refreshPairedPeers();
     _refreshDeviceGroups();
   }
@@ -58,7 +59,27 @@ class _PairingScreenState extends State<PairingScreen> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 轮询在前后台之间必须停一会：此前退到后台仍按 5s 间隔打 FFI。
+    if (state == AppLifecycleState.resumed) {
+      _refreshTimer ??= Timer.periodic(
+        const Duration(seconds: 5),
+        (_) {
+          unawaited(_refreshPairedPeers(silent: true));
+          unawaited(_refreshDeviceGroups(silent: true));
+        },
+      );
+      unawaited(_refreshPairedPeers(silent: true));
+      unawaited(_refreshDeviceGroups(silent: true));
+    } else {
+      _refreshTimer?.cancel();
+      _refreshTimer = null;
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _refreshTimer?.cancel();
     _refreshTimer = null;
     _scanTimeoutTimer?.cancel();
@@ -169,6 +190,14 @@ class _PairingScreenState extends State<PairingScreen> {
   }
 
   Future<void> _revokePeer(PairedPeerModel peer) async {
+    final confirmed = await confirmDestructive(
+      context,
+      title: '解绑 ${peer.deviceName}',
+      body: '该设备将失去访问本机存储池的权限，需要重新发起配对才能恢复。'
+          '此操作不可撤销。',
+      confirmLabel: '解绑',
+    );
+    if (!confirmed || !mounted) return;
     try {
       final revoked = await widget.bridge.revokePairedPeer(peer.deviceId);
       if (!mounted) return;
@@ -458,6 +487,14 @@ class _PairingScreenState extends State<PairingScreen> {
     GroupMemberModel member,
     String displayName,
   ) async {
+    final confirmed = await confirmDestructive(
+      context,
+      title: '移除成员 $displayName',
+      body: '该设备将不再属于「${group.name}」，已配置的组同步规则对它失效。'
+          '设备本身与快照数据不受影响。',
+      confirmLabel: '移除',
+    );
+    if (!confirmed || !mounted) return;
     try {
       await widget.bridge.removeGroupMember(
         groupId: group.groupId,
